@@ -37,6 +37,22 @@ def sanitize_id(raw_id: str) -> str:
     return cleaned.strip("_") or "video"
 
 
+def out_dir_for(out_root: Path, video_id: str, title: str, upload_date: str | None = None) -> Path:
+    """Pasta de saida legivel: 'AAAA-MM-DD - Titulo [id]'. Reaproveita pasta existente do mesmo id
+    (nome novo ou legado so com o id) para nao perder cache."""
+    legacy = out_root / video_id
+    if legacy.is_dir():
+        return legacy
+    found = next(iter(sorted(out_root.glob(f"*[[]{video_id}[]]"))), None) if out_root.is_dir() else None
+    if found is not None:
+        return found
+    slug = re.sub(r"\s+", " ", re.sub(r'[\\/:*?"<>|#&%$@!^~`]+', " ", title or "")).strip(" .-")[:70].rstrip(" .-")
+    date = ""
+    if upload_date and re.fullmatch(r"\d{8}", str(upload_date)):
+        date = f"{upload_date[:4]}-{upload_date[4:6]}-{upload_date[6:]} - "
+    return out_root / (f"{date}{slug} [{video_id}]" if slug else video_id)
+
+
 def _run(cmd: list[str], timeout: int | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, check=check)
 
@@ -373,6 +389,88 @@ def download_chat(url: str, info: dict[str, Any], cache_dir: Path) -> list[list[
     return None
 
 
+def format_channel_credit(channel: str, url: str = "", extractor: str = "") -> str:
+    """Format channel credit as 'twitch.tv/<canal>' for Twitch or '@<canal>' for YouTube."""
+    raw_ch = (channel or "").strip()
+    low_ext = (extractor or "").lower()
+    low_url = (url or "").lower()
+
+    if raw_ch.lower().startswith(("twitch.tv/", "www.twitch.tv/")):
+        name = raw_ch.split("/", 1)[1].strip("/ ").lstrip("@")
+        return f"twitch.tv/{name}" if name else ""
+    if raw_ch.startswith("@"):
+        if "twitch" in low_ext or "twitch.tv" in low_url:
+            name = raw_ch.lstrip("@").strip("/")
+            return f"twitch.tv/{name}" if name else ""
+        return raw_ch
+
+    if "twitch" in low_ext or "twitch.tv" in low_url:
+        if raw_ch:
+            return f"twitch.tv/{raw_ch.lstrip('@').strip('/')}"
+        m = re.search(r"twitch\.tv/([A-Za-z0-9_]+)", url or "", re.IGNORECASE)
+        if m and m.group(1).lower() not in ("videos", "video", "directory", "clip", "clips"):
+            return f"twitch.tv/{m.group(1)}"
+        return ""
+
+    if "youtube" in low_ext or "youtu.be" in low_url or "youtube.com" in low_url:
+        if raw_ch:
+            return f"@{raw_ch.lstrip('@').strip('/')}"
+        m = re.search(r"youtube\.com/@([A-Za-z0-9_.-]+)", url or "", re.IGNORECASE)
+        if m:
+            return f"@{m.group(1)}"
+        return ""
+
+    return raw_ch
+
+
+def ingest_local(local_dir: Path, out_root: Path, enable_chat: bool = True) -> IngestResult:
+    """Ingest a recording already on disk (source.mkv + meta.json + chat.json). No network calls."""
+    source = local_dir / "source.mkv"
+    if not source.is_file():
+        raise FileNotFoundError(f"source.mkv not found in {local_dir}")
+
+    meta_path = local_dir / "meta.json"
+    meta: dict[str, Any] = json.loads(meta_path.read_text(encoding="utf-8")) if meta_path.is_file() else {}
+    video_id = sanitize_id(str(meta.get("id") or local_dir.name))
+    title = str(meta.get("title") or video_id)
+    url = str(meta.get("webpage_url") or meta.get("url") or "")
+    extractor = str(meta.get("extractor") or "local")
+    raw_channel = str(meta.get("channel") or meta.get("uploader") or meta.get("uploader_id") or "").strip()
+    channel_credit = format_channel_credit(raw_channel, url, extractor) or video_id
+
+    out_dir = out_dir_for(out_root, video_id, title, str(meta.get("upload_date") or ""))
+    cache_dir = out_dir / ".cache"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    wav_path = cache_dir / "audio.wav"
+    if not (wav_path.is_file() and wav_path.stat().st_size > 1024):
+        extract_wav(source, wav_path)
+
+    chat_messages: list[list[Any]] | None = None
+    chat_path = local_dir / "chat.json"
+    if enable_chat and chat_path.is_file():
+        chat = json.loads(chat_path.read_text(encoding="utf-8"))
+        rows = chat.get("messages", []) if isinstance(chat, dict) else chat
+        chat_messages = rows or None
+
+    return IngestResult(
+        video_id=video_id,
+        title=title,
+        url=url,
+        extractor=extractor,
+        is_live=bool(meta.get("is_live")),
+        duration=probe_duration(wav_path),
+        audio_path=wav_path,
+        video_path=source,
+        heatmap=None,
+        chat_messages=chat_messages,
+        out_dir=out_dir,
+        cache_dir=cache_dir,
+        channel=channel_credit,
+    )
+
+
 def ingest(
     url: str,
     out_root: Path,
@@ -387,8 +485,11 @@ def ingest(
     extractor = str(info.get("extractor") or "")
     is_live = bool(info.get("is_live"))
     heatmap = info.get("heatmap") if isinstance(info.get("heatmap"), list) else None
+    webpage_url = str(info.get("webpage_url") or url)
+    raw_channel = str(info.get("channel") or info.get("uploader") or info.get("uploader_id") or "").strip()
+    channel_credit = format_channel_credit(raw_channel, webpage_url, extractor) or video_id
 
-    out_dir = out_root / video_id
+    out_dir = out_dir_for(out_root, video_id, title, str(info.get("upload_date") or ""))
     cache_dir = out_dir / ".cache"
     out_dir.mkdir(parents=True, exist_ok=True)
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -398,8 +499,9 @@ def ingest(
         "id": video_id,
         "title": title,
         "url": url,
-        "webpage_url": info.get("webpage_url") or url,
+        "webpage_url": webpage_url,
         "extractor": extractor,
+        "channel": channel_credit,
         "is_live": is_live,
         "duration": info.get("duration"),
         "has_heatmap": bool(heatmap),
@@ -427,7 +529,7 @@ def ingest(
     return IngestResult(
         video_id=video_id,
         title=title,
-        url=str(info.get("webpage_url") or url),
+        url=webpage_url,
         extractor=extractor,
         is_live=is_live,
         duration=duration,
@@ -437,4 +539,5 @@ def ingest(
         chat_messages=chat_messages,
         out_dir=out_dir,
         cache_dir=cache_dir,
+        channel=channel_credit,
     )
