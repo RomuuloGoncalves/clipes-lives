@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import numpy as np
 
-from .models import CandidatePeak, SignalBundle, SnappedClip, Word
+from .models import CandidatePeak, SignalBundle, SnappedClip, TopicSegment, Word
 from .signals import FPS_RMS, SILENCE_DB
+from .topics import segment_topics, split_topic_into_parts, words_to_sentences
 
 MIN_PRE_ROLL = 6.0
 IDEAL_PRE_ROLL_LOW = 6.0
@@ -267,6 +268,23 @@ def _silence_snap(
     return best_pair
 
 
+def _compute_signal_scores(
+    candidate: CandidatePeak,
+    start_t: float,
+    end_t: float,
+    bundle: SignalBundle | None,
+) -> dict[str, float]:
+    sig_scores = dict(candidate.signal_peaks)
+    if bundle is not None:
+        a = max(0, int(start_t))
+        b = min(bundle.n, max(a + 1, int(np.ceil(end_t))))
+        sig_scores = {
+            name: round(float(vec[a:b].max()), 3)
+            for name, vec in bundle.scores.items()
+        }
+    return sig_scores
+
+
 def snap_candidate(
     candidate: CandidatePeak,
     words: list[Word],
@@ -339,14 +357,7 @@ def snap_candidate(
     clip_words = [w.text for w in local_words if w.end > start_t and w.start < end_t]
     text = "".join(clip_words).strip()
 
-    sig_scores = dict(candidate.signal_peaks)
-    if bundle is not None:
-        a = max(0, int(start_t))
-        b = min(bundle.n, max(a + 1, int(np.ceil(end_t))))
-        sig_scores = {
-            name: round(float(vec[a:b].max()), 3)
-            for name, vec in bundle.scores.items()
-        }
+    sig_scores = _compute_signal_scores(candidate, start_t, end_t, bundle)
 
     return SnappedClip(
         peak=round(peak, 2),
@@ -362,6 +373,167 @@ def snap_candidate(
     )
 
 
+def _fallback_single(
+    candidate: CandidatePeak,
+    win_words: list[Word],
+    rms_db: np.ndarray,
+    duration: float,
+    min_dur: float,
+    single_max_dur: float,
+    bundle: SignalBundle | None,
+) -> list[SnappedClip]:
+    single = snap_candidate(
+        candidate,
+        words=win_words,
+        rms_db=rms_db,
+        duration=duration,
+        min_dur=min_dur,
+        max_dur=single_max_dur,
+        bundle=bundle,
+    )
+    return [single] if single is not None else []
+
+
+def snap_topic_parts(
+    candidate: CandidatePeak,
+    words: list[Word],
+    rms_db: np.ndarray,
+    duration: float,
+    min_dur: float = 25.0,
+    single_max_dur: float = 65.0,
+    part_max_dur: float = 58.0,
+    bundle: SignalBundle | None = None,
+    onnx_path: str | None = None,
+) -> list[SnappedClip]:
+    """Snap a candidate to its semantic topic boundaries, splitting >65s topics into 2-3 parts."""
+    if duration < min_dur:
+        return []
+
+    win_words = sorted(
+        (
+            w for w in words
+            if w.clean and w.end >= candidate.start_win - 1.0 and w.start <= candidate.end_win + 1.0
+        ),
+        key=lambda w: (w.start, w.end),
+    )
+    if len(win_words) < 4:
+        return _fallback_single(candidate, win_words, rms_db, duration, min_dur, single_max_dur, bundle)
+
+    if candidate.topic_start is not None and candidate.topic_end is not None:
+        t_words = [w for w in win_words if w.end > candidate.topic_start - 0.01 and w.start < candidate.topic_end + 0.01]
+        topic: TopicSegment | None = TopicSegment(
+            start=candidate.topic_start,
+            end=candidate.topic_end,
+            peak=candidate.peak,
+            sentences=words_to_sentences(t_words),
+        )
+    else:
+        topic = segment_topics(win_words, peak=candidate.peak, max_topic_dur=180.0, onnx_path=onnx_path)
+
+    if topic is None or topic.duration < min_dur - 1e-6:
+        return _fallback_single(candidate, win_words, rms_db, duration, min_dur, single_max_dur, bundle)
+
+    # Legacy 90s window with uniform interior text falls back to peak-centered single snap.
+    interior_texts = {
+        s[2] for s in topic.sentences
+        if s[0] >= candidate.start_win + 1.0 and s[1] <= candidate.end_win - 1.0
+    }
+    if (
+        topic.duration > single_max_dur
+        and (candidate.end_win - candidate.start_win) <= 90.5
+        and len(interior_texts) <= 1
+    ):
+        return _fallback_single(candidate, win_words, rms_db, duration, min_dur, single_max_dur, bundle)
+
+    raw_parts = split_topic_into_parts(
+        topic,
+        win_words,
+        min_dur=min_dur,
+        single_max_dur=single_max_dur,
+        part_max_dur=part_max_dur,
+    )
+    if not raw_parts:
+        return _fallback_single(candidate, win_words, rms_db, duration, min_dur, single_max_dur, bundle)
+
+    baseline_db = _local_baseline_db(rms_db, candidate.peak)
+    group_id = f"topic_{int(round(candidate.peak))}" if raw_parts[0][3] > 1 else ""
+    built: list[SnappedClip] = []
+
+    for idx_in_list, (p_start, p_end, part_idx, part_total) in enumerate(raw_parts):
+        part_idxs = [
+            i for i, w in enumerate(win_words)
+            if w.end > p_start + 0.01 and w.start < p_end - 0.01
+        ]
+        if not part_idxs:
+            return _fallback_single(candidate, win_words, rms_db, duration, min_dur, single_max_dur, bundle)
+
+        first_pos = part_idxs[0]
+        last_pos = part_idxs[-1]
+        first_w = win_words[first_pos]
+        last_w = win_words[last_pos]
+        part_words = [win_words[i] for i in part_idxs]
+        prev_w = win_words[first_pos - 1] if first_pos > 0 else None
+        nxt_w = win_words[last_pos + 1] if last_pos + 1 < len(win_words) else None
+
+        max_allowed = part_max_dur if part_total > 1 else single_max_dur
+        s_t = p_start
+        if part_idx == 1:
+            if prev_w is None:
+                cand_s = max(0.0, first_w.start - 0.25)
+            elif first_w.start - prev_w.end >= 0.04:
+                cand_s = max(0.0, first_w.start - 0.25, prev_w.end + 0.02)
+            else:
+                cand_s = (prev_w.end + first_w.start) * 0.5
+            # Never let the 0.25s pre-roll push part 1 over max_allowed and abort the series.
+            cand_s = max(cand_s, p_end - max_allowed)
+            if not _cuts_mid_word(cand_s, win_words) and cand_s < p_end:
+                s_t = cand_s
+
+        e_t = p_end
+        next_limit = min(duration, last_w.end + 15.0)
+        if nxt_w is not None:
+            next_limit = min(next_limit, nxt_w.start)
+        if part_idx < part_total:
+            next_limit = min(next_limit, raw_parts[idx_in_list + 1][0])
+        if nxt_w is None or nxt_w.start - last_w.end >= 0.04:
+            cand_e = _extend_past_reaction(last_w.end, next_limit, rms_db, baseline_db, duration)
+            cand_e = min(cand_e, s_t + max_allowed, next_limit)
+            if not _cuts_mid_word(cand_e, win_words) and cand_e >= last_w.end:
+                e_t = cand_e
+
+        dur = e_t - s_t
+        if not (min_dur - 1e-6 <= dur <= max_allowed + 1e-6):
+            return _fallback_single(candidate, win_words, rms_db, duration, min_dur, single_max_dur, bundle)
+        if _cuts_mid_word(s_t, win_words) or _cuts_mid_word(e_t, win_words):
+            return _fallback_single(candidate, win_words, rms_db, duration, min_dur, single_max_dur, bundle)
+
+        gap_s = (first_w.start - prev_w.end) if prev_w is not None else 99.0
+        s_type = "sentence" if (prev_w is None or prev_w.ends_sentence) else ("pause" if gap_s >= PAUSE_MED else "word_gap")
+        gap_e = (nxt_w.start - last_w.end) if nxt_w is not None else 99.0
+        e_type = "sentence" if (last_w.ends_sentence or nxt_w is None) else ("pause" if gap_e >= PAUSE_MED else "word_gap")
+
+        text = " ".join(w.clean for w in part_words)
+        sig_scores = _compute_signal_scores(candidate, s_t, e_t, bundle)
+
+        built.append(SnappedClip(
+            peak=round(candidate.peak, 2),
+            start=round(s_t, 2),
+            end=round(e_t, 2),
+            score=round(candidate.raw_score, 4),
+            active_signals=list(candidate.active_signals),
+            signal_scores=sig_scores,
+            text=text,
+            edge_mode="topic",
+            start_edge_type=s_type,
+            end_edge_type=e_type,
+            part_index=part_idx,
+            part_total=part_total,
+            group_id=group_id,
+        ))
+
+    return built
+
+
 def select_clips(
     candidates: list[CandidatePeak],
     words: list[Word],
@@ -369,26 +541,29 @@ def select_clips(
     duration: float,
     max_clips: int = 8,
     min_dur: float = 25.0,
-    max_dur: float = 55.0,
+    max_dur: float = 65.0,
     bundle: SignalBundle | None = None,
 ) -> list[SnappedClip]:
-    """Snap candidates, discard invalid ones, apply NMS, and keep top `max_clips`."""
+    """Snap candidates by topic/parts, apply group-aware NMS, and never truncate a multi-part series."""
     chosen: list[SnappedClip] = []
     for cand in sorted(candidates, key=lambda c: -c.raw_score):
         if len(chosen) >= max_clips:
             break
-        clip = snap_candidate(
+        parts = snap_topic_parts(
             cand,
             words=words,
             rms_db=rms_db,
             duration=duration,
             min_dur=min_dur,
-            max_dur=max_dur,
+            single_max_dur=max_dur,
+            part_max_dur=min(58.0, max_dur),
             bundle=bundle,
         )
-        if clip is None:
+        if not parts:
             continue
-        if any(clip.start < c.end + 1.0 and clip.end > c.start - 1.0 for c in chosen):
+        if len(chosen) > 0 and len(chosen) + len(parts) > max_clips + 1:
             continue
-        chosen.append(clip)
+        if any(p.start < c.end + 1.0 and p.end > c.start - 1.0 for p in parts for c in chosen):
+            continue
+        chosen.extend(parts)
     return chosen

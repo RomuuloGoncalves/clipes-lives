@@ -5,7 +5,7 @@ import numpy as np
 from clipes.eval import cuts_mid_word, evaluate_clips
 from clipes.models import CandidatePeak, Word
 from clipes.signals import FPS_RMS
-from clipes.snap import select_clips, snap_candidate
+from clipes.snap import select_clips, snap_candidate, snap_topic_parts
 
 
 def _make_speech_timeline(
@@ -127,3 +127,138 @@ def test_snap_discards_impossible_candidate():
     rms_long = np.full(200, -30.0, dtype=np.float32)
     cand2 = CandidatePeak(peak=45.0, raw_score=0.9, start_win=0.0, end_win=90.0)
     assert snap_candidate(cand2, words=words, rms_db=rms_long, duration=100.0, min_dur=25.0, max_dur=55.0) is None
+
+
+def _words_from_specs(specs: list[tuple[float, float, str]]) -> list[Word]:
+    words: list[Word] = []
+    for s, e, text in specs:
+        toks = text.split()
+        step = (e - s) / max(1, len(toks))
+        for i, tok in enumerate(toks):
+            ws = round(s + i * step, 3)
+            we = round(s + (i + 1) * step - 0.04, 3)
+            if we <= ws:
+                we = round(ws + 0.05, 3)
+            words.append(Word(ws, we, (" " + tok) if i > 0 else tok))
+    return words
+
+
+def test_snap_topic_punchline_at_end_keeps_setup():
+    """A story with peak_ratio ~0.85 must keep its full setup without being discarded."""
+    specs = [
+        (0.0, 8.0, "Comprei farinha, ovos e chocolate para assar um bolo na cozinha."),
+        (8.3, 16.0, "Misturei tudo na tigela e coloquei a forma no forno bem quente."),
+        (16.3, 24.0, "O cheiro do bolo assado tomou conta da casa durante a tarde."),
+        # Story from 26s to 80s (54s), peak at 72s -> ratio ~0.85
+        (26.0, 35.0, "Entrei na arena do chefe final sem nenhuma poção sobrando no inventário."),
+        (35.3, 45.0, "O chefe levantou a espada gigante e eu rolei para desviar do ataque."),
+        (45.3, 56.0, "Minha barra de vida estava com um pixel e quase morri no canto."),
+        (56.3, 67.0, "Esperei o último segundo do golpe dele para encaixar o contra-ataque."),
+        (67.3, 80.0, "Derrotei o chefe sem tomar dano nenhum, meu Deus do céu que absurdo!"),
+        # Topic 3
+        (83.0, 92.0, "Mudando de assunto, o preço da placa de vídeo subiu neste mês."),
+        (92.3, 102.0, "Muita gente está comparando memória RAM e SSD antes de montar PC."),
+        (102.3, 112.0, "A fonte precisa ter potência suficiente para aguentar o processador."),
+    ]
+    words = _words_from_specs(specs)
+    duration = 120.0
+    rms = np.full(int(duration * FPS_RMS), -34.0, dtype=np.float32)
+    rms[int(71.0 * FPS_RMS) : int(74.0 * FPS_RMS)] = -12.0
+
+    cand = CandidatePeak(peak=72.0, raw_score=0.95, start_win=0.0, end_win=120.0, active_signals=["loudness"])
+    parts = snap_topic_parts(cand, words, rms, duration, min_dur=25.0, single_max_dur=65.0)
+    assert len(parts) == 1
+    clip = parts[0]
+    assert clip.edge_mode == "topic"
+    assert clip.part_index == 1 and clip.part_total == 1
+    assert clip.peak_ratio > 0.75
+    assert 25.0 <= clip.duration <= 65.0
+    assert clip.start <= 30.0 and clip.end >= 79.0
+    assert not cuts_mid_word(clip.start, words)
+    assert not cuts_mid_word(clip.end, words)
+
+
+def test_snap_topic_120s_splits_into_valid_series():
+    """A 120s topic must emit 2-3 consecutive parts <= 58s with zero mid-word cuts."""
+    specs = [
+        (i * 10.0, i * 10.0 + 9.5, f"Capítulo {i} da história completa sobre a corrida maluca no torneio.")
+        for i in range(12)
+    ]
+    words = _words_from_specs(specs)
+    duration = 130.0
+    rms = np.full(int(duration * FPS_RMS), -34.0, dtype=np.float32)
+    rms[int(95.0 * FPS_RMS) : int(98.0 * FPS_RMS)] = -12.0
+
+    cand = CandidatePeak(
+        peak=96.0, raw_score=0.92, start_win=0.0, end_win=125.0,
+        topic_start=0.0, topic_end=119.46, active_signals=["loudness"],
+    )
+    parts = snap_topic_parts(cand, words, rms, duration, min_dur=25.0, single_max_dur=65.0, part_max_dur=58.0)
+    assert len(parts) in (2, 3)
+    n_total = len(parts)
+    assert all(p.part_total == n_total for p in parts)
+    assert [p.part_index for p in parts] == list(range(1, n_total + 1))
+    assert len({p.group_id for p in parts}) == 1 and parts[0].group_id != ""
+    for p in parts:
+        assert 25.0 <= p.duration <= 58.0
+        assert not cuts_mid_word(p.start, words)
+        assert not cuts_mid_word(p.end, words)
+
+
+def test_select_clips_never_truncates_multipart_series():
+    """When max_clips would cut a 3-part series in half, select_clips skips the incomplete series."""
+    specs = []
+    # Topic A around 70s (single 40s clip)
+    for i in range(4):
+        specs.append((40.0 + i * 10.0, 40.0 + i * 10.0 + 9.4, f"História rápida {i}."))
+    # Topic B around 250s (135s -> 3 parts)
+    for i in range(15):
+        specs.append((180.0 + i * 9.0, 180.0 + i * 9.0 + 8.5, f"História longa {i}."))
+    words = _words_from_specs(specs)
+    duration = 350.0
+    rms = np.full(int(duration * FPS_RMS), -34.0, dtype=np.float32)
+
+    cands = [
+        CandidatePeak(peak=70.0, raw_score=0.95, start_win=35.0, end_win=85.0, topic_start=40.0, topic_end=79.36),
+        CandidatePeak(peak=250.0, raw_score=0.80, start_win=175.0, end_win=320.0, topic_start=180.0, topic_end=314.46),
+    ]
+    # max_clips=2: Topic A takes 1 slot, Topic B wants 3 slots (1 + 3 = 4 > 2 + 1) -> must NOT emit 1/3 alone
+    chosen = select_clips(cands, words, rms, duration, max_clips=2, min_dur=25.0, max_dur=65.0)
+    assert len(chosen) == 1
+    assert chosen[0].part_total == 1
+
+    # max_clips=3: Topic A (1) + Topic B (3) = 4 <= 3 + 1 -> emits complete Topic B (1/3, 2/3, 3/3)
+    chosen_full = select_clips(cands, words, rms, duration, max_clips=3, min_dur=25.0, max_dur=65.0)
+    assert len(chosen_full) == 4
+    assert [c.part_index for c in chosen_full[1:]] == [1, 2, 3]
+    assert all(c.part_total == 3 for c in chosen_full[1:])
+
+
+def test_snap_topic_part1_preroll_capped_to_part_max_dur():
+    """Part 1 pre-roll step-back (-0.25s) must not exceed part_max_dur and abort the series."""
+    specs = [
+        (0.0, 5.0, "Assunto anterior bem longe."),
+        (10.0, 29.0, "Começo exato da história principal muito longa."),
+        (29.3, 48.0, "Desenvolvimento detalhado do meio da história."),
+        (48.3, 67.7, "Preparação final antes da virada da parte um."),
+        (68.1, 87.0, "Continuação imediata logo após o corte de parte."),
+        (87.3, 106.0, "Clímax emocionante da história inteira acontecendo!"),
+        (106.3, 125.5, "Desfecho completo fechando toda a narrativa."),
+    ]
+    words = _words_from_specs(specs)
+    duration = 135.0
+    rms = np.full(int(duration * FPS_RMS), -34.0, dtype=np.float32)
+    rms[int(95.0 * FPS_RMS) : int(98.0 * FPS_RMS)] = -12.0
+
+    cand = CandidatePeak(
+        peak=96.0, raw_score=0.92, start_win=0.0, end_win=130.0,
+        topic_start=10.0, topic_end=125.5, active_signals=["loudness"],
+    )
+    parts = snap_topic_parts(cand, words, rms, duration, min_dur=25.0, single_max_dur=65.0, part_max_dur=58.0)
+    assert len(parts) == 2
+    assert [(p.part_index, p.part_total) for p in parts] == [(1, 2), (2, 2)]
+    assert 9.75 < parts[0].start < 10.0
+    for p in parts:
+        assert 25.0 <= p.duration <= 58.0
+        assert not cuts_mid_word(p.start, words)
+        assert not cuts_mid_word(p.end, words)

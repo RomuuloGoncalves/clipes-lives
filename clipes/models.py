@@ -43,6 +43,7 @@ class IngestResult:
     chat_messages: list[list[Any]] | None
     out_dir: Path
     cache_dir: Path
+    channel: str = ""
 
 
 @dataclass
@@ -65,6 +66,21 @@ class CandidatePeak:
     end_win: float
     active_signals: list[str] = field(default_factory=list)
     signal_peaks: dict[str, float] = field(default_factory=dict)
+    topic_start: float | None = None
+    topic_end: float | None = None
+
+
+@dataclass
+class TopicSegment:
+    start: float
+    end: float
+    peak: float
+    sentences: list[tuple[float, float, str]] = field(default_factory=list)
+    boundary_score: float = 0.0
+
+    @property
+    def duration(self) -> float:
+        return round(self.end - self.start, 3)
 
 
 @dataclass
@@ -81,6 +97,14 @@ class SnappedClip:
     start_edge_type: str = "sentence"
     end_edge_type: str = "sentence"
     output_file: str = ""
+    part_index: int = 1
+    part_total: int = 1
+    group_id: str = ""
+    caption: str = ""
+    hashtags: list[str] = field(default_factory=list)
+    llm_score: float | None = None
+    llm_reason: str = ""
+    title_source: str = ""
 
     @property
     def duration(self) -> float:
