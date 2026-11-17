@@ -358,6 +358,7 @@ def test_quota_keeps_strong_peaks_first():
 import json as _json
 
 from clipes.eval import evaluate_quota_calibration
+from clipes.models import SnappedClip
 
 FIXTURE = Path(__file__).parent / "fixtures" / "calib_labels.json"
 
@@ -405,6 +406,12 @@ def test_calibration_counts_center_or_iou_and_ignores_negatives():
         topic_start=100.0, topic_end=140.0,
     )
     assert evaluate_quota_calibration([wide], labels, k=8)["recall_at_k"] == 0.2
+
+
+def test_calibration_reads_snapped_clip_bounds():
+    clip = SnappedClip(peak=120.0, start=100.0, end=140.0, score=0.8)
+    metrics = evaluate_quota_calibration([clip], [{"start": 110.0, "end": 130.0, "label": 1}], k=8)
+    assert metrics == {"precision_at_k": 1.0, "recall_at_k": 1.0}
 
 
 def test_calibration_empty_selection():
