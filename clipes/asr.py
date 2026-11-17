@@ -63,11 +63,12 @@ def transcribe_candidates(
     windows = merge_windows([(c.start_win, c.end_win) for c in candidates])
 
     words_path = cache_dir / "words.json"
+    norm_windows = [(round(s, 2), round(e, 2)) for s, e in windows]
     if words_path.is_file():
         try:
             cached = json.loads(words_path.read_text(encoding="utf-8"))
-            cached_wins = [tuple(w) for w in cached.get("windows", [])]
-            if cached.get("model") == model_name and cached_wins == [list(w) for w in windows]:
+            cached_wins = [(round(float(w[0]), 2), round(float(w[1]), 2)) for w in cached.get("windows", [])]
+            if cached.get("model") == model_name and cached_wins == norm_windows:
                 words = [Word(float(w["start"]), float(w["end"]), str(w["word"])) for w in cached.get("words", [])]
                 print(f"[asr] Reusing cached transcript ({len(words)} words)", flush=True)
                 return words, cached.get("language")

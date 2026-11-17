@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-SENTENCE_END = (".", "!", "?", "…")
+SENTENCE_END = (".", "!", "?")
 
 
 @dataclass
@@ -24,7 +24,9 @@ class Word:
     @property
     def ends_sentence(self) -> bool:
         c = self.clean.rstrip("\"'”’)")
-        return bool(c) and c.endswith(SENTENCE_END)
+        if not c or c.endswith("...") or c.endswith("…"):
+            return False
+        return c.endswith(SENTENCE_END)
 
 
 @dataclass

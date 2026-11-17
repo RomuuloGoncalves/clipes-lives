@@ -118,13 +118,17 @@ def _speech_start_candidates(
         is_sentence = prev is None or prev.ends_sentence
         q = 0.0
         if is_sentence:
-            q += 2.2
+            q += 3.0
+        if w.clean and w.clean[0].isupper():
+            q += 0.6
         if gap >= PAUSE_LONG:
             q += 1.6
         elif gap >= PAUSE_MED:
             q += 0.9
         elif gap >= 0.3:
-            q += 0.4
+            q += 0.3
+        if not is_sentence and gap < PAUSE_MED:
+            q -= 2.5
 
         pre_roll = peak - t_s
         if IDEAL_PRE_ROLL_LOW <= pre_roll <= IDEAL_PRE_ROLL_HIGH:
@@ -154,7 +158,7 @@ def _speech_end_candidates(
     out: list[tuple[float, float, str]] = []
 
     for j, w in enumerate(words):
-        if w.end < earliest or w.end > latest:
+        if w.end < peak - 2.0 or w.end > latest:
             continue
         nxt = words[j + 1] if j + 1 < len(words) else None
         if nxt is not None and nxt.start < w.end - 0.005:
@@ -167,20 +171,22 @@ def _speech_end_candidates(
             t_e = _extend_past_reaction(w.end, nxt.start, rms_db, baseline_db, duration)
         else:
             t_e = (w.end + nxt.start) * 0.5
-        if t_e > duration or _cuts_mid_word(t_e, words):
+        if t_e < earliest or t_e > latest or t_e > duration or _cuts_mid_word(t_e, words):
             continue
 
         gap = nxt.start - w.end if nxt else 99.0
         is_sentence = w.ends_sentence or nxt is None
         q = 0.0
         if is_sentence:
-            q += 2.2
+            q += 3.0
         if gap >= PAUSE_LONG:
             q += 1.6
         elif gap >= PAUSE_MED:
             q += 0.9
         elif gap >= 0.3:
-            q += 0.4
+            q += 0.3
+        if not is_sentence and gap < PAUSE_MED:
+            q -= 2.5
 
         # Prefer cuts where reaction/scream energy has subsided
         post_db = _max_db_in(rms_db, t_e, min(duration, t_e + 1.5))

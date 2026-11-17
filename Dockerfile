@@ -12,12 +12,17 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
-    nodejs \
     fonts-dejavu-core \
     fonts-liberation \
     fontconfig \
     && fc-cache -f \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && python3 -c "import platform, urllib.request, zipfile, io, os; \
+arch = 'aarch64-unknown-linux-gnu' if platform.machine() in ('aarch64','arm64') else 'x86_64-unknown-linux-gnu'; \
+data = urllib.request.urlopen(f'https://github.com/denoland/deno/releases/latest/download/deno-{arch}.zip', timeout=60).read(); \
+zf = zipfile.ZipFile(io.BytesIO(data)); \
+zf.extract('deno', '/usr/local/bin'); \
+os.chmod('/usr/local/bin/deno', 0o755)"
 
 WORKDIR /app
 

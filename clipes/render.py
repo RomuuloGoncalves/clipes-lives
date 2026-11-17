@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 from pathlib import Path
 
 from .ingest import js_runtime_args
@@ -179,9 +180,19 @@ def download_clip_window(
     attempts = [
         [
             "yt-dlp", "--no-playlist", "--socket-timeout", "30",
-            "--retries", "4", "--fragment-retries", "4",
+            "--retries", "6", "--fragment-retries", "6",
             "--download-sections", section, "--force-keyframes-at-cuts",
             "-f", "bv*[height<=1080]+ba/b[height<=1080]/best",
+            "--merge-output-format", "mp4",
+            "-o", tmpl,
+            *js_runtime_args(),
+            url,
+        ],
+        [
+            "yt-dlp", "--no-playlist", "--socket-timeout", "30",
+            "--retries", "6", "--fragment-retries", "6",
+            "--download-sections", section, "--force-keyframes-at-cuts",
+            "-f", "bv*[height<=720]+ba/b[height<=720]/best",
             "--merge-output-format", "mp4",
             "-o", tmpl,
             *js_runtime_args(),
@@ -198,7 +209,11 @@ def download_clip_window(
     ]
 
     last_err = ""
-    for cmd in attempts:
+    for i, cmd in enumerate(attempts):
+        if i > 0:
+            time.sleep(2.0 * i)
+            for leftover in tmp_dir.glob(f"seg_{idx:02d}.*"):
+                leftover.unlink(missing_ok=True)
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
         files = [p for p in tmp_dir.glob(f"seg_{idx:02d}.*") if not p.name.endswith(".part")]
         if res.returncode == 0 and files:
