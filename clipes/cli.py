@@ -111,8 +111,27 @@ def run_pipeline(args: argparse.Namespace) -> int:
     print(f"[candidates] Selected {len(candidates)} candidate peaks", flush=True)
 
     if not candidates:
-        print("[clipes] Nenhum pico candidato encontrado no vídeo.", flush=True)
-        return 1
+        note = "Nenhum pico candidato encontrado no vídeo (ex.: áudio contínuo sem variação)."
+        print(f"[clipes] {note}", flush=True)
+        timings["total_s"] = round(sum(timings.values()), 2)
+        manifest = {
+            "video_id": ing.video_id,
+            "title": ing.title,
+            "url": ing.url,
+            "is_live": ing.is_live,
+            "duration": round(ing.duration, 2),
+            "language": None,
+            "active_signals": list(bundle.scores.keys()),
+            "timings": timings,
+            "eval": evaluate_clips([], [], min_dur=args.min_dur, max_dur=args.max_dur),
+            "note": note,
+            "clips": [],
+        }
+        (ing.out_dir / "clips.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _write_run_readme(ing.out_dir, ing.video_id, ing.title, ing.url, [], timings)
+        return 0
 
     t3 = time.perf_counter()
     words, lang = transcribe_candidates(
@@ -138,8 +157,27 @@ def run_pipeline(args: argparse.Namespace) -> int:
     print(f"[snap] Final valid clips: {len(clips)}/{len(candidates)}", flush=True)
 
     if not clips:
-        print("[clipes] Nenhum candidato formou clipe válido dentro das restrições de borda/duração.", flush=True)
-        return 1
+        note = "Nenhum candidato formou clipe válido dentro das restrições de borda/duração."
+        print(f"[clipes] {note}", flush=True)
+        timings["total_s"] = round(sum(timings.values()), 2)
+        manifest = {
+            "video_id": ing.video_id,
+            "title": ing.title,
+            "url": ing.url,
+            "is_live": ing.is_live,
+            "duration": round(ing.duration, 2),
+            "language": lang,
+            "active_signals": list(bundle.scores.keys()),
+            "timings": timings,
+            "eval": evaluate_clips([], words, min_dur=args.min_dur, max_dur=args.max_dur),
+            "note": note,
+            "clips": [],
+        }
+        (ing.out_dir / "clips.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        _write_run_readme(ing.out_dir, ing.video_id, ing.title, ing.url, [], timings)
+        return 0
 
     t5 = time.perf_counter()
     clips_payload: list[dict[str, Any]] = []

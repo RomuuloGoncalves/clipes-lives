@@ -66,3 +66,47 @@ def test_evaluate_clips_recall():
     assert res["duration_ok_rate"] == 1.0
     assert res["peak_position_ok_rate"] == 1.0
     assert res["recall_at_5"] == 0.5
+
+
+def test_zero_clips_flat_signal_degrades_cleanly(tmp_path: Path, monkeypatch):
+    """A flat/music-only live recording with 0 peaks must exit 0 and write empty clips.json."""
+    import json
+    import wave
+    import numpy as np
+    from clipes import cli
+    from clipes.models import IngestResult
+
+    out_root = tmp_path / "out"
+    vid_dir = out_root / "live_music"
+    cache_dir = vid_dir / ".cache"
+    cache_dir.mkdir(parents=True)
+    wav_path = cache_dir / "audio.wav"
+    sr = 16000
+    samples = (np.ones(sr * 60, dtype=np.int16) * 500).tobytes()
+    with wave.open(str(wav_path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(samples)
+
+    fake_ing = IngestResult(
+        video_id="live_music",
+        title="24/7 Music Live",
+        url="https://www.youtube.com/watch?v=live_music",
+        extractor="youtube",
+        is_live=True,
+        duration=60.0,
+        audio_path=wav_path,
+        video_path=None,
+        heatmap=None,
+        chat_messages=None,
+        out_dir=vid_dir,
+        cache_dir=cache_dir,
+    )
+    monkeypatch.setattr(cli, "ingest", lambda **kwargs: fake_ing)
+    rc = cli.main(["https://www.youtube.com/watch?v=live_music", "--out-dir", str(out_root), "--live-minutes", "1"])
+    assert rc == 0
+    manifest = json.loads((vid_dir / "clips.json").read_text(encoding="utf-8"))
+    assert manifest["is_live"] is True
+    assert manifest["clips"] == []
+    assert (vid_dir / "README.md").is_file()

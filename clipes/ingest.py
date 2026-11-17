@@ -119,10 +119,15 @@ def record_live_stream(url: str, live_minutes: float, cache_dir: Path) -> tuple[
     wav_path = cache_dir / "audio.wav"
 
     if video_path.is_file() and video_path.stat().st_size > 10240:
-        print(f"[ingest] Reusing recorded live file: {video_path}", flush=True)
-        if not wav_path.is_file() or wav_path.stat().st_size <= 1024:
-            extract_wav(video_path, wav_path)
-        return wav_path, video_path
+        try:
+            existing_dur = probe_duration(video_path)
+        except Exception:
+            existing_dur = 0.0
+        if existing_dur >= seconds * 0.9:
+            print(f"[ingest] Reusing recorded live file ({existing_dur:.1f}s): {video_path}", flush=True)
+            if not wav_path.is_file() or wav_path.stat().st_size <= 1024:
+                extract_wav(video_path, wav_path)
+            return wav_path, video_path
 
     g_cmd = [
         "yt-dlp", "-g", "--no-playlist", "--socket-timeout", "30",
