@@ -147,6 +147,100 @@ def signal_loudness(rms_db: np.ndarray, n: int) -> np.ndarray:
     return scores
 
 
+def signal_prosody(rms_db: np.ndarray, n: int, window_s: int = 5) -> np.ndarray:
+    """1 Hz prosody score: rolling std of voiced energy + syllabic |Δ rms_db|, scaled by voiced IQR.
+
+    The scale is max(1.5, 1.5 * IQR) of voiced dB, so compressed speech (±2 dB) still scores high
+    while silence and steady tones stay at 0.
+    """
+    db = np.asarray(rms_db, dtype=np.float64)
+    if db.size < 2:
+        return np.zeros(n, dtype=np.float64)
+
+    voiced = db > SILENCE_DB
+    if not voiced.any():
+        return np.zeros(n, dtype=np.float64)
+    v = voiced.astype(np.float64)
+    # Center on the voiced median so a steady tone gives exactly 0 (no float cancellation).
+    x = np.where(voiced, db - float(np.median(db[voiced])), 0.0)
+    win = max(2, window_s * FPS_RMS)
+    cnt = uniform_filter1d(v, win, mode="constant")
+    safe = np.maximum(cnt, 1e-9)
+    mean = uniform_filter1d(x, win, mode="constant") / safe
+    mean_sq = uniform_filter1d(x * x, win, mode="constant") / safe
+    std = np.sqrt(np.maximum(mean_sq - mean * mean, 0.0))
+
+    pair = np.concatenate([[False], voiced[1:] & voiced[:-1]]).astype(np.float64)
+    delta = np.concatenate([[0.0], np.abs(np.diff(db))]) * pair
+    delta_mean = uniform_filter1d(delta, win, mode="constant") / np.maximum(
+        uniform_filter1d(pair, win, mode="constant"), 1e-9
+    )
+
+    raw_frame = np.where(voiced, std + delta_mean, 0.0)
+    q75, q25 = np.percentile(db[voiced], [75.0, 25.0])
+    scale = max(1.5, 1.5 * float(q75 - q25))
+    scores = np.clip(_frames_to_seconds(raw_frame, FPS_RMS, n) / scale, 0.0, 1.0)
+    scores[_frames_to_seconds(db, FPS_RMS, n) <= SILENCE_DB] = 0.0
+    return scores
+
+
+def triage_audio_blocks(
+    bundle: SignalBundle,
+    block_s: float = 30.0,
+    hop_s: float = 15.0,
+    budget_ratio: float = 0.30,
+    min_speech_density: float = 0.30,
+    max_audio_s: float = 3600.0,
+) -> list[tuple[float, float, float]]:
+    """Passada 0: pick (start, end, score) speech blocks stratified by video thirds within the ASR budget."""
+    duration = float(bundle.duration)
+    prosody = signal_prosody(bundle.rms_db, bundle.n)
+    # "Speech" second = voiced with syllabic modulation; steady music/tones never qualify.
+    speech = prosody >= 0.25
+    budget = min(budget_ratio * duration, max_audio_s)
+
+    blocks: list[tuple[float, float, float]] = []
+    last_start = max(0.0, duration - block_s)
+    for start in np.arange(0.0, last_start + 1e-6, hop_s):
+        s = float(start)
+        e = min(duration, s + block_s)
+        i0, i1 = int(s), max(int(s) + 1, int(math.ceil(e)))
+        if float(speech[i0:i1].mean()) < min_speech_density:
+            continue
+        score = 0.7 * float(prosody[i0:i1].mean()) + 0.3 * float(bundle.combined[i0:i1].mean())
+        blocks.append((round(s, 2), round(e, 2), round(score, 4)))
+
+    by_score = sorted(blocks, key=lambda b: -b[2])
+    chosen: list[tuple[float, float, float]] = []
+    used = 0.0
+
+    def _try_add(block: tuple[float, float, float], cap: float) -> bool:
+        nonlocal used
+        s, e, _ = block
+        if used + (e - s) > cap + 1e-6 or any(s < ce and cs < e for cs, ce, _ in chosen):
+            return False
+        chosen.append(block)
+        used += e - s
+        return True
+
+    third = duration / 3.0
+    for k in range(3):
+        third_used = 0.0
+        for b in by_score:
+            if min(2, int(((b[0] + b[1]) * 0.5) // third)) != k or b in chosen:
+                continue
+            if third_used + (b[1] - b[0]) > budget / 3.0 + 1e-6:
+                continue
+            if _try_add(b, budget):
+                third_used += b[1] - b[0]
+    # Leftover budget (e.g. a third without speech) goes to the best remaining blocks anywhere.
+    for b in by_score:
+        if b not in chosen:
+            _try_add(b, budget)
+
+    return sorted(chosen)
+
+
 def signal_chat(
     messages: list[list[Any]] | None,
     n: int,

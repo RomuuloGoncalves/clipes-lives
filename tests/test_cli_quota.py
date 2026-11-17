@@ -1,0 +1,132 @@
+"""CLI flags --mode, --min-per-hour and --asr-budget-ratio. Heavy stages are mocked."""
+
+import json
+import wave
+from pathlib import Path
+
+import numpy as np
+
+from clipes import cli
+from clipes.models import CandidatePeak, IngestResult, SignalBundle, SnappedClip, Word
+
+
+def _ing(tmp_path: Path, duration: float = 7200.0) -> IngestResult:
+    cache = tmp_path / "out" / "vid" / ".cache"
+    cache.mkdir(parents=True)
+    wav = cache / "audio.wav"
+    with wave.open(str(wav), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(16000)
+        wf.writeframes(b"\x00\x00" * 1600)
+    out = cache.parent
+    return IngestResult(
+        video_id="vid", title="Live longa", url="https://www.twitch.tv/gaules",
+        extractor="twitch:vod", is_live=False, duration=duration, audio_path=wav,
+        video_path=None, heatmap=None, chat_messages=None, out_dir=out, cache_dir=cache,
+        channel="twitch.tv/gaules",
+    )
+
+
+def _bundle(duration: float) -> SignalBundle:
+    n = max(1, int(duration))
+    zeros = np.zeros(n)
+    return SignalBundle(
+        duration=duration, n=n, scores={"loudness": zeros}, combined=zeros.copy(),
+        smoothed=zeros.copy(), agreeing=np.zeros(n, dtype=np.int32),
+        weights={"loudness": 1.0}, rms_db=np.full(n * 2, -30.0, dtype=np.float32),
+    )
+
+
+def _peaks(n: int, score: float = 0.9) -> list[CandidatePeak]:
+    return [
+        CandidatePeak(peak=200.0 + i * 200.0, raw_score=score, start_win=100.0, end_win=300.0)
+        for i in range(n)
+    ]
+
+
+def _wire(monkeypatch, ing: IngestResult, peaks: list[CandidatePeak], quota):
+    seen: dict[str, list] = {"triage": [], "pass1": [], "quota": [], "pass2": []}
+    monkeypatch.setattr(cli, "ingest", lambda **kwargs: ing)
+    monkeypatch.setattr(cli, "compute_rms_db", lambda *a, **k: ing and np.zeros(4, np.float32))
+    monkeypatch.setattr(cli, "compute_signals", lambda **k: _bundle(ing.duration))
+    monkeypatch.setattr(cli, "pick_candidate_peaks", lambda *a, **k: list(peaks))
+
+    def triage(bundle, budget_ratio=0.30, **k):
+        seen["triage"].append(budget_ratio)
+        return [(10.0, 40.0, 0.8)]
+
+    def pass1(*a, **k):
+        seen["pass1"].append(k.get("model_size"))
+        return [Word(10.0, 50.0, "fala " * 40)]
+
+    def pick_quota(*a, **k):
+        seen["quota"].append(k.get("min_per_hour"))
+        return quota
+
+    def pass2(*a, **k):
+        seen["pass2"].append(k.get("beam_size"))
+        return [Word(12.0, 12.4, " Olha"), Word(12.5, 13.0, " isso!")], "pt"
+
+    monkeypatch.setattr(cli, "triage_audio_blocks", triage)
+    monkeypatch.setattr(cli, "transcribe_fast_blocks", pass1)
+    monkeypatch.setattr(cli, "pick_quota_candidates", pick_quota)
+    monkeypatch.setattr(cli, "transcribe_candidates", pass2)
+    clip = SnappedClip(peak=30.0, start=10.0, end=50.0, score=0.8, text="Olha isso!")
+    monkeypatch.setattr(cli, "select_clips", lambda **k: [clip])
+    return seen
+
+
+def _run(tmp_path: Path, extra: list[str]) -> int:
+    return cli.main(["https://www.twitch.tv/gaules", "--out-dir", str(tmp_path / "out"), "--no-llm", "--skip-render", *extra])
+
+
+def test_auto_triggers_quota_when_strong_peaks_miss_the_target(tmp_path, monkeypatch):
+    ing = _ing(tmp_path)
+    seen = _wire(monkeypatch, ing, _peaks(1), ([_peaks(1)[0]], True))
+    assert _run(tmp_path, ["--min-per-hour", "3"]) == 0
+    assert seen["triage"] == [0.30]
+    assert seen["pass1"] == [None]
+    assert seen["quota"] == [3.0]
+    assert seen["pass2"] == [1]
+    manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert manifest["detection_mode"] == "auto"
+    assert manifest["floor_mode"] is True
+    assert manifest["quota_target"] == 6
+    assert "asr_pass1_s" in manifest["timings"] and "asr_pass2_s" in manifest["timings"]
+    assert "Cota 6" in manifest["note"]
+
+
+def test_auto_stays_on_peaks_when_strong_peaks_fill_the_quota(tmp_path, monkeypatch):
+    ing = _ing(tmp_path)
+    seen = _wire(monkeypatch, ing, _peaks(6), ([], False))
+    assert _run(tmp_path, []) == 0
+    assert seen["triage"] == [] and seen["pass1"] == [] and seen["quota"] == []
+    assert seen["pass2"] == [5]
+    manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert manifest["detection_mode"] == "auto"
+    assert manifest["floor_mode"] is False
+    assert manifest["quota_target"] == 6
+    assert "note" not in manifest
+
+
+def test_mode_peaks_skips_pass1_and_mode_quota_always_runs_it(tmp_path, monkeypatch):
+    ing = _ing(tmp_path, duration=3600.0)
+    seen = _wire(monkeypatch, ing, _peaks(8), ([_peaks(1)[0]], False))
+    assert _run(tmp_path, ["--mode", "peaks"]) == 0
+    assert seen["pass1"] == [] and seen["pass2"] == [5]
+
+    seen2 = _wire(monkeypatch, ing, _peaks(8), ([_peaks(1)[0]], False))
+    assert _run(tmp_path, ["--mode", "quota", "--asr-budget-ratio", "0.5", "--min-per-hour", "1"]) == 0
+    assert seen2["triage"] == [0.5]
+    assert seen2["pass1"] == [None]
+    assert seen2["quota"] == [1.0]
+    manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert manifest["detection_mode"] == "quota"
+    assert manifest["quota_target"] == 1
+
+
+def test_invalid_quota_flags_exit_2():
+    assert cli.main(["http://x", "--min-per-hour", "-1", "--skip-render"]) == 2
+    assert cli.main(["http://x", "--asr-budget-ratio", "0.05", "--skip-render"]) == 2
+    assert cli.main(["http://x", "--asr-budget-ratio", "1.5", "--skip-render"]) == 2

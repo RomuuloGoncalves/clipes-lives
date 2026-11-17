@@ -111,3 +111,27 @@ def test_parse_ytdlp_live_chat():
     rows = parse_ytdlp_live_chat(sample_lines)
     assert len(rows) == 1
     assert rows[0] == (12.5, "KKKKKK", "Joao")
+
+
+def test_asymmetric_window_on_top_candidates_and_symmetric_reserves():
+    duration = 1200.0
+    n = int(duration)
+    rms_db = np.full(n * FPS_RMS, -36.0, dtype=np.float32)
+    # 5 peaks: first near start (60s) to test 0.0 clamping, last near end (1170s) to test duration clamping
+    planted = [(60.0, -8.0), (300.0, -10.0), (550.0, -12.0), (850.0, -14.0), (1170.0, -16.0)]
+    for p, level in planted:
+        rms_db[int((p - 1.0) * FPS_RMS) : int((p + 1.0) * FPS_RMS)] = level
+
+    bundle = compute_signals(duration=duration, rms_db=rms_db, chat_messages=None, heatmap=None)
+    cands = pick_candidate_peaks(bundle, max_clips=3, min_separation=90)
+    assert len(cands) == 5
+
+    # Top max_clips (indices 0..2) use [peak - 150, peak + 60]
+    for c in cands[:3]:
+        assert c.start_win == round(max(0.0, c.peak - 150.0), 2)
+        assert c.end_win == round(min(duration, c.peak + 60.0), 2)
+
+    # Reserves (index >= max_clips) keep [peak - 45, peak + 45]
+    for c in cands[3:]:
+        assert c.start_win == round(max(0.0, c.peak - 45.0), 2)
+        assert c.end_win == round(min(duration, c.peak + 45.0), 2)
