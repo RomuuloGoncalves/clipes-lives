@@ -1,0 +1,11 @@
+#!/bin/sh
+# Uso: ./clipar <url> [opcoes]   (ou ./clipar monitor ...)
+# Cria a pasta de saida como seu usuario antes do Docker (senao ele a cria como root, com cadeado).
+# Limita a CPU (CLIPES_CPUS, padrao 3), baixa a prioridade e liga o vigia termico durante a execucao.
+OUT_DIR="${OUT_DIR:-$HOME/Downloads/clipes-lives}"
+mkdir -p "$OUT_DIR" && export OUT_DIR
+D="$(dirname "$0")"
+"$D/vigia-temp" & V=$!
+fim() { kill $V 2>/dev/null; docker unpause $(docker ps -q --filter label=com.docker.compose.project=clipes-lives) >/dev/null 2>&1; }
+trap fim EXIT INT TERM
+nice -n 19 docker compose run --rm clipes "$@"

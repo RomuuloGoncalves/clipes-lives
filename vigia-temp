@@ -1,0 +1,16 @@
+#!/bin/sh
+# Vigia termico: pausa os containers do projeto acima de MAX C e retoma abaixo de MIN C.
+# Registra a temperatura em $LOG (padrao ~/Downloads/clipes-lives/.temp.log) para diagnosticar quedas.
+MAX="${CLIPES_TEMP_MAX:-85}"; MIN="${CLIPES_TEMP_MIN:-75}"
+LOG="${LOG:-$HOME/Downloads/clipes-lives/.temp.log}"; mkdir -p "$(dirname "$LOG")"
+pausado=0
+trap 'docker unpause $(docker ps -q --filter label=com.docker.compose.project=clipes-lives) >/dev/null 2>&1; exit' INT TERM EXIT
+while :; do
+  t=0
+  for z in /sys/class/thermal/thermal_zone*/temp; do v=$(( $(cat "$z" 2>/dev/null || echo 0) / 1000 )); [ "$v" -gt "$t" ] && t=$v; done
+  echo "$(date +%T) ${t}C pausado=$pausado" >> "$LOG"; sync "$LOG" 2>/dev/null
+  ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives)
+  if [ "$pausado" = 0 ] && [ "$t" -ge "$MAX" ]; then docker pause $ids >/dev/null 2>&1; pausado=1
+  elif [ "$pausado" = 1 ] && [ "$t" -le "$MIN" ]; then docker unpause $ids >/dev/null 2>&1; pausado=0; fi
+  sleep 5
+done
