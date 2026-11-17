@@ -1,0 +1,19 @@
+services:
+  clipes:
+    build: .
+    image: clipes-lives:latest
+    user: "${UID:-1000}:${GID:-1000}"
+    mem_limit: 6g
+    environment:
+      OUT_DIR: /out
+      HOME: /cache
+      XDG_CACHE_HOME: /cache
+      HF_HOME: /cache/huggingface
+      CLIPES_WHISPER_MODEL: ${CLIPES_WHISPER_MODEL:-small}
+      CLIPES_CPU_THREADS: ${CLIPES_CPU_THREADS:-6}
+    volumes:
+      - clipes_models:/cache
+      - ${OUT_DIR:-${HOME}/Downloads/clipes-lives}:/out
+
+volumes:
+  clipes_models:
