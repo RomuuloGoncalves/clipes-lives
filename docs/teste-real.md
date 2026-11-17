@@ -62,9 +62,46 @@ Todos os 8 arquivos MP4 foram validados via `ffprobe`: stream de vídeo `h264` `
 3. **Reticências (`...`) como fim de frase e corte antes de reação sem fala:** na 1ª iteração, o `clip_01` terminou em `"coxinha do"` (`word_gap`) e o `clip_07` terminou em `"Mas ele..."`.
    - **Correções:** excluído `...`/`…` de `Word.ends_sentence` (`models.py`), reforçado peso de fim/início de frase vs `word_gap` (`snap.py`), e movido o filtro `t_e >= earliest` para *depois* de `_extend_past_reaction` (`snap.py`), permitindo que o `clip_01` encerrasse logo após os aplausos (`337.25s`, `sentence_edge_rate` subiu de `0.9375` para `1.0`).
 
-## 6. Limitações Conhecidas
+## 6. Teste Real em Modo Live (`--live-minutes 4`)
 
-- **Modo live (`--live-minutes`):** implementado em `ingest.py` (`yt-dlp -g` + `ffmpeg -t` + fallback `--downloader ffmpeg`), porém não exercitado ao vivo neste teste porque `UBv07VGeD24` já estava consolidado como VOD.
-- **Chat replay:** este VOD específico do Podpah não tinha trilha `live_chat`; a coleta de chat foi validada via testes unitários (`parse_ytdlp_live_chat` e `signal_chat`).
+### 6.1. Seleção da live ativa
+- `https://www.youtube.com/watch?v=jfKfPfyJRdk` retornou erro do YouTube (`This live stream recording is not available`) no momento do teste (`2026-11-17 00:57 -03`).
+- Busca de lives ativas no YouTube (`yt-dlp --flat-playlist`) encontrou transmissões em pt-BR no ar; foi selecionada a live com fala/gameplay `https://www.youtube.com/watch?v=cStJTQf9XUk` (*"GOTÃO TA ON! PRECISAMOS CONVERSAR! REACT & GAMEPLAY 🔴 YURI AO VIVO 🔴 2026-11-17 03:57"*, `is_live: true`).
+
+### 6.2. Comando e Execução
+
+```sh
+docker compose run --rm clipes "https://www.youtube.com/watch?v=cStJTQf9XUk" --live-minutes 4 --max-clips 2
+```
+
+- **Gravação:** `ingest.py` detectou `is_live: true`, resolveu o stream via `yt-dlp -g` e gravou exatos `240.0 s` (4.0 min) em `/out/cStJTQf9XUk/.cache/live_source.mkv` (`36.4 MB`) + extraiu `audio.wav` (`7.3 MB`).
+- **Degradação de sinais:** em modo live não há `heatmap` nem chat replay histórico (`[ingest] Live mode: skipping replay chat fetch.`); o pipeline rodou apenas com `loudness` (`weight=1.0`).
+- **Tempos por etapa (`cStJTQf9XUk`):**
+  - `ingest_s`: `245.82 s` (4 min de captura em tempo real + extração WAV)
+  - `signals_s`: `0.02 s`
+  - `candidates_s`: `0.00 s` (3 picos candidatos)
+  - `asr_s`: `80.93 s` (`faster-whisper small` int8, 2 janelas mescladas, 616 palavras, `lang=pt`)
+  - `snap_s`: `0.01 s` (2/3 candidatos válidos)
+  - `render_s`: `33.27 s` (2 clipes cortados diretamente de `live_source.mkv`)
+  - `total_s`: `360.05 s`
+
+### 6.3. Clipes Gerados na Live (`/home/romulo/Downloads/clipes-lives/cStJTQf9XUk/`)
+
+Métricas em `clips.json`: `count=2`, `mid_word_cut_rate=0.0`, `sentence_edge_rate=1.0`, `duration_ok_rate=1.0`, `peak_position_ok_rate=1.0`.
+
+| Clipe | Intervalo (Duração) | Score | Pico (`ratio`) | Bordas | Título |
+|---|---|---:|---:|---|---|
+| `clip_01.mp4` | `14.09s–50.35s` (36.3s) | `0.684` | `30.0s` (`0.439`) | `sentence` / `sentence` | *Você iria contra o cauão, tio sã?* |
+| `clip_02.mp4` | `109.71s–148.02s` (38.3s) | `0.321` | `124.0s` (`0.373`) | `sentence` / `sentence` | *Nossa, o muriloso vai matar esse filha da puta vê* |
+
+Ambos os arquivos validados via `ffprobe`: `h264` `1080x1920`, `aac`, `2.4 MB` e `2.5 MB`, UID/GID `1000:1000`.
+
+### 6.4. Ajuste pós-teste Live
+- Verificado que, caso uma live contínua (ex.: só música ambiente) produza 0 picos ou 0 clipes válidos, o CLI agora grava `clips.json` (`"clips": []`, `"note": ...`) + `README.md` com mensagem clara e retorna código `0` sem falhar (`test_zero_clips_flat_signal_degrades_cleanly`).
+- `record_live_stream` agora verifica a duração do `live_source.mkv` em cache antes de reaproveitar (se o usuário aumentar `--live-minutes`, regrava em vez de reutilizar trecho menor).
+
+## 7. Limitações Conhecidas
+
+- **Chat em lives ativas:** em modo `--live-minutes`, o chat ao vivo em tempo real ainda não é capturado (só VOD `live_chat` / Twitch GQL), degradando para `loudness` apenas.
 - **Qualidade de transcrição em pt-BR (`small` int8):** gírias e sobreposição de vozes geram pequenos erros pontuais de grafia nas legendas/títulos (ex.: `"búlutinho"`), contornáveis passando `--whisper-model large-v3-turbo` ao custo de ~2x mais tempo de CPU e ~2.2 GB de RAM.
-- **Títulos sem LLM:** a heurística prioriza frases com `!`/`?` e proximidade do pico; em trechos sem pontuação clara (como a abertura do `clip_01`), o título reflete literalmente a frase capturada pelo Whisper.
+- **Títulos sem LLM:** a heurística prioriza frases com `!`/`?` e proximidade do pico; em trechos sem pontuação clara (como a abertura do `clip_01` no VOD), o título reflete literalmente a frase capturada pelo Whisper.

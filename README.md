@@ -14,10 +14,14 @@ Construir a imagem:
 docker compose build
 ```
 
-Processar um VOD ou live (saída padrão em `~/Downloads/clipes-lives/<video_id>/`, personalizável via `OUT_DIR`):
+Processar um VOD ou live ativa (saída padrão em `~/Downloads/clipes-lives/<video_id>/`, personalizável via `OUT_DIR`):
 
 ```sh
+# VOD (YouTube / Twitch)
 docker compose run --rm clipes "https://www.youtube.com/watch?v=UBv07VGeD24"
+
+# Live ativa (grava N minutos do stream e processa o arquivo gravado)
+docker compose run --rm clipes "https://www.youtube.com/watch?v=cStJTQf9XUk" --live-minutes 4 --max-clips 2
 ```
 
 Opções da CLI:
@@ -28,8 +32,10 @@ docker compose run --rm clipes <url> \
   --min-dur 25 \
   --max-dur 55 \
   --live-minutes 20 \
-  --chat   # ou --no-chat
+  --chat   # ou --no-chat (lives e VODs sem chat degradam sem erro)
 ```
+
+Se um vídeo ou live contínua (ex.: só música) não gerar picos/clipes válidos, o pipeline encerra normalmente (código `0`), grava `clips.json` vazio com o motivo e imprime aviso claro.
 
 Rodar a suíte de testes dentro do container:
 
