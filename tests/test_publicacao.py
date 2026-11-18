@@ -1111,4 +1111,225 @@ def test_run_pending_without_injected_publishers_refreshes_on_401_and_succeeds(
         assert secret not in store_file_data
 
 
+def test_publicar_do_discord_ok_sha_divergente_404_e_limpa_tmp(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import hashlib
+    from clipes.discord_rest import DiscordRestError
+    from clipes.registro import Registro
+
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    _, db = _mongo_with_worker("w-pc1", "pc-mesa", T0)
+    store = MongoStore(db)
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"refresh_token": SECRET_REFRESH, "access_token": SECRET_ACCESS}})
+
+    video_bytes = b"master-video-exact-bytes"
+    video_sha = hashlib.sha256(video_bytes).hexdigest()
+    signed_url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4?ex=111&hm=signedsecret"
+
+    clip_dir = tmp_path / "2026-11-18 - Live [v_disc]"
+    clip_dir.mkdir(parents=True)
+    (clip_dir / "clips.json").write_text(
+        json.dumps({
+            "video_id": "v_disc",
+            "channel": "gaules",
+            "owner": "w-pc1",
+            "created_at": T0 - 10,
+            "clips": [{"index": 1, "clip_id": "v_disc_c01", "file": "c1.mp4", "title": "Do Discord", "discord": {"thread_id": "thr-d", "message_id": "msg-d"}}],
+        }),
+        encoding="utf-8",
+    )
+    reg = Registro(tmp_path, mongo=db)
+    reg.upsert({
+        "clip_id": "v_disc_c01",
+        "titulo": "Do Discord",
+        "canal": "gaules",
+        "criado_em": T0 - 10,
+        "owner": "w-pc1",
+        "arquivo": "2026-11-18 - Live [v_disc]/c1.mp4",
+        "tamanho": len(video_bytes),
+        "sha256": video_sha,
+    })
+    reg.set_discord("v_disc_c01", {
+        "thread_id": "thr-d",
+        "message_id": "msg-d",
+        "attachment_id": "att-d",
+        "filename": "c1.mp4",
+        "size": len(video_bytes),
+    })
+    reg.marcar("v_disc_c01", status="so_discord", ack_em=T0 - 5)
+
+    class FakeRest:
+        def __init__(self, mode: str = "ok") -> None:
+            self.mode = mode
+
+        def get_message(self, channel_id: str, message_id: str) -> dict[str, Any]:
+            if self.mode == "404":
+                raise DiscordRestError("Discord HTTP 404: Unknown Message", status=404)
+            if self.mode == "empty_att":
+                return {"id": message_id, "attachments": []}
+            return {
+                "id": message_id,
+                "attachments": [{"id": "att-d", "size": len(video_bytes), "url": signed_url}],
+            }
+
+        def download(self, url: str, dst: Path | None, max_bytes: int) -> tuple[int, str]:
+            assert dst is not None
+            data = b"tampered-bytes" if self.mode == "bad_sha" else video_bytes
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            dst.write_bytes(data)
+            return len(data), hashlib.sha256(data).hexdigest()
+
+    seen_paths: list[Path] = []
+
+    def pub_ok(mp4: Path, title: str, desc: str, tok: str) -> dict[str, Any]:
+        seen_paths.append(mp4)
+        assert mp4.parent == tmp_path / ".tmp_publicar"
+        assert mp4.name.startswith("v_disc_c01_youtube_")
+        assert mp4.read_bytes() == video_bytes
+        return {"video_id": "yt_ok_1", "url": "https://youtube.com/shorts/yt_ok_1"}
+
+    request(store, "v_disc_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": pub_ok},
+        discord_post=lambda tid, msg: None,
+        discord_client=FakeRest(mode="ok"),
+    )
+    assert len(outcomes) == 1
+    assert outcomes[0]["status"] == "ok"
+    assert len(seen_paths) == 1
+    assert not seen_paths[0].exists()
+    reg_after = reg.get("v_disc_c01")
+    assert reg_after is not None
+    assert reg_after["publicacoes"]["youtube"]["id"] == "yt_ok_1"
+    assert "signedsecret" not in (tmp_path / "registro.json").read_text(encoding="utf-8")
+
+    # Publisher fails -> temp file is still deleted in finally
+    db.publish_requests.delete_many({})
+    request(store, "v_disc_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    seen_fail: list[Path] = []
+
+    def pub_fail(mp4: Path, title: str, desc: str, tok: str) -> dict[str, Any]:
+        seen_fail.append(mp4)
+        raise RuntimeError("upload crashed")
+
+    outcomes_fail = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": pub_fail},
+        discord_post=lambda tid, msg: None,
+        discord_client=FakeRest(mode="ok"),
+    )
+    assert outcomes_fail[0]["status"] == "erro"
+    assert len(seen_fail) == 1
+    assert not seen_fail[0].exists()
+
+    # Divergent sha256 -> aborts without publishing
+    db.publish_requests.delete_many({})
+    request(store, "v_disc_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    called_bad = False
+
+    def pub_never(*args: Any) -> dict[str, Any]:
+        nonlocal called_bad
+        called_bad = True
+        return {}
+
+    outcomes_sha = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": pub_never},
+        discord_post=lambda tid, msg: None,
+        discord_client=FakeRest(mode="bad_sha"),
+    )
+    assert called_bad is False
+    assert outcomes_sha[0]["status"] == "erro_arquivo"
+    assert outcomes_sha[0]["message"] == "arquivo do Discord diferente do registrado"
+
+    # Empty attachments (HTTP 200 []) or 404 -> marks perdido, erro_arquivo
+    for mode in ("empty_att", "404"):
+        reg.marcar("v_disc_c01", status="so_discord")
+        db.publish_requests.delete_many({})
+        request(store, "v_disc_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+        outcomes_lost = run_pending(
+            store,
+            "w-pc1",
+            out_root=tmp_path,
+            now=T0,
+            tokens_path=tokens_path,
+            publishers={"youtube": pub_never},
+            discord_post=lambda tid, msg: None,
+            discord_client=FakeRest(mode=mode),
+        )
+        assert outcomes_lost[0]["status"] == "erro_arquivo"
+        assert outcomes_lost[0]["message"] == "clipe perdido: mensagem do Discord apagada"
+        assert reg.get("v_disc_c01")["status"] == "perdido"
+
+
+def test_run_pending_finishes_ok_even_if_registro_or_clips_json_write_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    import clipes.publicacao as pub_mod
+    from clipes.registro import Registro
+
+    _make_clip_fixture(tmp_path, owner="w-pc1")
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    _, db = _mongo_with_worker("w-pc1", "pc-mesa", T0)
+    store = MongoStore(db)
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"access_token": SECRET_ACCESS, "refresh_token": SECRET_REFRESH}})
+
+    uploads: list[str] = []
+
+    def fake_yt(mp4, title, desc, token):
+        uploads.append(mp4.name)
+        return {"video_id": "yt-published-999"}
+
+    monkeypatch.setattr(
+        pub_mod,
+        "_record_clip_publication",
+        lambda *a, **kw: (_ for _ in ()).throw(OSError("No space left on device")),
+    )
+    monkeypatch.setattr(
+        Registro,
+        "registrar_publicacao",
+        lambda *a, **kw: (_ for _ in ()).throw(PermissionError("denied")),
+    )
+
+    thread_msgs: list[tuple[str, str]] = []
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": fake_yt},
+        discord_post=lambda tid, msg: thread_msgs.append((tid, msg)),
+    )
+
+    assert len(uploads) == 1
+    assert len(outcomes) == 1
+    assert outcomes[0]["status"] == "ok"
+    assert outcomes[0]["resultado"]["video_id"] == "yt-published-999"
+    req_doc = db.publish_requests.find_one({"_id": "live1_c01:youtube"})
+    assert req_doc is not None and req_doc["status"] == "ok"
+    assert len(thread_msgs) == 1
+    assert "yt-published-999" in thread_msgs[0][1]
+
+    out = capsys.readouterr().out
+    assert "[publicacao]" in out
+    assert SECRET_ACCESS not in out
+    assert SECRET_REFRESH not in out
+
+
 

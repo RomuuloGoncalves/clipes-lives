@@ -178,3 +178,150 @@ def test_http_error_does_not_leak_token():
     err_text = str(exc_info.value)
     assert "401" in err_text
     assert token not in err_text
+
+
+def test_get_message_200_404_and_429():
+    token = "secret-discord-token-get"
+    sleeps: list[float] = []
+    calls = 0
+
+    def fake_urlopen(req, timeout=None):
+        nonlocal calls
+        calls += 1
+        assert req.get_method() == "GET"
+        assert req.get_header("Authorization") == f"Bot {token}"
+        if calls == 1:
+            raise urllib.error.HTTPError(
+                req.full_url, 429, "Too Many Requests",
+                hdrs={}, fp=io.BytesIO(json.dumps({"retry_after": 0.2}).encode("utf-8")),
+            )
+        if calls == 2:
+            return _FakeResponse(200, {
+                "id": "msg_1",
+                "attachments": [{"id": "att_1", "size": 123, "url": "https://cdn.discordapp.com/x.mp4?ex=1&hm=2"}],
+            })
+        raise urllib.error.HTTPError(
+            req.full_url, 404, "Not Found",
+            hdrs={}, fp=io.BytesIO(json.dumps({"code": 10008, "message": "Unknown Message"}).encode("utf-8")),
+        )
+
+    rest = DiscordRest(token, urlopen=fake_urlopen, sleep=sleeps.append)
+    msg = rest.get_message("thr_1", "msg_1")
+    assert msg["id"] == "msg_1"
+    assert msg["attachments"][0]["id"] == "att_1"
+    assert sleeps == [0.2]
+
+    with pytest.raises(DiscordRestError) as exc_info:
+        rest.get_message("thr_1", "msg_missing")
+    assert exc_info.value.status == 404
+    assert "404" in str(exc_info.value)
+
+
+def test_download_streams_checks_limit_and_never_leaks_signed_url(tmp_path: Path):
+    import hashlib
+
+    token = "secret-token-dl"
+    signed_url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4?ex=6789abcd&is=67890000&hm=deadbeefsecret"
+    payload = b"hello-discord-mp4-" * 200
+    expected_sha = hashlib.sha256(payload).hexdigest()
+
+    def fake_urlopen_ok(req, timeout=None):
+        assert req.full_url == signed_url
+        return _FakeResponse(200, payload)
+
+    rest = DiscordRest(token, urlopen=fake_urlopen_ok, sleep=lambda _: None)
+
+    # Stream without writing to disk (dst=None)
+    size_mem, sha_mem = rest.download(signed_url, None, max_bytes=len(payload) + 10)
+    assert size_mem == len(payload)
+    assert sha_mem == expected_sha
+
+    # Stream to destination file
+    dst = tmp_path / "dl" / "clip.mp4"
+    size_disk, sha_disk = rest.download(signed_url, dst, max_bytes=len(payload))
+    assert size_disk == len(payload)
+    assert sha_disk == expected_sha
+    assert dst.read_bytes() == payload
+
+    # Exceeding max_bytes aborts, removes temp, and hides query string
+    dst_big = tmp_path / "dl" / "too_big.mp4"
+    with pytest.raises(DiscordRestError) as exc_big:
+        rest.download(signed_url, dst_big, max_bytes=len(payload) - 1)
+    assert not dst_big.exists()
+    assert list(dst_big.parent.glob(".too_big.mp4.tmp.*")) == []
+    assert "deadbeefsecret" not in str(exc_big.value)
+    assert "ex=6789abcd" not in str(exc_big.value)
+
+    # Network error / 404 also hides signed query string
+    def fake_urlopen_err(req, timeout=None):
+        raise urllib.error.URLError(f"failed fetching {signed_url}")
+
+    rest_err = DiscordRest(token, urlopen=fake_urlopen_err, sleep=lambda _: None)
+    with pytest.raises(DiscordRestError) as exc_net:
+        rest_err.download(signed_url, None, max_bytes=1024)
+    assert "deadbeefsecret" not in str(exc_net.value)
+    assert "hm=" not in str(exc_net.value)
+
+
+def test_post_includes_components_in_json_and_multipart(tmp_path: Path):
+    token = "secret-discord-token-comp"
+    captured: list[Any] = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(200, {"id": f"msg_{len(captured)}"})
+
+    rest = DiscordRest(token, urlopen=fake_urlopen, sleep=lambda _: None)
+    components = [
+        {"type": 1, "components": [{"type": 2, "style": 3, "label": "Aprovar", "custom_id": "aprovar:vid_c01"}]}
+    ]
+
+    # Without file (JSON)
+    res_json = rest.post("thr_1", "texto clipe", components=components)
+    assert res_json["id"] == "msg_1"
+    req_json = captured[0]
+    assert req_json.get_header("Content-type") == "application/json"
+    assert json.loads(req_json.data.decode("utf-8")) == {
+        "content": "texto clipe",
+        "components": components,
+    }
+
+    # With file (multipart)
+    clip_file = tmp_path / "clip.mp4"
+    clip_file.write_bytes(b"mp4bytes")
+    res_mp = rest.post("thr_1", "texto com anexo", file=clip_file, components=components)
+    assert res_mp["id"] == "msg_2"
+    req_mp = captured[1]
+    ctype = req_mp.get_header("Content-type")
+    assert ctype and ctype.startswith("multipart/form-data; boundary=")
+    parts = _parse_multipart(ctype, req_mp.data)
+    assert json.loads(parts["payload_json"][1].decode("utf-8")) == {
+        "content": "texto com anexo",
+        "components": components,
+    }
+
+
+def test_post_and_download_wrap_raw_oserror_without_leaking_secrets(tmp_path: Path):
+    token = "SUPER_SECRET_RAW_OSERROR_TOK"
+    signed_url = "https://cdn.discordapp.com/attachments/1/2/clip.mp4?ex=111&hm=signedsecret999"
+
+    def urlopen_broken(req, timeout=None):
+        raise BrokenPipeError(f"broken pipe token={token}")
+
+    rest_post = DiscordRest(token, urlopen=urlopen_broken, sleep=lambda _: None)
+    clip_file = tmp_path / "clip.mp4"
+    clip_file.write_bytes(b"mp4bytes")
+    with pytest.raises(DiscordRestError) as exc_post:
+        rest_post.post("thr_1", "aviso", file=clip_file)
+    assert isinstance(exc_post.value.__cause__, BrokenPipeError)
+    assert token not in str(exc_post.value)
+
+    def urlopen_reset(req, timeout=None):
+        raise ConnectionResetError(f"reset fetching {signed_url}")
+
+    rest_dl = DiscordRest(token, urlopen=urlopen_reset, sleep=lambda _: None)
+    with pytest.raises(DiscordRestError) as exc_dl:
+        rest_dl.download(signed_url, None, max_bytes=1024)
+    assert isinstance(exc_dl.value.__cause__, ConnectionResetError)
+    assert "signedsecret999" not in str(exc_dl.value)
+    assert "hm=" not in str(exc_dl.value)

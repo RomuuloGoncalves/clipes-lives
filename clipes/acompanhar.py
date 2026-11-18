@@ -7,9 +7,13 @@ import json
 import os
 import re
 import shutil
+import signal
 import sys
+import threading
 import time
 import urllib.parse
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -387,6 +391,36 @@ class LiveSession:
         self.pool.release_on_demand(self.key)
 
 
+@contextmanager
+def _exit_signals_to_kb() -> Iterator[None]:
+    """Convert SIGTERM/SIGHUP into KeyboardInterrupt on the main thread."""
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
+    def _raise_kb(_signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt
+
+    prev: list[tuple[int, Any]] = []
+    for name in ("SIGTERM", "SIGHUP"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            old = signal.signal(sig, _raise_kb)
+            prev.append((sig, old))
+        except (OSError, ValueError):
+            pass
+    try:
+        yield
+    finally:
+        for sig, old in prev:
+            try:
+                signal.signal(sig, old)
+            except (OSError, ValueError):
+                pass
+
+
 class Supervisor:
     """Supervise up to L simultaneous live sessions sharing 1 DiskQueue and 1 worker."""
 
@@ -702,130 +736,193 @@ class Supervisor:
             on_job_active=lambda jid: self._current_job.__setitem__(0, jid),
         )
 
+    def _release_session(
+        self,
+        key: str,
+        sess: LiveSession,
+        *,
+        release_pool: bool = True,
+        reraise_non_mongo: bool = True,
+    ) -> None:
+        if release_pool:
+            for fn in (sess.pool.release_hold, sess.pool.release_on_demand):
+                try:
+                    fn(key)
+                except Exception:
+                    pass
+        if self.coord is not None and sess.live_id is not None:
+            try:
+                self.coord.release(sess.live_id, sess.live_ended)
+            except Exception as exc:
+                if not monitor._is_mongo_error(exc):
+                    if reraise_non_mongo:
+                        raise
+                    print(f"[acompanhar] erro ao liberar lease {sess.live_id}: {exc}", flush=True)
+                else:
+                    self._on_mongo_err(exc)
+
     def run(self) -> dict[str, Any]:
         self.out_root.mkdir(parents=True, exist_ok=True)
         queue = monitor.DiskQueue(self.queue_root)
         lock = monitor._lock_worker(queue.root)
+        pool: Any | None = self.pool
         try:
-            queue.recover_orphans()
-            pipeline_fn = self.pipeline or monitor.run_local_pipeline
-            probe_fn = self.probe_arg or monitor.probe_metadata
-            is_live_fn = self.is_live_arg or (lambda u: bool(probe_fn(u).get("is_live")))
+            with _exit_signals_to_kb():
+                queue.recover_orphans()
+                pipeline_fn = self.pipeline or monitor.run_local_pipeline
+                probe_fn = self.probe_arg or monitor.probe_metadata
+                is_live_fn = self.is_live_arg or (lambda u: bool(probe_fn(u).get("is_live")))
 
-            if self.pool is not None:
-                pool = self.pool
-            else:
-                def _source_cmd(key: str) -> list[str]:
-                    alvo = self._alvo_by_key.get(key)
-                    if alvo is not None and alvo.plataforma == "youtube":
-                        return monitor.ytdlp_live_cmd(alvo.url)
-                    return monitor.streamlink_cmd(key)
+                if pool is None:
+                    def _source_cmd(key: str) -> list[str]:
+                        alvo = self._alvo_by_key.get(key)
+                        if alvo is not None and alvo.plataforma == "youtube":
+                            return monitor.ytdlp_live_cmd(alvo.url)
+                        return monitor.streamlink_cmd(key)
 
-                pool = monitor.RollingRecorderPool(
-                    queue.root / ".buffer",
-                    max_hot=0,
-                    max_on_demand=max(1, len(self.alvos)),
-                    buffer_seconds=monitor.LIVE_WINDOW_S + 2 * self.step,
-                    source_cmd=_source_cmd,
-                )
+                    pool = monitor.RollingRecorderPool(
+                        queue.root / ".buffer",
+                        max_hot=0,
+                        max_on_demand=max(1, len(self.alvos)),
+                        buffer_seconds=monitor.LIVE_WINDOW_S + 2 * self.step,
+                        source_cmd=_source_cmd,
+                    )
 
-            worker_alias = os.environ.get("CLIPES_ALIAS", "").strip()
-            if self.coord is not None and not worker_alias:
-                from .capacidade import worker_id as get_worker_id
+                worker_alias = os.environ.get("CLIPES_ALIAS", "").strip()
+                if self.coord is not None and not worker_alias:
+                    from .capacidade import worker_id as get_worker_id
 
-                worker_alias = get_worker_id(self.out_root)
-            beat_interval = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20")))
-            last_beat = float("-inf")
+                    worker_alias = get_worker_id(self.out_root)
+                beat_interval = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20")))
+                last_beat = float("-inf")
 
-            limite = self._limite()
-            for alvo in self.alvos:
-                status = self._try_start_alvo(alvo, limite, queue, pool, pipeline_fn, is_live_fn, probe_fn)
-                if status == "aguardando":
-                    self._aguardando.append((alvo, self._last_refusal_reason or ""))
+                def _process_one_with_keepalive() -> bool:
+                    # ponytail: post_aviso (HTTP sincrono ate ~60s) ainda pode pausar o loop;
+                    # CLIPES_LEASE_S >= 90s e o teto seguro no Mongo com 2 PCs.
+                    if self.coord is None:
+                        return self._process_one(queue, pipeline_fn)
+                    stop_hb = threading.Event()
 
-            if not self._active:
-                if self._saw_blocked and not self._saw_not_claimed:
-                    return {"status": "blocked", "jobs": [], "reason": None}
-                if self._saw_not_claimed:
-                    return {"status": "not_claimed", "jobs": [], "reason": self._last_refusal_reason}
-                return {"status": "ended", "jobs": [], "reason": None}
-
-            while self._active:
-                t = self.now()
-                c_active = self._coord_active()
-                if c_active is not None and t - last_beat >= beat_interval:
-                    last_beat = t
-                    cap_now = self._cap()
-                    ml_now = max(1, int(resolve_max_lives(self.out_root, cap_now.get("cpus"), max_lives_fn=self.ml_fn)))
-                    razao_now = monitor._read_perfil_razao(self.out_root, cap_now.get("cpus"))
-                    try:
-                        c_active.beat(worker_alias, cap_now, self._current_job[0], ml_now, razao_now)
-                        for key, sess in list(self._active.items()):
-                            if sess.live_id is None:
+                    def _keepalive() -> None:
+                        while not stop_hb.wait(beat_interval):
+                            c = self._coord_active()
+                            if c is None:
                                 continue
-                            if not c_active.renew(sess.live_id):
-                                print(f"[fila] lease perdida {sess.live_id}", flush=True)
-                                self._lost_lives.add(sess.live_id)
-                                if hasattr(pool, "stop_channel"):
-                                    pool.stop_channel(key)
-                                else:
-                                    pool.release_on_demand(key)
-                                sess.lease_lost = True
-                                sess.live_ended = False
-                                self._saw_lease_lost = True
-                                self._active.pop(key, None)
-                    except Exception as exc:
-                        if not monitor._is_mongo_error(exc):
-                            raise
-                        self._on_mongo_err(exc)
-
-                slot_opened = False
-                for key, sess in list(self._active.items()):
-                    if not sess.tick(t):
-                        sess.encerrar()
-                        if self.coord is not None and sess.live_id is not None:
                             try:
-                                self.coord.release(sess.live_id, sess.live_ended)
+                                cap_k = self._cap()
+                                ml_k = max(1, int(resolve_max_lives(self.out_root, cap_k.get("cpus"), max_lives_fn=self.ml_fn)))
+                                razao_k = monitor._read_perfil_razao(self.out_root, cap_k.get("cpus"))
+                                c.beat(worker_alias, cap_k, self._current_job[0], ml_k, razao_k)
+                                for sess in list(self._active.values()):
+                                    if sess.live_id is not None:
+                                        c.renew(sess.live_id)
                             except Exception as exc:
-                                if not monitor._is_mongo_error(exc):
-                                    raise
-                        self._active.pop(key, None)
-                        slot_opened = True
+                                if monitor._is_mongo_error(exc):
+                                    self._on_mongo_err(exc)
 
-                if slot_opened and self._aguardando:
-                    self._promote_aguardando(queue, pool, pipeline_fn, is_live_fn, probe_fn)
+                    hb_thread = threading.Thread(target=_keepalive, daemon=True)
+                    hb_thread.start()
+                    try:
+                        return self._process_one(queue, pipeline_fn)
+                    finally:
+                        stop_hb.set()
+                        hb_thread.join(timeout=5.0)
+
+                limite = self._limite()
+                for alvo in self.alvos:
+                    status = self._try_start_alvo(alvo, limite, queue, pool, pipeline_fn, is_live_fn, probe_fn)
+                    if status == "aguardando":
+                        self._aguardando.append((alvo, self._last_refusal_reason or ""))
 
                 if not self._active:
-                    break
+                    if self._saw_blocked and not self._saw_not_claimed:
+                        return {"status": "blocked", "jobs": [], "reason": None}
+                    if self._saw_not_claimed:
+                        return {"status": "not_claimed", "jobs": [], "reason": self._last_refusal_reason}
+                    return {"status": "ended", "jobs": [], "reason": None}
 
-                if not (self._has_own_pending(queue) and self._process_one(queue, pipeline_fn)):
-                    self.sleep(1.0)
-                pool.cleanup(t)
+                while self._active:
+                    t = self.now()
+                    c_active = self._coord_active()
+                    if c_active is not None and t - last_beat >= beat_interval:
+                        last_beat = t
+                        cap_now = self._cap()
+                        ml_now = max(1, int(resolve_max_lives(self.out_root, cap_now.get("cpus"), max_lives_fn=self.ml_fn)))
+                        razao_now = monitor._read_perfil_razao(self.out_root, cap_now.get("cpus"))
+                        try:
+                            c_active.beat(worker_alias, cap_now, self._current_job[0], ml_now, razao_now)
+                            for key, sess in list(self._active.items()):
+                                if sess.live_id is None:
+                                    continue
+                                if not c_active.renew(sess.live_id):
+                                    print(f"[fila] lease perdida {sess.live_id}", flush=True)
+                                    self._lost_lives.add(sess.live_id)
+                                    if hasattr(pool, "stop_channel"):
+                                        pool.stop_channel(key)
+                                    else:
+                                        pool.release_on_demand(key)
+                                    sess.lease_lost = True
+                                    sess.live_ended = False
+                                    self._saw_lease_lost = True
+                                    self._active.pop(key, None)
+                        except Exception as exc:
+                            if not monitor._is_mongo_error(exc):
+                                raise
+                            self._on_mongo_err(exc)
 
-            while self._has_own_pending(queue, skip_lost=True):
-                if not self._process_one(queue, pipeline_fn):
-                    break
+                    slot_opened = False
+                    for key, sess in list(self._active.items()):
+                        try:
+                            ended = not sess.tick(t)
+                            if ended:
+                                sess.encerrar()
+                        except Exception as exc:
+                            canal = sess.alvo.canal or self._label(sess.alvo)
+                            print(f"[acompanhar] erro na sessao {canal}: {exc}", flush=True)
+                            self._release_session(key, sess, release_pool=True, reraise_non_mongo=False)
+                            self._active.pop(key, None)
+                            if self.reraise_start_error:  # live unica (follow_live): o chamador ve a falha
+                                raise
+                            slot_opened = True
+                            continue
 
-            all_jobs: list[str] = []
-            for sess in self._all_sessions.values():
-                all_jobs.extend(sess.jobs)
-            status = "lease_lost" if (self._saw_lease_lost and not any(s.live_ended for s in self._all_sessions.values())) else "ended"
-            return {"status": status, "jobs": all_jobs, "reason": None}
+                        if ended:
+                            self._release_session(key, sess, release_pool=False, reraise_non_mongo=True)
+                            self._active.pop(key, None)
+                            slot_opened = True
+
+                    if slot_opened and self._aguardando:
+                        self._promote_aguardando(queue, pool, pipeline_fn, is_live_fn, probe_fn)
+
+                    if not self._active:
+                        break
+
+                    if not (self._has_own_pending(queue) and _process_one_with_keepalive()):
+                        self.sleep(1.0)
+                    pool.cleanup(t)
+                    if hasattr(pool, "enforce_cap"):
+                        pool.enforce_cap(monitor.BUFFER_CAP_BYTES)
+
+                while self._has_own_pending(queue, skip_lost=True):
+                    if not self._process_one(queue, pipeline_fn):
+                        break
+
+                all_jobs: list[str] = []
+                for sess in self._all_sessions.values():
+                    all_jobs.extend(sess.jobs)
+                status = "lease_lost" if (self._saw_lease_lost and not any(s.live_ended for s in self._all_sessions.values())) else "ended"
+                return {"status": status, "jobs": all_jobs, "reason": None}
         finally:
-            for key, sess in list(self._active.items()):
-                try:
-                    pool_ref = sess.pool
-                    pool_ref.release_hold(key)
-                    pool_ref.release_on_demand(key)
-                except Exception:
-                    pass
-                if self.coord is not None and sess.live_id is not None:
+            try:
+                for key, sess in list(self._active.items()):
+                    self._release_session(key, sess, release_pool=True, reraise_non_mongo=True)
+            finally:
+                if pool is not None and hasattr(pool, "stop_all"):
                     try:
-                        self.coord.release(sess.live_id, sess.live_ended)
-                    except Exception as exc:
-                        if not monitor._is_mongo_error(exc):
-                            raise
-            lock.close()
+                        pool.stop_all()
+                    except Exception:
+                        pass
+                lock.close()
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -855,18 +952,19 @@ def main(argv: list[str] | None = None) -> int:
     out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
     queue_root = args.queue_dir.expanduser().resolve() if args.queue_dir else None
     policy = monitor.load_policy(args.policy_file) if args.policy_file else monitor.load_policy(Path("policy.json"))
-    coord = monitor._connect_coord_for_follow(out_root) if os.environ.get("CLIPES_MONGO_URI", "").strip() else None
-
-    sup = Supervisor(
-        parsed,
-        out_root,
-        queue_root=queue_root,
-        max_dur=args.max_dur,
-        policy=policy,
-        coord=coord,
-    )
     try:
-        sup.run()
+        with _exit_signals_to_kb():
+            coord = monitor._connect_coord_for_follow(out_root) if os.environ.get("CLIPES_MONGO_URI", "").strip() else None
+
+            sup = Supervisor(
+                parsed,
+                out_root,
+                queue_root=queue_root,
+                max_dur=args.max_dur,
+                policy=policy,
+                coord=coord,
+            )
+            sup.run()
     except KeyboardInterrupt:
         pass
     except RuntimeError as exc:

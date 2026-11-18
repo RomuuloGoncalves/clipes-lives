@@ -6,7 +6,7 @@ import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
-from clipes.previa import preview_for_discord
+from clipes.previa import DEFAULT_DISCORD_MAX_MB, bitrate_alvo, preview_for_discord
 
 
 def _make_sparse_file(path: Path, size_bytes: int) -> Path:
@@ -121,3 +121,27 @@ def test_real_ffmpeg_3s_synthetic_preview_fits_target(tmp_path: Path):
     assert res.is_file()
     assert res.stat().st_size <= target_bytes
     assert src.stat().st_size == orig_size
+
+
+def test_default_limit_20mb_98_percent_cutoff_and_bitrate_alvo(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CLIPES_DISCORD_MAX_MB", raising=False)
+    assert DEFAULT_DISCORD_MAX_MB == 20.0
+
+    # 19 MB file under default 20 MB limit (<= 98% = 19.6 MB) is returned without ffmpeg
+    src_19m = _make_sparse_file(tmp_path / "clip_19m.mp4", 19 * 1024 * 1024)
+    called: list[list[str]] = []
+    res = preview_for_discord(
+        src_19m,
+        duration=60.0,
+        cache_dir=tmp_path / "cache",
+        run=lambda cmd, **kw: called.append(cmd),
+    )
+    assert res == src_19m
+    assert called == []
+
+    # bitrate_alvo respects custom teto and audio_kbps and can drop below 400
+    v_master = bitrate_alvo(60.0, 20.0, teto=6000, audio_kbps=160)
+    expected = int((20 * 1024 * 1024 * 0.90 * 8) / (1000 * 60)) - 160
+    assert v_master == expected
+    assert bitrate_alvo(10.0, 20.0, teto=6000, audio_kbps=160) == 6000
+    assert bitrate_alvo(500.0, 20.0, teto=6000, audio_kbps=160) < 400

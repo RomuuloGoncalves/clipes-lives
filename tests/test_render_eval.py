@@ -830,3 +830,151 @@ def test_render_clip_forwards_hook_top_and_respects_opt_out(tmp_path: Path, monk
     render_mod.render_clip(clip, 2, [], "", out_dir, cache_dir, live_video_path=src)
     ass_off = (cache_dir / "clip_02_ele-perdeu-tudo.ass").read_text(encoding="utf-8")
     assert "TopHook" not in ass_off
+
+
+def test_master_mode_discord_flags_720_last_stage_rerender_and_livre(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+    from clipes import render as render_mod
+
+    monkeypatch.delenv("CLIPES_BLUR_BG", raising=False)
+    monkeypatch.setenv("CLIPES_MASTER_MODE", "discord")
+    monkeypatch.setenv("CLIPES_DISCORD_MAX_MB", "10")
+
+    src = tmp_path / "live.mkv"
+    src.write_bytes(b"src")
+    out_dir = tmp_path / "out"
+    cache_dir = tmp_path / "cache"
+    out_dir.mkdir()
+    cache_dir.mkdir()
+
+    # 60s clip (+1.2s outro = 61.2s) with 10 MB -> V = ~1072 kbps (400 <= V < 1500 -> 720x1280 last stage)
+    cmds: list[list[str]] = []
+    sizes = [10 * 1024 * 1024, 5 * 1024 * 1024]  # first > 98%, second <= 98%
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        size = sizes.pop(0) if sizes else 1024
+        Path(cmd[-1]).write_bytes(b"\x00" * size)
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(render_mod.subprocess, "run", fake_run)
+    clip = SnappedClip(peak=30.0, start=0.0, end=60.0, score=0.9, title="Master 720")
+    out_mp4 = render_mod.render_clip(
+        clip, 1, [Word(1.0, 1.5, "Oi!")], "", out_dir, cache_dir, live_video_path=src,
+    )
+    assert out_mp4.is_file()
+    assert len(cmds) == 2
+    assert clip.cabe_discord is True
+
+    cmd1, cmd2 = cmds
+    assert "-vf" not in cmd1
+    fc1 = cmd1[cmd1.index("-filter_complex") + 1]
+    assert fc1.endswith("subtitles='" + str(cache_dir / "clip_01_master-720.ass").replace(":", "\\:") + "'[v_out];[v_out]scale=720:1280,setsar=1[v_720]")
+    assert cmd1[cmd1.index("-map") + 1] == "[v_720]"
+
+    v1 = int(cmd1[cmd1.index("-maxrate") + 1].rstrip("k"))
+    v2 = int(cmd2[cmd2.index("-maxrate") + 1].rstrip("k"))
+    assert 400 <= v1 < 1500
+    assert v2 == round(v1 * 0.85)
+    assert cmd2[cmd2.index("-bufsize") + 1] == f"{v2 * 2}k"
+
+    # When retry still exceeds 98% of limit, file is kept and cabe_discord=False
+    cmds.clear()
+    sizes[:] = [10 * 1024 * 1024, 10 * 1024 * 1024]
+    clip_fail = SnappedClip(peak=30.0, start=0.0, end=60.0, score=0.9, title="Nao cabe")
+    out_fail = render_mod.render_clip(clip_fail, 2, [], "", out_dir, cache_dir, live_video_path=src)
+    assert out_fail.is_file()
+    assert len(cmds) == 2
+    assert clip_fail.cabe_discord is False
+
+    # V < 400 (500s with 10 MB) -> no -maxrate, cabe_discord=False
+    cmds.clear()
+    sizes[:] = [1024]
+    clip_long = SnappedClip(peak=100.0, start=0.0, end=500.0, score=0.9, title="Muito longo")
+    render_mod.render_clip(clip_long, 3, [], "", out_dir, cache_dir, live_video_path=src)
+    assert len(cmds) == 1
+    assert "-maxrate" not in cmds[0]
+    assert clip_long.cabe_discord is False
+
+    # CLIPES_MASTER_MODE=livre -> no -maxrate, no 720 downscale, cabe_discord=False
+    monkeypatch.setenv("CLIPES_MASTER_MODE", "livre")
+    cmds.clear()
+    sizes[:] = [1024]
+    clip_livre = SnappedClip(peak=30.0, start=0.0, end=60.0, score=0.9, title="Modo livre")
+    render_mod.render_clip(clip_livre, 4, [], "", out_dir, cache_dir, live_video_path=src)
+    assert len(cmds) == 1
+    assert "-maxrate" not in cmds[0]
+    assert "scale=720:1280" not in cmds[0][cmds[0].index("-filter_complex") + 1]
+    assert clip_livre.cabe_discord is False
+
+
+def test_render_clip_real_ffmpeg_master_10s_limite_2mb(tmp_path: Path, monkeypatch):
+    """Real short ffmpeg test: testsrc 10 s with 2 MB limit -> <= 1.8 MB (90%) and 720x1280."""
+    import subprocess
+    from clipes import render as render_mod
+
+    monkeypatch.delenv("CLIPES_BLUR_BG", raising=False)
+    monkeypatch.setenv("CLIPES_MASTER_MODE", "discord")
+    monkeypatch.setenv("CLIPES_DISCORD_MAX_MB", "2")
+
+    src = tmp_path / "live_10s.mkv"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", "testsrc2=size=1280x720:rate=30:duration=11",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=11",
+            "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", str(src),
+        ],
+        check=True,
+    )
+    out_dir, cache_dir = tmp_path / "out", tmp_path / "cache"
+    out_dir.mkdir()
+    cache_dir.mkdir()
+
+    clip = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Master 2MB")
+    mp4 = render_mod.render_clip(clip, 1, [], "", out_dir, cache_dir, live_video_path=src)
+    assert mp4.is_file()
+    assert clip.cabe_discord is True
+    assert mp4.stat().st_size <= int(1.8 * 1024 * 1024)
+    streams = _ffprobe_streams(mp4)
+    video = next(s for s in streams if s["codec_type"] == "video")
+    assert (video["width"], video["height"]) == (720, 1280)
+
+
+def test_master_mode_discord_retry_falha_mantem_master_e_marca_cabe_discord_false(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+    from clipes import render as render_mod
+
+    monkeypatch.delenv("CLIPES_BLUR_BG", raising=False)
+    monkeypatch.setenv("CLIPES_MASTER_MODE", "discord")
+    monkeypatch.setenv("CLIPES_DISCORD_MAX_MB", "10")
+
+    src = tmp_path / "live.mkv"
+    src.write_bytes(b"src")
+    out_dir = tmp_path / "out"
+    cache_dir = tmp_path / "cache"
+    out_dir.mkdir()
+    cache_dir.mkdir()
+
+    valid_master = b"VALID_MASTER" * (900 * 1024)  # > 98% of 10 MB
+    calls: list[Path] = []
+
+    def fake_run(cmd, **kw):
+        target = Path(cmd[-1])
+        calls.append(target)
+        if len(calls) == 1:
+            target.write_bytes(valid_master)
+            return SimpleNamespace(returncode=0, stderr="", stdout="")
+        target.write_bytes(b"CORRUPT_PARTIAL")
+        return SimpleNamespace(returncode=1, stderr="encode failed", stdout="")
+
+    monkeypatch.setattr(render_mod.subprocess, "run", fake_run)
+    clip = SnappedClip(peak=30.0, start=0.0, end=60.0, score=0.9, title="Retry falha")
+    out_mp4 = render_mod.render_clip(clip, 1, [], "", out_dir, cache_dir, live_video_path=src)
+
+    assert len(calls) == 2
+    assert calls[0] != calls[1]
+    assert out_mp4.is_file()
+    assert out_mp4.read_bytes() == valid_master
+    assert clip.cabe_discord is False
+    assert not list(out_dir.glob(".tmp_clip_*"))

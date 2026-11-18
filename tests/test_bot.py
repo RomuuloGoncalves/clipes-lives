@@ -16,6 +16,7 @@ import pytest
 from clipes import __main__ as entry
 from clipes import bot as bot_mod
 from clipes import oauth as oauth_mod
+from clipes import publicacao
 from clipes.publicacao import LocalStore, MongoStore
 
 T0 = 1_763_400_000.0
@@ -28,9 +29,11 @@ THREAD_ID = 555666777888999000
 
 
 class _FakeUser:
-    def __init__(self, uid: int | str, *, bot: bool = False):
+    def __init__(self, uid: int | str, *, bot: bool = False, name: str | None = None):
         self.id = int(uid)
         self.bot = bot
+        self.name = name or str(uid)
+        self.display_name = self.name
 
 
 class _FakeChannel:
@@ -38,9 +41,11 @@ class _FakeChannel:
         self.id = int(cid)
         self.parent_id = int(parent_id) if parent_id is not None else None
         self.sent: list[str] = []
+        self.sent_kwargs: list[dict[str, Any]] = []
 
     async def send(self, content: str, **kwargs: Any) -> None:
         self.sent.append(content)
+        self.sent_kwargs.append(kwargs)
 
 
 class _FakeMessage:
@@ -56,17 +61,21 @@ class _FakeMessage:
         self.author = _FakeUser(author_id, bot=author_bot)
         self.channel = channel or _FakeChannel(CHANNEL_ID)
         self.replies: list[str] = []
+        self.reply_kwargs: list[dict[str, Any]] = []
 
     async def reply(self, content: str, **kwargs: Any) -> None:
         self.replies.append(content)
+        self.reply_kwargs.append(kwargs)
 
 
 class _FakeInteractionResponse:
     def __init__(self) -> None:
         self.messages: list[tuple[str, bool]] = []
+        self.kwargs_list: list[dict[str, Any]] = []
 
     async def send_message(self, content: str, *, ephemeral: bool = False, **kwargs: Any) -> None:
         self.messages.append((content, ephemeral))
+        self.kwargs_list.append(kwargs)
 
 
 class _FakeInteraction:
@@ -158,7 +167,7 @@ def test_make_bot_intents_commands_and_guild_sync(tmp_path: Path):
     pub_cmd = bot.tree.get_command("publicar")
     list_cmd = bot.tree.get_command("listar")
     assert pub_cmd is not None
-    assert [p.name for p in pub_cmd.parameters] == ["id"]
+    assert [p.name for p in pub_cmd.parameters] == ["id", "agora"]
     assert list_cmd is not None
 
     synced: list[tuple[str, int | None]] = []
@@ -691,3 +700,346 @@ def test_asterisco_libera_qualquer_usuario():
     assert publicacao.user_allowed("999", ["*"])
     assert publicacao.user_allowed("999", ["111"]) is False
     assert publicacao.user_allowed("999", []) is False
+
+
+def test_buscar_slash_e_texto_resultado_vazio_curto_permissao_canal_e_limite_1900(tmp_path: Path):
+    from clipes.registro import Registro
+
+    reg = Registro(tmp_path)
+    for i in range(20):
+        reg.upsert({
+            "clip_id": f"gta_c{i:02d}",
+            "titulo": f"Trailer Épico GTA Parte {i} " + ("x" * 40),
+            "hashtags": ["#gta6"],
+            "legenda": "Momento insano",
+            "canal": "gaules",
+            "criado_em": T0 + i * 86400,
+            "arquivo": f"p/gta_c{i:02d}.mp4",
+            "tamanho": 100,
+            "sha256": f"sha_{i}",
+        })
+        reg.set_discord(f"gta_c{i:02d}", {
+            "thread_id": "555666777888999000",
+            "message_id": f"888000{i:02d}",
+            "attachment_id": f"att_{i}",
+            "filename": f"gta_c{i:02d}.mp4",
+            "size": 100,
+        })
+        reg.marcar(f"gta_c{i:02d}", status="no_discord", ack_em=T0 + i * 86400)
+
+    store = LocalStore(tmp_path)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+    buscar_cmd = bot.tree.get_command("buscar")
+    assert buscar_cmd is not None
+
+    # 1. Happy path via /buscar -> <= 1900 chars, newest first, with link & status & date
+    i_ok = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    i_ok.guild_id = GUILD_ID
+    asyncio.run(buscar_cmd.callback(i_ok, "gta trailer"))
+    resp_text, eph = i_ok.response.messages[0]
+    assert eph is False
+    assert len(resp_text) <= 1900
+    assert "gta_c19" in resp_text
+    assert f"https://discord.com/channels/{GUILD_ID}/555666777888999000/88800019" in resp_text
+    assert "no_discord" in resp_text
+
+    # 2. Text command `buscar <texto>` using message.guild.id
+    class _FakeGuild:
+        id = GUILD_ID
+
+    m_ok = _FakeMessage("buscar gta trailer", author_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    m_ok.guild = _FakeGuild()
+    asyncio.run(bot.on_message(m_ok))
+    assert len(m_ok.replies) == 1
+    assert "gta_c19" in m_ok.replies[0]
+    assert f"https://discord.com/channels/{GUILD_ID}/" in m_ok.replies[0]
+
+    # 3. Empty search result
+    i_empty = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(buscar_cmd.callback(i_empty, "naoexiste"))
+    assert i_empty.response.messages[0][0] == 'nenhum clipe para "naoexiste"'
+
+    # 4. Short query (< 2 chars) via slash and message `buscar a`
+    i_short = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(buscar_cmd.callback(i_short, "x"))
+    assert i_short.response.messages[0][0] == "busca precisa de 2+ caracteres"
+
+    m_short = _FakeMessage("buscar x", author_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(bot.on_message(m_short))
+    assert m_short.replies == ["busca precisa de 2+ caracteres"]
+
+    # 5. Unauthorized user
+    i_unauth = _FakeInteraction(user_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(buscar_cmd.callback(i_unauth, "gta"))
+    assert i_unauth.response.messages == [("sem permissao", True)]
+
+    m_unauth = _FakeMessage("buscar gta", author_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(bot.on_message(m_unauth))
+    assert m_unauth.replies == ["sem permissao"]
+
+    # 6. Wrong channel
+    i_wrong = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(OTHER_CHANNEL_ID))
+    asyncio.run(buscar_cmd.callback(i_wrong, "gta"))
+    assert i_wrong.response.messages == [("canal nao permitido", True)]
+
+    m_wrong = _FakeMessage("buscar gta", author_id=ALLOWED_USER, channel=_FakeChannel(OTHER_CHANNEL_ID))
+    asyncio.run(bot.on_message(m_wrong))
+    assert m_wrong.replies == []
+
+
+def test_on_interaction_aprovar_botao_permitido_negado_desconhecido_e_inexistente(tmp_path: Path):
+    _make_clip(tmp_path, video_id="btn1", clip_id="btn1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    tokens_path = _write_tokens(tmp_path / "tokens.json")
+    db, store = _mongo_store("w-pc1", "pc-mesa", T0)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=T0,
+    )
+
+    class _FakeComponentMsg:
+        def __init__(self, content: str):
+            self.content = content
+            self.edits: list[dict[str, Any]] = []
+
+        async def edit(self, *, content: str | None = None, view: Any = "UNSET") -> None:
+            self.edits.append({"content": content, "view": view})
+            if content is not None:
+                self.content = content
+
+    class _FakeComponentInteraction:
+        def __init__(
+            self,
+            *,
+            custom_id: str,
+            user_id: int | str = ALLOWED_USER,
+            user_name: str = "Romulo",
+            channel: _FakeChannel | None = None,
+            itype: Any = discord.InteractionType.component,
+            msg: _FakeComponentMsg | None = None,
+        ):
+            self.type = itype
+            self.data = {"custom_id": custom_id, "component_type": 2}
+            self.user = _FakeUser(user_id, name=user_name)
+            self.channel = channel or _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+            self.channel_id = self.channel.id
+            self.message = msg
+            self.response = _FakeInteractionResponse()
+
+    # 1. Unknown prefix or non-component type -> ignored
+    i_other_prefix = _FakeComponentInteraction(custom_id="outro:btn1_c01", msg=_FakeComponentMsg("post"))
+    i_app_cmd = _FakeComponentInteraction(
+        custom_id="aprovar:btn1_c01",
+        itype=discord.InteractionType.application_command,
+        msg=_FakeComponentMsg("post"),
+    )
+    asyncio.run(bot.on_interaction(i_other_prefix))
+    asyncio.run(bot.on_interaction(i_app_cmd))
+    assert i_other_prefix.response.messages == []
+    assert i_app_cmd.response.messages == []
+    assert db.publish_requests.count_documents({}) == 0
+
+    # 2. Unauthorized user -> ephemeral, no request, message not edited
+    msg_unauth = _FakeComponentMsg("Clipe bom")
+    i_unauth = _FakeComponentInteraction(custom_id="aprovar:btn1_c01", user_id=OTHER_USER, msg=msg_unauth)
+    asyncio.run(bot.on_interaction(i_unauth))
+    assert i_unauth.response.messages == [("sem permissao", True)]
+    assert msg_unauth.edits == []
+    assert db.publish_requests.count_documents({}) == 0
+
+    # 3. Wrong channel -> ephemeral, no request
+    msg_wrong = _FakeComponentMsg("Clipe bom")
+    i_wrong = _FakeComponentInteraction(
+        custom_id="aprovar:btn1_c01",
+        channel=_FakeChannel(OTHER_CHANNEL_ID),
+        msg=msg_wrong,
+    )
+    asyncio.run(bot.on_interaction(i_wrong))
+    assert i_wrong.response.messages == [("canal nao permitido", True)]
+    assert msg_wrong.edits == []
+    assert db.publish_requests.count_documents({}) == 0
+
+    # 4. Nonexistent clip -> returns request message, does not edit button
+    msg_nf = _FakeComponentMsg("Clipe antigo")
+    i_nf = _FakeComponentInteraction(custom_id="aprovar:fantasma_c99", msg=msg_nf)
+    asyncio.run(bot.on_interaction(i_nf))
+    assert i_nf.response.messages == [("clipe fantasma_c99 nao encontrado", False)]
+    assert msg_nf.edits == []
+
+    # 5. Allowed user after simulated restart (brand new bot instance, no View state)
+    bot_restarted = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=T0,
+    )
+    msg_ok = _FakeComponentMsg("**Titulo btn1_c01** (`btn1_c01`)")
+    i_ok = _FakeComponentInteraction(custom_id="aprovar:btn1_c01", user_id=ALLOWED_USER, user_name="Romulo", msg=msg_ok)
+    asyncio.run(bot_restarted.on_interaction(i_ok))
+    assert len(i_ok.response.messages) == 1
+    assert "youtube: publicacao enfileirada" in i_ok.response.messages[0][0]
+    assert i_ok.response.messages[0][1] is False
+    assert db.publish_requests.find_one({"_id": "btn1_c01:youtube"})["status"] == "pending"
+    assert len(msg_ok.edits) == 1
+    assert msg_ok.edits[0]["view"] is None
+    assert "aprovado por Romulo" in msg_ok.edits[0]["content"]
+
+
+def test_bot_publicar_com_agenda_e_sufixo_agora(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from zoneinfo import ZoneInfo
+
+    sp = ZoneInfo("America/Sao_Paulo")
+    t_now = datetime(2026, 11, 18, 10, 0, tzinfo=sp).timestamp()
+    monkeypatch.setenv("CLIPES_AGENDA_HORARIOS", "11:30,19:00")
+    monkeypatch.setenv("CLIPES_TZ", "America/Sao_Paulo")
+
+    _make_clip(tmp_path, video_id="ag1", clip_id="ag1_c01", owner="w-pc1", thread_id=None)
+    _make_clip(tmp_path, video_id="ag2", clip_id="ag2_c01", owner="w-pc1", thread_id=None)
+    _make_clip(tmp_path, video_id="ag3", clip_id="ag3_c01", owner="w-pc1", thread_id=None)
+    tokens_path = _write_tokens(tmp_path / "tokens.json")
+    db, store = _mongo_store("w-pc1", "pc-mesa", t_now)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=t_now,
+    )
+
+    # 1. Text `publicar ag1_c01` -> agendado para 11:30
+    msg_ag = _FakeMessage("publicar ag1_c01", channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(bot.on_message(msg_ag))
+    assert len(msg_ag.replies) == 1
+    assert "agendado para 2026-11-18 11:30 (America/Sao_Paulo)" in msg_ag.replies[0]
+    doc_ag = db.publish_requests.find_one({"_id": "ag1_c01:youtube"})
+    assert doc_ag is not None and doc_ag.get("agendar_para") is not None
+
+    # 2. Text `publicar ag2_c01 agora` -> sem agendar_para
+    msg_now = _FakeMessage("publicar ag2_c01 agora", channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(bot.on_message(msg_now))
+    assert len(msg_now.replies) == 1
+    assert "youtube: publicacao enfileirada" in msg_now.replies[0]
+    assert "agendado para" not in msg_now.replies[0]
+    doc_now = db.publish_requests.find_one({"_id": "ag2_c01:youtube"})
+    assert doc_now is not None and "agendar_para" not in doc_now
+
+    # 3. Slash `/publicar id:ag3_c01 agora:True` -> sem agendar_para
+    pub_cmd = bot.tree.get_command("publicar")
+    assert pub_cmd is not None
+    inter_now = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(pub_cmd.callback(inter_now, "ag3_c01", agora=True))
+    assert "agendado para" not in inter_now.response.messages[0][0]
+    doc_slash = db.publish_requests.find_one({"_id": "ag3_c01:youtube"})
+    assert doc_slash is not None and "agendar_para" not in doc_slash
+
+
+def test_bot_respostas_usam_allowed_mentions_none_e_buscar_usa_to_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from clipes.registro import Registro
+
+    _make_clip(tmp_path, video_id="sec1", clip_id="sec1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    tokens_path = _write_tokens(tmp_path / "tokens.json")
+    reg = Registro(tmp_path)
+    reg.upsert({"clip_id": "sec1_c01", "titulo": "Clip Sec", "canal": "gaules", "criado_em": T0})
+
+    _, store = _mongo_store("w-pc1", "pc-mesa", T0)
+    thread_ch = _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=["*"],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=T0,
+    )
+    bot.get_channel = lambda cid: thread_ch if int(cid) == THREAD_ID else None  # type: ignore[method-assign]
+
+    def _assert_none_mentions(am: Any) -> None:
+        assert isinstance(am, discord.AllowedMentions)
+        assert am.everyone is False
+        assert am.users is False
+        assert am.roles is False
+        assert am.replied_user is False
+
+    to_thread_calls: list[Any] = []
+    real_to_thread = asyncio.to_thread
+
+    async def spy_to_thread(func, /, *args, **kwargs):
+        to_thread_calls.append(func)
+        return await real_to_thread(func, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", spy_to_thread)
+
+    # 1. Text `buscar @everyone <@123>` with allowed_ids=["*"]
+    m_search = _FakeMessage("buscar @everyone <@123>", author_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(bot.on_message(m_search))
+    assert "@everyone" in m_search.replies[0]
+    _assert_none_mentions(m_search.reply_kwargs[0].get("allowed_mentions"))
+
+    # 2. Slash `/buscar @here`
+    buscar_cmd = bot.tree.get_command("buscar")
+    assert buscar_cmd is not None
+    i_search = _FakeInteraction(user_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(buscar_cmd.callback(i_search, "@here"))
+    _assert_none_mentions(i_search.response.kwargs_list[0].get("allowed_mentions"))
+    assert to_thread_calls == [bot_mod._format_search_results, bot_mod._format_search_results]
+
+    # 3. Text `publicar` & Slash `/publicar` & `/listar`
+    m_pub = _FakeMessage("publicar sec1_c01", author_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(bot.on_message(m_pub))
+    _assert_none_mentions(m_pub.reply_kwargs[0].get("allowed_mentions"))
+    _assert_none_mentions(thread_ch.sent_kwargs[0].get("allowed_mentions"))
+
+    pub_cmd = bot.tree.get_command("publicar")
+    list_cmd = bot.tree.get_command("listar")
+    assert pub_cmd is not None and list_cmd is not None
+    i_pub = _FakeInteraction(user_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    i_list = _FakeInteraction(user_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(pub_cmd.callback(i_pub, "sec1_c01"))
+    asyncio.run(list_cmd.callback(i_list))
+    _assert_none_mentions(i_pub.response.kwargs_list[0].get("allowed_mentions"))
+    _assert_none_mentions(i_list.response.kwargs_list[0].get("allowed_mentions"))
+
+    # 4. Button `aprovar:` (with edit accepting allowed_mentions)
+    class _EditMsg:
+        def __init__(self, content: str):
+            self.content = content
+            self.edits: list[dict[str, Any]] = []
+
+        async def edit(self, *, content: str | None = None, view: Any = "UNSET", allowed_mentions: Any = None) -> None:
+            self.edits.append({"content": content, "view": view, "allowed_mentions": allowed_mentions})
+
+    class _BtnInteraction:
+        def __init__(self, custom_id: str, msg: _EditMsg):
+            self.type = discord.InteractionType.component
+            self.data = {"custom_id": custom_id, "component_type": 2}
+            self.user = _FakeUser(OTHER_USER, name="@everyone")
+            self.channel = _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+            self.channel_id = THREAD_ID
+            self.message = msg
+            self.response = _FakeInteractionResponse()
+
+    edit_msg = _EditMsg("post")
+    i_btn = _BtnInteraction("aprovar:sec1_c01", edit_msg)
+    asyncio.run(bot.on_interaction(i_btn))
+    _assert_none_mentions(i_btn.response.kwargs_list[0].get("allowed_mentions"))
+    assert len(edit_msg.edits) == 1
+    _assert_none_mentions(edit_msg.edits[0].get("allowed_mentions"))

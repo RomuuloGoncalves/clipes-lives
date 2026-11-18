@@ -541,6 +541,7 @@ def build_video_filter(
     blur_bg: bool | None = None,
     crop: tuple[int, int, int, int] | None = None,
     bar: BarConfig | None = None,
+    downscale_720: bool = False,
 ) -> tuple[str, str]:
     """Build ffmpeg -filter_complex string and mapped video pad label."""
     if blur_bg is None:
@@ -605,6 +606,10 @@ def build_video_filter(
         vf_parts.append(f"{cur}subtitles='{escaped_ass}'[v_out]")
         cur = "[v_out]"
 
+    if downscale_720:
+        vf_parts.append(f"{cur}scale=720:1280,setsar=1[v_720]")
+        cur = "[v_720]"
+
     return ";".join(vf_parts), cur
 
 
@@ -621,6 +626,46 @@ def build_audio_filter(
     )
 
 
+def _master_mode() -> str:
+    raw = os.environ.get("CLIPES_MASTER_MODE", "").strip().lower()
+    return "livre" if raw == "livre" else "discord"
+
+
+def _build_render_cmd(
+    *,
+    pre_args: list[str],
+    src_path: Path,
+    logo_args: list[str],
+    filter_complex: str,
+    v_map: str,
+    af_chain: str,
+    total_dur: float,
+    tmp_out: Path,
+    maxrate_kbps: int | None = None,
+) -> list[str]:
+    rate_args = (
+        ["-maxrate", f"{maxrate_kbps}k", "-bufsize", f"{maxrate_kbps * 2}k"]
+        if maxrate_kbps is not None
+        else []
+    )
+    return [
+        "ffmpeg", "-y", "-v", "error",
+        *pre_args,
+        "-i", str(src_path),
+        *logo_args,
+        "-filter_complex", filter_complex,
+        "-map", v_map,
+        "-map", "0:a?",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
+        *rate_args,
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac", "-b:a", "160k", "-af", af_chain,
+        "-t", f"{total_dur:.3f}",
+        "-movflags", "+faststart",
+        str(tmp_out),
+    ]
+
+
 def render_clip(
     clip: SnappedClip,
     idx: int,
@@ -632,7 +677,7 @@ def render_clip(
     channel_credit: str = "",
     reframe: bool = False,
 ) -> Path:
-    """Download window (or slice live recording) and render 1080x1920 MP4 with ASS captions."""
+    """Download window (or slice live recording) and render 1080x1920 (or 720x1280) MP4 with ASS captions."""
     bar = bar_config()
     stem = clip_stem(idx, clip)
     out_file = out_dir / f"{stem}.mp4"
@@ -674,40 +719,75 @@ def render_clip(
     clip.layout = (  # type: ignore[attr-defined]
         "reframed_face" if crop is not None else ("blurred_16x9" if blur_bg else "black_bars_16x9")
     )
-    filter_complex, v_map = build_video_filter(
-        ass_path=ass_path,
-        n_subs=n_subs,
-        outro_duration=OUTRO_DURATION,
-        blur_bg=blur_bg,
-        crop=crop,
-        bar=bar,
-    )
     af_chain = build_audio_filter(clip.duration, outro_duration=OUTRO_DURATION)
     total_dur = clip.duration + OUTRO_DURATION
-
     logo_args = ["-i", str(bar.logo)] if (bar is not None and bar.logo is not None) else []
     tmp_out = out_dir / f".tmp_clip_{idx:02d}.mp4"
-    cmd = [
-        "ffmpeg", "-y", "-v", "error",
-        *pre_args,
-        "-i", str(src_path),
-        *logo_args,
-        "-filter_complex", filter_complex,
-        "-map", v_map,
-        "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "21", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "160k", "-af", af_chain,
-        "-t", f"{total_dur:.3f}",
-        "-movflags", "+faststart",
-        str(tmp_out),
-    ]
-    try:
+
+    mode = _master_mode()
+    rate_kbps: int | None = None
+    accept_bytes: int | None = None
+    if mode == "livre":
+        clip.cabe_discord = False
+    else:
+        from .previa import _resolve_limit_mb, bitrate_alvo
+
+        limit_mb = _resolve_limit_mb(None)
+        accept_bytes = int(limit_mb * 1024 * 1024 * 0.98)
+        v_kbps = bitrate_alvo(total_dur, limit_mb, teto=6000, audio_kbps=160)
+        if v_kbps < 400:
+            clip.cabe_discord = False
+        else:
+            rate_kbps = v_kbps
+            clip.cabe_discord = True
+
+    tmp_retry = out_dir / f".tmp_clip_{idx:02d}.retry.mp4"
+
+    def _run_encode(maxrate: int | None, target: Path = tmp_out) -> None:
+        downscale = maxrate is not None and maxrate < 1500
+        filter_complex, v_map = build_video_filter(
+            ass_path=ass_path,
+            n_subs=n_subs,
+            outro_duration=OUTRO_DURATION,
+            blur_bg=blur_bg,
+            crop=crop,
+            bar=bar,
+            downscale_720=downscale,
+        )
+        cmd = _build_render_cmd(
+            pre_args=pre_args,
+            src_path=src_path,
+            logo_args=logo_args,
+            filter_complex=filter_complex,
+            v_map=v_map,
+            af_chain=af_chain,
+            total_dur=total_dur,
+            tmp_out=target,
+            maxrate_kbps=maxrate,
+        )
         res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
         if res.returncode != 0:
             raise RuntimeError(f"ffmpeg render failed: {(res.stderr or res.stdout)[-500:]}")
+
+    try:
+        _run_encode(rate_kbps, tmp_out)
+        if rate_kbps is not None and accept_bytes is not None and tmp_out.is_file():
+            if tmp_out.stat().st_size > accept_bytes:
+                retry_kbps = max(1, round(rate_kbps * 0.85))
+                try:
+                    _run_encode(retry_kbps, tmp_retry)
+                except Exception as exc:
+                    print(f"[render] re-encode falhou; mantendo master: {exc}", flush=True)
+                    clip.cabe_discord = False
+                else:
+                    if tmp_retry.is_file():
+                        if tmp_retry.stat().st_size > accept_bytes:
+                            clip.cabe_discord = False
+                        tmp_retry.replace(tmp_out)
         tmp_out.replace(out_file)
     finally:
         tmp_out.unlink(missing_ok=True)
+        tmp_retry.unlink(missing_ok=True)
         if temp_seg is not None:
             temp_seg.unlink(missing_ok=True)
 

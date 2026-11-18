@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import mongomock
 import pytest
 
 from clipes import __main__ as entry, acompanhar, monitor
+from clipes.coord import Coord
 
 B = 1_700_000_100  # multiple of 300
 
@@ -60,6 +64,8 @@ class FakeMultiPool:
         self.active: set[str] = set()
         self.stopped: set[str] = set()
         self.first: dict[str, int] = {}
+        self.enforce_caps: list[int] = []
+        self.stop_all_calls = 0
 
     def start_on_demand(self, ch: str) -> bool:
         if ch in self.fail_on:
@@ -100,6 +106,14 @@ class FakeMultiPool:
 
     def cleanup(self, now: float) -> None:
         pass
+
+    def enforce_cap(self, max_bytes: int) -> None:
+        self.enforce_caps.append(max_bytes)
+
+    def stop_all(self) -> None:
+        self.stop_all_calls += 1
+        for ch in list(self.active):
+            self.release_on_demand(ch)
 
 
 # ---- T4: parse_alvo & dedup ----------------------------------------------------------------------
@@ -469,3 +483,110 @@ def test_main_acompanhar_rota_alvo_invalido_e_lock_ocupado(tmp_path, monkeypatch
     env = {k: v for k, v in os.environ.items() if k != "CLIPES_MONGO_URI"}
     res = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False)
     assert res.returncode == 0, res.stderr + res.stdout
+
+
+def test_erro_tick_ou_encerrar_remove_so_sessao_com_falha_e_mantem_outra_viva(tmp_path, monkeypatch, capsys):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-isol", now=clock.now, lease_s=300)
+
+    class FailingPool(FakeMultiPool):
+        def freeze_and_concat(self, ch: str, s: float, e: float, dst: Path) -> Path:
+            if ch == "canal_a":
+                raise RuntimeError("ffmpeg concat failed")
+            return super().freeze_and_concat(ch, s, e, dst)
+
+    pool = FailingPool(clock, {"canal_a": B + 620, "canal_b": B + 620})
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("canal_a"), acompanhar.parse_alvo("canal_b")],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        is_live=lambda u: True,
+        probe=lambda u: {"id": "a1" if "canal_a" in u else "b1", "is_live": True},
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    res = sup.run()
+    out = capsys.readouterr().out
+
+    assert res["status"] == "ended"
+    assert "[acompanhar]" in out and "canal_a" in out
+    assert "canal_a" in pool.stopped
+    assert "canal_a" not in pool.active
+    assert db.lives.find_one({"_id": "twitch:canal_a:a1"})["owner"] is None
+    assert db.lives.find_one({"_id": "twitch:canal_b:b1"})["status"] == "ended"
+    assert any(j.startswith("canal_b_") for j in res["jobs"])
+
+
+def test_sigterm_sighup_para_gravadores_e_enforce_cap_no_ciclo(tmp_path, monkeypatch):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
+
+    # 1. Normal run invokes enforce_cap(BUFFER_CAP_BYTES) and stop_all()
+    pool_ok = FakeMultiPool(clock, {"c1": B + 320})
+    sup_ok = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("c1")],
+        tmp_path / "out_ok",
+        pool=pool_ok,
+        pipeline=lambda d, o: {"clips": []},
+        is_live=lambda u: True,
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+    )
+    assert sup_ok.run()["status"] == "ended"
+    assert monitor.BUFFER_CAP_BYTES in pool_ok.enforce_caps
+    assert pool_ok.stop_all_calls >= 1
+
+    # 2. SIGTERM raises KeyboardInterrupt, stops pool, restores previous handler
+    prev_term = signal.getsignal(signal.SIGTERM)
+    clock_sig = Clock(B + 10)
+
+    class SigPool(FakeMultiPool):
+        def segments(self, ch):
+            if self.clock.t >= B + 30:
+                os.kill(os.getpid(), signal.SIGTERM)
+            return super().segments(ch)
+
+    pool_sig = SigPool(clock_sig, {"c1": B + 600})
+    sup_sig = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("c1")],
+        tmp_path / "out_sig",
+        pool=pool_sig,
+        pipeline=lambda d, o: {"clips": []},
+        is_live=lambda u: True,
+        now=clock_sig.now,
+        sleep=clock_sig.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+    )
+    with pytest.raises(KeyboardInterrupt):
+        sup_sig.run()
+
+    assert pool_sig.stop_all_calls >= 1
+    assert pool_sig.active == set()
+    assert signal.getsignal(signal.SIGTERM) is prev_term
+
+    # 3. SIGHUP in main() returns 0 cleanly and restores previous handler
+    if hasattr(signal, "SIGHUP"):
+        prev_hup = signal.getsignal(signal.SIGHUP)
+
+        class HupSup:
+            def __init__(self, *a, **kw):
+                pass
+
+            def run(self):
+                os.kill(os.getpid(), signal.SIGHUP)
+                return {"status": "ended"}
+
+        monkeypatch.setattr(acompanhar, "Supervisor", HupSup)
+        rc = acompanhar.main(["c1", "--out-dir", str(tmp_path / "out_hup")])
+        assert rc == 0
+        assert signal.getsignal(signal.SIGHUP) is prev_hup

@@ -108,6 +108,7 @@ class SnappedClip:
     hook_top: str = ""
     description_long: str = ""
     description_source: str = ""
+    cabe_discord: bool = True
 
     @property
     def duration(self) -> float:

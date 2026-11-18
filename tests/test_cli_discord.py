@@ -185,6 +185,7 @@ def test_cli_main_posta_2_clipes_e_nao_reposta_ao_rerodar(tmp_path, monkeypatch)
     assert saved["discord"]["thread_id"] == "thr-1"
     assert saved["clips"][0]["discord"] == {"thread_id": "thr-1", "message_id": "msg-2"}
     assert saved["clips"][1]["discord"] == {"thread_id": "thr-1", "message_id": "msg-3"}
+    assert saved["clips"][0]["cabe_discord"] is True
 
     # Rerun on same folder: _merge_discord preserves ids -> 0 Discord calls
     rc2 = cli.main([

@@ -208,7 +208,8 @@ Formatos aceitos: `<canal>`, `twitch.tv/<canal>`, `youtube.com/@<handle>/live`, 
 
 - **Limite simultâneo (`CLIPES_MAX_LIVES`)**: se `CLIPES_MAX_LIVES` for um inteiro `>= 1`, ele define o máximo de lives gravando ao mesmo tempo; caso contrário vale o resultado de `bench-live` em `OUT_DIR/.perfil.json` (ou `1` sem medição).
 - **Recusa visível e fila de espera**: lives acima do limite (ou com lease ocupada por outro PC no Mongo) ficam em `aguardando` na ordem dos argumentos e começam assim que uma vaga abre. Cada recusa aparece no log (`[acompanhar] recusada ...`) e é enviada uma vez para o `DISCORD_CHANNEL_ID`. Janelas descartadas por backlog também avisam no Discord.
-- **Disco por live**: cada gravador mantém cerca de 20 minutos de buffer em `queue/.buffer/` (~900 MB por live a 6 Mb/s). `CLIPES_MIN_FREE_GB` evita fechar novas janelas quando o disco aperta, mas não limita o buffer em andamento.
+- **Disco por live**: cada gravador mantém cerca de 20 minutos de buffer em `queue/.buffer/` (~900 MB por live a 6 Mb/s), respeitando o teto global `BUFFER_CAP_BYTES` (~1,5 GB). `CLIPES_MIN_FREE_GB` evita fechar novas janelas quando o disco aperta, mas não limita o buffer em andamento.
+- **Lease no MongoDB (2 PCs)**: o worker mantém `beat`/`renew` ativos em segundo plano durante o processamento de cada job, mas avisos síncronos ao Discord (`post_aviso`, timeout até ~60 s) pausam o laço principal; mantenha `CLIPES_LEASE_S` >= `90` (padrão).
 - **YouTube (experimental)**: a gravação de lives do YouTube usa `yt-dlp -f "b[height<=1080]/b" --hls-use-mpegts -o -` sem chat. Se alguma live não entregar formato muxado via `yt-dlp`, o plano B é testar `streamlink <url> best`.
 - **Smoke manual**: rode 1 live da Twitch + 1 live do YouTube com `CLIPES_MAX_LIVES=2` por ~15 minutos (`./clipar acompanhar <twitch> <youtube>`) e confira nos logs e na fila que janelas das duas lives são geradas sem dois jobs simultâneos em `processing/`.
 
@@ -245,7 +246,7 @@ O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o s
    - Abra a URL gerada e autorize o bot no seu servidor.
 4. No `.env` (obtidos pelo Modo Desenvolvedor do Discord):
    - `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` e `DISCORD_ALLOWED_USER_IDS` (lista vazia bloqueia todas as publicações; `*` libera qualquer usuário que enxergue o canal).
-   - `CLIPES_DISCORD_MAX_MB=10` (opcional; prévia é recomprimida para 720x1280 se passar de 90% do limite, preservando o original 1080x1920).
+   - `CLIPES_DISCORD_MAX_MB=20` (opcional; no modo padrão `discord`, o master já mira esse teto em uma única codificação, caindo para 720x1280 se o bitrate ficar abaixo de 1500 kbps).
 
 ### 2. Google Cloud (YouTube Data API v3)
 
@@ -276,11 +277,38 @@ Subir o serviço contínuo do bot (um único processo por servidor Discord; exig
 docker compose up -d bot
 ```
 
-Comandos disponíveis apenas no canal configurado (`DISCORD_CHANNEL_ID`), suas threads e para IDs em `DISCORD_ALLOWED_USER_IDS`: `publicar <clip_id>`, `/publicar id:<clip_id>` e `/listar`.
+Comandos disponíveis apenas no canal configurado (`DISCORD_CHANNEL_ID`), suas threads e para IDs em `DISCORD_ALLOWED_USER_IDS`: `publicar <clip_id>` (ou `publicar <clip_id> agora`), `/publicar id:<clip_id>` (opcional `agora:True`), `/listar`, `/buscar texto:<palavras>` e `buscar <palavras>`.
+
+- **Agenda de publicação:** no `docker-compose.yml`, `CLIPES_AGENDA_HORARIOS` vem com padrão `11:30,19:00` no fuso `CLIPES_TZ` (`America/Sao_Paulo`). Cada pedido aprovado recebe o próximo horário livre daquela plataforma com folga mínima de 30 minutos (1 publicação por horário por plataforma); defina `CLIPES_AGENDA_HORARIOS=` (vazio) no `.env` para publicar na hora, ou use `publicar <clip_id> agora` para publicar imediatamente.
 
 > **Workers multi-PC:** todo PC que executa o `monitor` e publica seus próprios clipes também precisa de `DISCORD_BOT_TOKEN` no `.env`; sem ele o worker pula prévias e `run_pending`, deixando pedidos `pending` na fila.
 
-### 5. Auditoria para publicação pública (futuro)
+### 5. Registro e liberar disco
+
+Todo clipe processado por CLI ou worker é indexado em `OUT_DIR/registro.json` (fonte da verdade local, gravada com `flock` e escrita atômica) com hash SHA-256, tamanho e IDs do Discord (`thread_id`, `message_id`, `attachment_id`). Quando `CLIPES_MONGO_URI` está ativo, uma cópia é enviada para a coleção `clips` (`_id = clip_id`) para busca entre PCs e publicação remota; URLs assinadas do CDN nunca são salvas e são obtidas na hora via API do Discord.
+
+- `CLIPES_MASTER_MODE`: `discord` (padrão; codifica o master uma única vez dentro de `CLIPES_DISCORD_MAX_MB`, re-renderiza uma vez da fonte com 85% do bitrate se passar de 98% do limite e marca `cabe_discord=false` se ainda não couber) ou `livre` (mantém `-crf 21` sem teto de bitrate, gera prévia separada quando precisar e nunca apaga o arquivo local).
+- `CLIPES_DISCORD_MAX_MB`: limite usado para o envio ao Discord (padrão `20`). Uploads rejeitados com HTTP 413 caem automaticamente para aviso sem anexo (`cabe_discord=false`).
+- `CLIPES_REGISTRO_VERIFICAR`: `1` por padrão; após o upload do master no modo `discord`, baixa o anexo em stream e confirma `size` e `sha256` antes de marcar `status="no_discord"`.
+- `CLIPES_RETENCAO_H`: vazio por padrão (retenção **desligada**). Quando definido com um número `>= 0` (horas após o ACK), a varredura ao final de cada envio ao Discord apaga o `.mp4` e `.cache/discord_<stem>.mp4` dos clipes `no_discord` sem pedido de publicação `pending`/`running` (marcando `status="so_discord"`), mantendo `.txt`, `.descricao.txt` e `clips.json`.
+
+> **Atenção:** quando `CLIPES_RETENCAO_H` apaga o `.mp4` local, o Discord passa a ser a única cópia do vídeo. Se a mensagem ou o anexo forem apagados no Discord, a publicação marca o clipe como `perdido`.
+
+| Risco | Avaliação | Mitigação |
+| ----- | --------- | --------- |
+| Política / ToS do Discord | Incerto (médio): links assinados visam evitar hospedagem pública para terceiros | Servidor privado do próprio operador, sem URL pública; registro local guarda os metadados |
+| Mensagem, canal ou bot apagados | Alta gravidade, baixa probabilidade | Retenção desligada por padrão; ACK por SHA-256; detecção de `perdido` ao publicar |
+| Limite de anexo (ex.: servidor sem Boost em 10 MiB) | Médio | Teste de upload de 19 MB no servidor; HTTP 413 marca `cabe_discord=false` e mantém o arquivo local |
+| Qualidade do master limitada (~2,3 Mb/s em 60 s / 20 MiB) | Médio (Shorts/TikTok recomprimem no upload) | `CLIPES_MASTER_MODE=livre` preserva qualidade máxima sem apagar o local |
+| Rate limit da API ao verificar/baixar | Baixo (1 GET por clipe) | `DiscordRest` trata HTTP 429 com `retry_after` |
+| Corrida entre worker e CLI | Baixo | `flock` + escrita atômica em `registro.json` e skip de clipes com pedido `pending`/`running` |
+
+**Smoke manual recomendado:**
+1. Envie um clipe de ~19 MB no canal configurado para confirmar o limite do servidor (se voltar HTTP 413, defina `CLIPES_DISCORD_MAX_MB=10`).
+2. Rode uma clipagem curta com `CLIPES_RETENCAO_H=0`, confirme no `registro.json` o `status="so_discord"` e a remoção do `.mp4` local (mantendo `.txt` e `clips.json`).
+3. Envie `publicar <clip_id>` (YouTube privado) e verifique que o download temporário em `.tmp_publicar/` publica com o mesmo SHA-256 e é removido em seguida.
+
+### 6. Auditoria para publicação pública (futuro)
 
 Nesta versão a privacidade é fixa no código (`private` / `SELF_ONLY`). Para liberar publicação pública após auditoria:
 

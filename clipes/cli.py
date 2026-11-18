@@ -523,6 +523,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "group_id": clip.group_id,
             "topic_duration": group_totals.get(clip.group_id, clip.duration),
             "transcript": clip.text,
+            "cabe_discord": bool(getattr(clip, "cabe_discord", True)),
         }
         clips_payload.append(clip_entry)
     timings["render_s"] = round(time.perf_counter() - t5, 2)

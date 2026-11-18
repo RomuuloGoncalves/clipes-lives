@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
 import sys
 from collections.abc import Callable, Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -16,9 +18,19 @@ from discord import app_commands
 
 from . import publicacao
 from .publicacao import LocalStore, MongoStore
+from .registro import Registro
 
-_PUBLICAR_RE = re.compile(r"^\s*publicar\s+(\S+)\s*$", re.IGNORECASE)
+_PUBLICAR_RE = re.compile(r"^\s*publicar\s+(\S+)(?:\s+(agora))?\s*$", re.IGNORECASE)
+_BUSCAR_RE = re.compile(r"^\s*buscar(?:\s+(.*))?$", re.IGNORECASE)
 _DISCORD_MAX_CHARS = 1900
+
+
+def _accepts_kw(fn: Any, kw: str) -> bool:
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return True
+    return kw in params or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
 
 
 def _resolve_out_root(store: Any, out_root: Path | str | None) -> Path:
@@ -157,6 +169,66 @@ def _format_recent_clips(out_root: Path | None, *, store: Any = None, limit: int
     return "\n".join(lines) if lines else "nenhum clipe encontrado"
 
 
+def _resolve_guild_id(source: Any, bot_guild_id: int | None) -> str | None:
+    gid = getattr(source, "guild_id", None)
+    if gid is None and getattr(source, "guild", None) is not None:
+        gid = getattr(source.guild, "id", None)
+    if gid is not None:
+        return str(gid)
+    if bot_guild_id is not None:
+        return str(bot_guild_id)
+    env_gid = os.environ.get("DISCORD_GUILD_ID", "").strip()
+    return env_gid or None
+
+
+def _format_search_results(
+    out_root: Path,
+    texto: str,
+    *,
+    store: Any = None,
+    guild_id: str | None = None,
+    limit: int = 10,
+) -> str:
+    clean = (texto or "").strip()
+    if len(clean) < 2:
+        return "busca precisa de 2+ caracteres"
+
+    reg = Registro(out_root, mongo=getattr(store, "db", None))
+    hits = reg.buscar(clean, limite=limit)
+    if not hits:
+        return f'nenhum clipe para "{clean}"'
+
+    lines: list[str] = []
+    total_len = 0
+    for doc in hits:
+        cid = str(doc.get("clip_id") or doc.get("_id") or "")
+        titulo = str(doc.get("titulo") or doc.get("title") or cid)[:50]
+        canal = str(doc.get("canal") or doc.get("channel") or "-")
+        status = str(doc.get("status") or "local")
+        ts = doc.get("criado_em") if doc.get("criado_em") is not None else doc.get("created_at")
+        try:
+            date_str = datetime.fromtimestamp(float(ts), timezone.utc).strftime("%Y-%m-%d") if ts is not None else "-"
+        except (TypeError, ValueError, OSError):
+            date_str = "-"
+
+        d_info = doc.get("discord") if isinstance(doc.get("discord"), dict) else {}
+        t_id = d_info.get("thread_id")
+        m_id = d_info.get("message_id")
+        link_part = (
+            f" | https://discord.com/channels/{guild_id}/{t_id}/{m_id}"
+            if (guild_id and t_id and m_id)
+            else ""
+        )
+        line = f"• `{cid}` — {titulo} | {canal} | {date_str} | {status}{link_part}"
+        if total_len + len(line) + (1 if lines else 0) > _DISCORD_MAX_CHARS:
+            if not lines:
+                lines.append(line[:_DISCORD_MAX_CHARS])
+            break
+        lines.append(line)
+        total_len += len(line) + (1 if len(lines) > 1 else 0)
+    return "\n".join(lines)
+
+
 class ClipesBot(discord.Client):
     """Discord gateway client hosting `/publicar`, `/listar`, and `publicar <id>`."""
 
@@ -176,7 +248,7 @@ class ClipesBot(discord.Client):
         run_local: bool = False,
         run_pending_fn: Callable[..., Any] | None = None,
     ) -> None:
-        super().__init__(intents=intents)
+        super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
         self.store = store
         self.allowed_ids = allowed_ids
@@ -211,7 +283,7 @@ class ClipesBot(discord.Client):
             target = None
         if target is not None and hasattr(target, "send"):
             try:
-                await target.send(result)
+                await target.send(result, allowed_mentions=discord.AllowedMentions.none())
             except Exception:
                 pass
 
@@ -229,7 +301,14 @@ class ClipesBot(discord.Client):
             quota_path=self.quota_path,
         )
 
-    def _request_publish(self, clip_id: str, user_id: str | int, thread_id: str | None) -> str:
+    def _request_publish(
+        self,
+        clip_id: str,
+        user_id: str | int,
+        thread_id: str | None,
+        *,
+        agendar: bool = True,
+    ) -> str:
         return publicacao.request(
             self.store,
             clip_id,
@@ -241,6 +320,7 @@ class ClipesBot(discord.Client):
             tokens_path=self.tokens_path,
             quota_path=self.quota_path,
             thread_id=thread_id,
+            agendar=agendar,
         )
 
     async def on_message(self, message: Any) -> None:
@@ -254,20 +334,116 @@ class ClipesBot(discord.Client):
         if not _in_configured_channel(channel, self.channel_id):
             return
 
-        match = _PUBLICAR_RE.match(getattr(message, "content", "") or "")
+        content = getattr(message, "content", "") or ""
+        user_id = getattr(author, "id", "")
+
+        search_match = _BUSCAR_RE.match(content)
+        if search_match:
+            if not publicacao.user_allowed(user_id, self.allowed_ids):
+                reply_text = "sem permissao"
+            else:
+                gid = _resolve_guild_id(message, self.guild_id)
+                reply_text = await asyncio.to_thread(
+                    _format_search_results,
+                    self.out_root,
+                    search_match.group(1) or "",
+                    store=self.store,
+                    guild_id=gid,
+                )
+            no_mentions = discord.AllowedMentions.none()
+            if hasattr(message, "reply"):
+                await message.reply(reply_text, mention_author=False, allowed_mentions=no_mentions)
+            elif channel is not None and hasattr(channel, "send"):
+                await channel.send(reply_text, allowed_mentions=no_mentions)
+            return
+
+        match = _PUBLICAR_RE.match(content)
         if not match:
             return
 
         clip_id = match.group(1).strip()
+        agora = match.group(2) is not None
         thread_id = _extract_thread_id(channel)
-        result = self._request_publish(clip_id, getattr(author, "id", ""), thread_id)
+        result = self._request_publish(clip_id, user_id, thread_id, agendar=not agora)
 
+        no_mentions = discord.AllowedMentions.none()
         if hasattr(message, "reply"):
-            await message.reply(result, mention_author=False)
+            await message.reply(result, mention_author=False, allowed_mentions=no_mentions)
         elif channel is not None and hasattr(channel, "send"):
-            await channel.send(result)
+            await channel.send(result, allowed_mentions=no_mentions)
 
         await self._maybe_notify_thread(clip_id, result, getattr(channel, "id", None))
+        await self._maybe_run_local(result)
+
+    async def on_interaction(self, interaction: Any) -> None:
+        itype = getattr(interaction, "type", None)
+        if itype not in (discord.InteractionType.component, 3):
+            return
+        data = getattr(interaction, "data", None)
+        if not isinstance(data, dict):
+            return
+        custom_id = str(data.get("custom_id") or "")
+        if not custom_id.startswith("aprovar:"):
+            return
+        clip_id = custom_id[len("aprovar:") :].strip()
+        if not clip_id:
+            return
+
+        no_mentions = discord.AllowedMentions.none()
+        if not _interaction_in_configured_channel(interaction, self.channel_id):
+            await interaction.response.send_message(
+                "canal nao permitido",
+                ephemeral=True,
+                allowed_mentions=no_mentions,
+            )
+            return
+        if not _interaction_user_allowed(interaction, self.allowed_ids):
+            await interaction.response.send_message(
+                "sem permissao",
+                ephemeral=True,
+                allowed_mentions=no_mentions,
+            )
+            return
+
+        channel = getattr(interaction, "channel", None)
+        thread_id = _extract_thread_id(channel)
+        user = getattr(interaction, "user", None)
+        user_id = getattr(user, "id", "")
+        result = self._request_publish(clip_id, user_id, thread_id)
+        await interaction.response.send_message(
+            result,
+            ephemeral=(result == "sem permissao"),
+            allowed_mentions=no_mentions,
+        )
+
+        accepted = ("publicacao enfileirada" in result) or ("pedido fica na fila" in result)
+        if accepted:
+            msg = getattr(interaction, "message", None)
+            if msg is not None and hasattr(msg, "edit"):
+                user_name = (
+                    getattr(user, "display_name", None)
+                    or getattr(user, "name", None)
+                    or str(user_id)
+                )
+                orig_content = str(getattr(msg, "content", "") or "")
+                suffix = f"aprovado por {user_name}"
+                if suffix in orig_content:
+                    new_content = orig_content
+                elif not orig_content:
+                    new_content = suffix[:2000]
+                elif len(orig_content) + 1 + len(suffix) <= 2000:
+                    new_content = f"{orig_content}\n{suffix}"
+                else:
+                    max_orig = max(0, 2000 - len(suffix) - 1)
+                    new_content = f"{orig_content[:max_orig]}\n{suffix}" if max_orig > 0 else suffix[:2000]
+                edit_kw: dict[str, Any] = {"allowed_mentions": no_mentions} if _accepts_kw(msg.edit, "allowed_mentions") else {}
+                try:
+                    await msg.edit(content=new_content, view=None, **edit_kw)
+                except Exception:
+                    pass
+
+        current_cid = getattr(interaction, "channel_id", getattr(channel, "id", None))
+        await self._maybe_notify_thread(clip_id, result, current_cid)
         await self._maybe_run_local(result)
 
 
@@ -309,31 +485,80 @@ def make_bot(
     )
 
     @bot.tree.command(name="publicar", description="Publica um clipe como privado no YouTube e no TikTok")
-    @app_commands.describe(id="ID do clipe (ex: video_c01)")
-    async def publicar_cmd(interaction: discord.Interaction, id: str) -> None:
+    @app_commands.describe(
+        id="ID do clipe (ex: video_c01)",
+        agora="Publica na hora, ignorando a agenda",
+    )
+    async def publicar_cmd(interaction: discord.Interaction, id: str, agora: bool = False) -> None:
+        no_mentions = discord.AllowedMentions.none()
         if not _interaction_in_configured_channel(interaction, bot.channel_id):
-            await interaction.response.send_message("canal nao permitido", ephemeral=True)
+            await interaction.response.send_message(
+                "canal nao permitido",
+                ephemeral=True,
+                allowed_mentions=no_mentions,
+            )
             return
         clip_id = id.strip()
         channel = getattr(interaction, "channel", None)
         thread_id = _extract_thread_id(channel)
         user_id = getattr(getattr(interaction, "user", None), "id", "")
-        result = bot._request_publish(clip_id, user_id, thread_id)
-        await interaction.response.send_message(result, ephemeral=(result == "sem permissao"))
+        result = bot._request_publish(clip_id, user_id, thread_id, agendar=not agora)
+        await interaction.response.send_message(
+            result,
+            ephemeral=(result == "sem permissao"),
+            allowed_mentions=no_mentions,
+        )
         current_cid = getattr(interaction, "channel_id", getattr(channel, "id", None))
         await bot._maybe_notify_thread(clip_id, result, current_cid)
         await bot._maybe_run_local(result)
 
     @bot.tree.command(name="listar", description="Lista os 10 ultimos clip_id disponiveis")
     async def listar_cmd(interaction: discord.Interaction) -> None:
+        no_mentions = discord.AllowedMentions.none()
         if not _interaction_in_configured_channel(interaction, bot.channel_id):
-            await interaction.response.send_message("canal nao permitido", ephemeral=True)
+            await interaction.response.send_message(
+                "canal nao permitido",
+                ephemeral=True,
+                allowed_mentions=no_mentions,
+            )
             return
         if not _interaction_user_allowed(interaction, bot.allowed_ids):
-            await interaction.response.send_message("sem permissao", ephemeral=True)
+            await interaction.response.send_message(
+                "sem permissao",
+                ephemeral=True,
+                allowed_mentions=no_mentions,
+            )
             return
         text = _format_recent_clips(bot.out_root, store=bot.store, limit=10)
-        await interaction.response.send_message(text, ephemeral=False)
+        await interaction.response.send_message(text, ephemeral=False, allowed_mentions=no_mentions)
+
+    @bot.tree.command(name="buscar", description="Busca clipes no registro por texto")
+    @app_commands.describe(texto="Palavras para buscar (minimo 2 caracteres)")
+    async def buscar_cmd(interaction: discord.Interaction, texto: str) -> None:
+        no_mentions = discord.AllowedMentions.none()
+        if not _interaction_in_configured_channel(interaction, bot.channel_id):
+            await interaction.response.send_message(
+                "canal nao permitido",
+                ephemeral=True,
+                allowed_mentions=no_mentions,
+            )
+            return
+        if not _interaction_user_allowed(interaction, bot.allowed_ids):
+            await interaction.response.send_message(
+                "sem permissao",
+                ephemeral=True,
+                allowed_mentions=no_mentions,
+            )
+            return
+        gid = _resolve_guild_id(interaction, bot.guild_id)
+        reply = await asyncio.to_thread(
+            _format_search_results,
+            bot.out_root,
+            texto,
+            store=bot.store,
+            guild_id=gid,
+        )
+        await interaction.response.send_message(reply, ephemeral=False, allowed_mentions=no_mentions)
 
     return bot
 

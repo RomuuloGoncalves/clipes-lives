@@ -2,31 +2,32 @@
 
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
-import tempfile
-import threading
 import time
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import contextmanager
-from datetime import datetime, timezone
+import uuid
+from collections.abc import Callable, Iterable
+from datetime import datetime, time as dt_time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .monitor import ChannelPolicy, load_policy
+from .registro import Registro, _atomic_write_json, _json_default, _locked_path, _read_json
 
 PLATFORMS: tuple[str, ...] = ("youtube", "tiktok")
 DEFAULT_DAILY_QUOTAS: dict[str, int] = {"youtube": 6, "tiktok": 5}
 QUOTA_ENV_KEYS: dict[str, str] = {"youtube": "CLIPES_YT_MAX_DIA", "tiktok": "CLIPES_TIKTOK_MAX_DIA"}
 DEFAULT_TOKENS_PATH = Path("/config/tokens.json")
+DEFAULT_AGENDA_TZ = "America/Sao_Paulo"
+DEFAULT_AGENDA_FOLGA_MIN = 30
 WORKER_STALE_S = 180.0
 _UPLOAD_URL_RE = re.compile(r"https?://[^\s'\"<>]*upload[^\s'\"<>]*", re.IGNORECASE)
 _HTTP_401_RE = re.compile(r"(?:^|\b(?:http(?:/[\d.]+)?|status|code|erro|error)\s*[:=]?\s*|\()401(?:\b|\))")
 _ACTIVE_REQUEST_STATUSES: tuple[str, ...] = ("ok", "pending", "running")
-_PATH_LOCKS_GUARD = threading.Lock()
-_PATH_LOCKS: dict[Path, threading.Lock] = {}
+_AGENDA_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+_UNSET = object()
 
 
 def _now_ts(now: Callable[[], float] | float | None) -> float:
@@ -39,55 +40,95 @@ def _dt(ts: float) -> datetime:
     return datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None)
 
 
-def _json_default(obj: Any) -> str:
-    if isinstance(obj, datetime):
-        return obj.isoformat()
-    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
-
-
-@contextmanager
-def _locked_path(path: Path) -> Iterator[None]:
-    """Serialize read-modify-write across threads and processes for `path`."""
-    resolved = path.resolve()
-    with _PATH_LOCKS_GUARD:
-        lock = _PATH_LOCKS.setdefault(resolved, threading.Lock())
-    with lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        lock_path = path.with_name(f".{path.name}.lock")
-        with open(lock_path, "a+", encoding="utf-8") as lock_fh:
-            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-            try:
-                yield
-            finally:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-
-
-def _atomic_write_json(path: Path, payload: Any, mode: int | None = None) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    text = json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", suffix=".json", dir=str(path.parent))
-    tmp_path = Path(tmp_name)
+def _resolve_tz(tz: tzinfo | str | None = None) -> tuple[tzinfo, str]:
+    if isinstance(tz, tzinfo):
+        name = getattr(tz, "key", None) or str(tz)
+        return tz, name
+    raw = (tz if isinstance(tz, str) else os.environ.get("CLIPES_TZ", "")).strip()
+    name = raw or DEFAULT_AGENDA_TZ
     try:
-        if mode is not None:
-            os.fchmod(fd, mode)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        if mode is not None:
-            os.chmod(tmp_path, mode)
-        tmp_path.replace(path)
-    finally:
-        tmp_path.unlink(missing_ok=True)
+        return ZoneInfo(name), name
+    except (ZoneInfoNotFoundError, KeyError, ValueError):
+        print(f"[agenda] fuso invalido: {name}", flush=True)
+        return ZoneInfo(DEFAULT_AGENDA_TZ), DEFAULT_AGENDA_TZ
 
 
-def _read_json(path: Path, default: Any) -> Any:
-    if not path.is_file():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return default
+def _to_aware_tz(value: Any, tz_obj: tzinfo) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(float(value), timezone.utc).astimezone(tz_obj)
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=tz_obj)
+        return value.astimezone(tz_obj)
+    if isinstance(value, str):
+        ts = _parse_ts(value)
+        if ts is None:
+            return None
+        return datetime.fromtimestamp(ts, timezone.utc).astimezone(tz_obj)
+    return None
+
+
+def ler_horarios(env: Any = _UNSET) -> list[dt_time]:
+    """Parse comma-separated HH:MM slots from `env` (or `CLIPES_AGENDA_HORARIOS`), logging invalid tokens."""
+    raw = os.environ.get("CLIPES_AGENDA_HORARIOS", "") if env is _UNSET else (env or "")
+    if not isinstance(raw, str):
+        raw = str(raw)
+    slots: list[dt_time] = []
+    for part in raw.split(","):
+        tok = part.strip()
+        if not tok:
+            continue
+        m = _AGENDA_TIME_RE.fullmatch(tok)
+        if not m:
+            print(f"[agenda] horario invalido: {tok}", flush=True)
+            continue
+        hour, minute = int(m.group(1)), int(m.group(2))
+        if not (0 <= hour <= 23 and 0 <= minute <= 59):
+            print(f"[agenda] horario invalido: {tok}", flush=True)
+            continue
+        slots.append(dt_time(hour, minute))
+    return sorted(set(slots))
+
+
+def proximo_horario(
+    agora: datetime | float | int,
+    horarios: Iterable[dt_time],
+    ocupados: Iterable[Any] = (),
+    tz: tzinfo | str | None = None,
+    folga_min: int = DEFAULT_AGENDA_FOLGA_MIN,
+) -> datetime:
+    """Return the next free scheduled datetime in `tz` >= `agora + folga_min` minutes."""
+    ordered = sorted(set(horarios))
+    if not ordered:
+        raise ValueError("horarios nao pode ser vazio")
+
+    tz_obj, _ = _resolve_tz(tz)
+    agora_tz = _to_aware_tz(agora, tz_obj)
+    if agora_tz is None:
+        raise ValueError("agora invalido")
+
+    min_dt = agora_tz + timedelta(minutes=folga_min)
+    occupied_keys: set[datetime] = set()
+    for occ in ocupados:
+        occ_dt = _to_aware_tz(occ, tz_obj)
+        if occ_dt is not None:
+            occupied_keys.add(occ_dt.astimezone(timezone.utc).replace(second=0, microsecond=0))
+
+    start_date = min_dt.date()
+    day_offset = 0
+    while True:
+        day = start_date + timedelta(days=day_offset)
+        for slot in ordered:
+            cand = datetime.combine(day, slot, tzinfo=tz_obj)
+            if cand < min_dt:
+                continue
+            cand_key = cand.astimezone(timezone.utc).replace(second=0, microsecond=0)
+            if cand_key in occupied_keys:
+                continue
+            return cand
+        day_offset += 1
 
 
 def _sanitize_text(text: str, secrets: Iterable[str] = ()) -> str:
@@ -305,14 +346,43 @@ class LocalStore:
             self._save(data)
             return stored, True
 
-    def find_pending(self, worker_id: str | None = None) -> list[dict[str, Any]]:
+    def find_pending(
+        self,
+        worker_id: str | None = None,
+        now: Callable[[], float] | float | None = None,
+    ) -> list[dict[str, Any]]:
+        now_ts = _now_ts(now)
         reqs = self._load()["requests"].values()
-        out = [
-            dict(r)
-            for r in reqs
-            if r.get("status") == "pending" and (worker_id is None or r.get("owner") == worker_id)
-        ]
+        out = []
+        for r in reqs:
+            if r.get("status") != "pending":
+                continue
+            if worker_id is not None and r.get("owner") != worker_id:
+                continue
+            sched_ts = _parse_ts(r.get("agendar_para"))
+            if sched_ts is not None and sched_ts > now_ts:
+                continue
+            out.append(dict(r))
         return sorted(out, key=lambda r: str(r.get("criado_em") or ""))
+
+    def scheduled_times(self, plataforma: str) -> list[datetime]:
+        reqs = self._load()["requests"].values()
+        out: list[datetime] = []
+        for r in reqs:
+            if r.get("status") != "pending" or r.get("plataforma") != plataforma:
+                continue
+            ts = _parse_ts(r.get("agendar_para"))
+            if ts is not None:
+                out.append(datetime.fromtimestamp(ts, timezone.utc))
+        return out
+
+    def active_clip_ids(self) -> set[str]:
+        reqs = self._load()["requests"].values()
+        return {
+            str(r["clip_id"])
+            for r in reqs
+            if r.get("status") in ("pending", "running") and r.get("clip_id")
+        }
 
     def claim_request(self, req_id: str, worker_id: str | None = None) -> dict[str, Any] | None:
         """Atomically transition a `pending` request to `running`, returning it or None."""
@@ -381,11 +451,42 @@ class MongoStore:
                 return (found or dict(doc)), False
             raise
 
-    def find_pending(self, worker_id: str | None = None) -> list[dict[str, Any]]:
-        query: dict[str, Any] = {"status": "pending"}
+    def find_pending(
+        self,
+        worker_id: str | None = None,
+        now: Callable[[], float] | float | None = None,
+    ) -> list[dict[str, Any]]:
+        now_dt = _dt(_now_ts(now))
+        query: dict[str, Any] = {
+            "status": "pending",
+            "$or": [
+                {"agendar_para": {"$exists": False}},
+                {"agendar_para": None},
+                {"agendar_para": {"$lte": now_dt}},
+            ],
+        }
         if worker_id is not None:
             query["owner"] = worker_id
         return list(self.db.publish_requests.find(query).sort("criado_em", 1))
+
+    def scheduled_times(self, plataforma: str) -> list[datetime]:
+        docs = self.db.publish_requests.find(
+            {"status": "pending", "plataforma": plataforma, "agendar_para": {"$ne": None}},
+            {"agendar_para": 1},
+        )
+        out: list[datetime] = []
+        for d in docs:
+            ts = _parse_ts(d.get("agendar_para"))
+            if ts is not None:
+                out.append(datetime.fromtimestamp(ts, timezone.utc))
+        return out
+
+    def active_clip_ids(self) -> set[str]:
+        docs = self.db.publish_requests.find(
+            {"status": {"$in": ["pending", "running"]}},
+            {"clip_id": 1},
+        )
+        return {str(d["clip_id"]) for d in docs if d.get("clip_id")}
 
     def claim_request(self, req_id: str, worker_id: str | None = None) -> dict[str, Any] | None:
         """Atomically transition a `pending` request to `running`, returning it or None."""
@@ -419,17 +520,32 @@ class MongoStore:
     def find_clip_doc(self, clip_id: str) -> dict[str, Any] | None:
         clip = self.db.clips.find_one({"$or": [{"_id": clip_id}, {"clip_id": clip_id}]})
         if clip:
+            discord_meta = clip.get("discord") if isinstance(clip.get("discord"), dict) else {}
+            clip_view = dict(clip)
+            clip_view.setdefault("clip_id", clip_id)
+            if not clip_view.get("title") and clip_view.get("titulo"):
+                clip_view["title"] = clip_view["titulo"]
+            if not clip_view.get("caption") and clip_view.get("legenda"):
+                clip_view["caption"] = clip_view["legenda"]
+            if not clip_view.get("description_long") and clip_view.get("descricao_longa"):
+                clip_view["description_long"] = clip_view["descricao_longa"]
             return {
                 "clip_id": clip_id,
-                "clip": clip,
+                "clip": clip_view,
                 "manifest": clip.get("manifest") or {},
                 "clips_json_path": None,
                 "mp4_path": None,
-                "channel": str(clip.get("channel") or "").lower(),
-                "created_at": _parse_ts(clip.get("created_at")),
+                "channel": str(clip.get("channel") or clip.get("canal") or "").lower(),
+                "created_at": _parse_ts(
+                    clip.get("created_at") if clip.get("created_at") is not None else clip.get("criado_em")
+                ),
                 "ready_at": _parse_ts(clip.get("ready_at")),
                 "owner": clip.get("owner"),
-                "thread_id": (clip.get("discord") or {}).get("thread_id") or clip.get("thread_id"),
+                "thread_id": discord_meta.get("thread_id") or clip.get("thread_id"),
+                "discord": discord_meta,
+                "sha256": clip.get("sha256"),
+                "tamanho": clip.get("tamanho"),
+                "registro": clip,
             }
         return None
 
@@ -443,58 +559,97 @@ def _adapt_store(store: Any) -> LocalStore | MongoStore:
 
 
 def find_clip(out_root: Path | str | None, clip_id: str, *, store: Any = None) -> dict[str, Any] | None:
-    """Locate `clip_id` across `clips.json` manifests under `out_root` (and optional Mongo store)."""
+    """Locate `clip_id` across `clips.json`, `registro.json`, and optional Mongo store."""
     cid = (clip_id or "").strip()
     if not cid:
         return None
 
-    if out_root is not None:
-        root = Path(out_root)
-        if root.is_dir():
-            jobs_by_dir = _load_done_jobs_by_output_dir(root)
-            default_owner = _local_worker_id(root)
-            for clips_path in sorted(root.rglob("clips.json")):
-                manifest = _read_json(clips_path, None)
-                if not isinstance(manifest, dict):
+    reg_rec: dict[str, Any] | None = None
+    root = Path(out_root) if out_root is not None else None
+    if root is not None and (root / "registro.json").is_file():
+        reg_rec = Registro(root).get(cid)
+    reg_discord = reg_rec.get("discord") if isinstance((reg_rec or {}).get("discord"), dict) else {}
+
+    if root is not None and root.is_dir():
+        jobs_by_dir = _load_done_jobs_by_output_dir(root)
+        default_owner = _local_worker_id(root)
+        for clips_path in sorted(root.rglob("clips.json")):
+            manifest = _read_json(clips_path, None)
+            if not isinstance(manifest, dict):
+                continue
+            clips = manifest.get("clips")
+            if not isinstance(clips, list):
+                continue
+            try:
+                dir_key = str(clips_path.parent.resolve())
+            except OSError:
+                dir_key = str(clips_path.parent)
+            job = jobs_by_dir.get(dir_key)
+            for entry in clips:
+                if not isinstance(entry, dict):
                     continue
-                clips = manifest.get("clips")
-                if not isinstance(clips, list):
+                entry_id = entry.get("clip_id") or (
+                    f"{manifest.get('video_id')}_c{int(entry['index']):02d}"
+                    if manifest.get("video_id") and entry.get("index") is not None
+                    else None
+                )
+                if entry_id != cid:
                     continue
-                try:
-                    dir_key = str(clips_path.parent.resolve())
-                except OSError:
-                    dir_key = str(clips_path.parent)
-                job = jobs_by_dir.get(dir_key)
-                for entry in clips:
-                    if not isinstance(entry, dict):
-                        continue
-                    entry_id = entry.get("clip_id") or (
-                        f"{manifest.get('video_id')}_c{int(entry['index']):02d}"
-                        if manifest.get("video_id") and entry.get("index") is not None
-                        else None
-                    )
-                    if entry_id != cid:
-                        continue
-                    mp4_rel = entry.get("file")
-                    mp4_path = (clips_path.parent / mp4_rel) if mp4_rel else None
-                    discord_meta = entry.get("discord") if isinstance(entry.get("discord"), dict) else {}
-                    manifest_discord = manifest.get("discord") if isinstance(manifest.get("discord"), dict) else {}
-                    return {
-                        "clip_id": cid,
-                        "clip": entry,
-                        "manifest": manifest,
-                        "clips_json_path": clips_path,
-                        "mp4_path": mp4_path,
-                        "channel": _extract_channel(manifest, entry, job),
-                        "created_at": _parse_ts((job or {}).get("created_at") or manifest.get("created_at")),
-                        "ready_at": _parse_ts(
-                            entry.get("ready_at")
-                            if entry.get("ready_at") is not None
-                            else (job or {}).get("ready_at", manifest.get("ready_at"))
-                        ),
-                        "owner": (job or {}).get("owner") or entry.get("owner") or manifest.get("owner") or default_owner,
-                        "thread_id": discord_meta.get("thread_id") or manifest_discord.get("thread_id"),
-                    }
+                mp4_rel = entry.get("file")
+                mp4_path = (clips_path.parent / mp4_rel) if mp4_rel else None
+                discord_meta = entry.get("discord") if isinstance(entry.get("discord"), dict) else {}
+                manifest_discord = manifest.get("discord") if isinstance(manifest.get("discord"), dict) else {}
+                merged_discord = {**reg_discord, **discord_meta}
+                return {
+                    "clip_id": cid,
+                    "clip": entry,
+                    "manifest": manifest,
+                    "clips_json_path": clips_path,
+                    "mp4_path": mp4_path,
+                    "channel": _extract_channel(manifest, entry, job),
+                    "created_at": _parse_ts((job or {}).get("created_at") or manifest.get("created_at")),
+                    "ready_at": _parse_ts(
+                        entry.get("ready_at")
+                        if entry.get("ready_at") is not None
+                        else (job or {}).get("ready_at", manifest.get("ready_at"))
+                    ),
+                    "owner": (job or {}).get("owner") or entry.get("owner") or manifest.get("owner") or default_owner,
+                    "thread_id": discord_meta.get("thread_id") or reg_discord.get("thread_id") or manifest_discord.get("thread_id"),
+                    "discord": merged_discord,
+                    "sha256": (reg_rec or {}).get("sha256") or entry.get("sha256"),
+                    "tamanho": (reg_rec or {}).get("tamanho") or entry.get("tamanho"),
+                    "registro": reg_rec,
+                }
+
+    if reg_rec is not None:
+        mp4_rel = reg_rec.get("arquivo")
+        mp4_path = (root / mp4_rel) if (root is not None and mp4_rel) else None
+        clip_view = {
+            **reg_rec,
+            "clip_id": cid,
+            "title": reg_rec.get("titulo") or reg_rec.get("title") or cid,
+            "caption": reg_rec.get("legenda") or reg_rec.get("caption") or "",
+            "description_long": reg_rec.get("descricao_longa") or reg_rec.get("description_long") or "",
+            "discord": reg_discord,
+        }
+        return {
+            "clip_id": cid,
+            "clip": clip_view,
+            "manifest": {},
+            "clips_json_path": None,
+            "mp4_path": mp4_path,
+            "channel": str(reg_rec.get("canal") or reg_rec.get("channel") or "").lower(),
+            "created_at": _parse_ts(
+                reg_rec.get("criado_em") if reg_rec.get("criado_em") is not None else reg_rec.get("created_at")
+            ),
+            "ready_at": _parse_ts(reg_rec.get("ready_at")),
+            "owner": reg_rec.get("owner") or (_local_worker_id(root) if root is not None else None),
+            "thread_id": reg_discord.get("thread_id"),
+            "discord": reg_discord,
+            "sha256": reg_rec.get("sha256"),
+            "tamanho": reg_rec.get("tamanho"),
+            "registro": reg_rec,
+        }
 
     if store is not None:
         return _adapt_store(store).find_clip_doc(cid)
@@ -540,6 +695,25 @@ def _has_platform_token(tokens: dict[str, Any], plataforma: str) -> bool:
     return isinstance(entry, dict) and bool(entry.get("refresh_token") or entry.get("access_token"))
 
 
+def _occupied_slots_for_platform(adapted: Any, plat: str) -> list[datetime]:
+    fn = getattr(adapted, "scheduled_times", None)
+    if callable(fn):
+        return list(fn(plat))
+    db = getattr(adapted, "db", None)
+    if db is not None and hasattr(db, "publish_requests"):
+        docs = db.publish_requests.find(
+            {"status": "pending", "plataforma": plat, "agendar_para": {"$ne": None}},
+            {"agendar_para": 1},
+        )
+        out: list[datetime] = []
+        for d in docs:
+            ts = _parse_ts(d.get("agendar_para"))
+            if ts is not None:
+                out.append(datetime.fromtimestamp(ts, timezone.utc))
+        return out
+    return []
+
+
 def request(
     store: Any,
     clip_id: str,
@@ -557,6 +731,8 @@ def request(
     thread_id: str | None = None,
     platforms: tuple[str, ...] = PLATFORMS,
     worker_stale_s: float = WORKER_STALE_S,
+    agendar: bool = True,
+    tz: tzinfo | str | None = None,
 ) -> str:
     """Validate permission, policy, idempotency, and quota, then enqueue `publish_requests`."""
     if not user_allowed(user_id, allowed_ids):
@@ -582,6 +758,8 @@ def request(
     tok_map = _load_tokens(tokens, tokens_path)
     owner = worker_id or found.get("owner") or (_local_worker_id(root) if root is not None else None) or "local"
     eff_thread_id = thread_id or found.get("thread_id")
+    horarios = ler_horarios() if agendar else []
+    tz_obj, tz_name = _resolve_tz(tz)
     messages: list[str] = []
 
     for plat in platforms:
@@ -595,7 +773,19 @@ def request(
             messages.append(f"{plat}: desligada")
             continue
 
-        if not quota_ok(plat, now_ts, quota_path=quota_path, out_root=root):
+        slot_dt: datetime | None = None
+        if horarios:
+            if existing is not None and existing.get("status") in ("pending", "running"):
+                existing_ts = _parse_ts(existing.get("agendar_para"))
+                if existing_ts is not None:
+                    slot_dt = datetime.fromtimestamp(existing_ts, timezone.utc).astimezone(tz_obj)
+            else:
+                agora_dt = datetime.fromtimestamp(now_ts, timezone.utc).astimezone(tz_obj)
+                ocupados = _occupied_slots_for_platform(adapted, plat)
+                slot_dt = proximo_horario(agora_dt, horarios, ocupados, tz_obj)
+
+        quota_ts = slot_dt.timestamp() if slot_dt is not None else now_ts
+        if not quota_ok(plat, quota_ts, quota_path=quota_path, out_root=root):
             adapted.enqueue_request({
                 "_id": f"{clip_id}:{plat}",
                 "clip_id": clip_id,
@@ -611,7 +801,7 @@ def request(
             messages.append(f"cota diaria atingida ({plat})")
             continue
 
-        adapted.enqueue_request({
+        doc: dict[str, Any] = {
             "_id": f"{clip_id}:{plat}",
             "clip_id": clip_id,
             "plataforma": plat,
@@ -622,12 +812,22 @@ def request(
             "thread_id": eff_thread_id,
             "criado_em": _dt(now_ts),
             "concluido_em": None,
-        })
+        }
+        if slot_dt is not None:
+            doc["agendar_para"] = _dt(slot_dt.timestamp())
+
+        stored, _ = adapted.enqueue_request(doc)
+        stored_sched_ts = _parse_ts(stored.get("agendar_para"))
+        sched_suffix = ""
+        if stored_sched_ts is not None:
+            stored_dt = datetime.fromtimestamp(stored_sched_ts, timezone.utc).astimezone(tz_obj)
+            sched_suffix = f"; agendado para {stored_dt.strftime('%Y-%m-%d %H:%M')} ({tz_name})"
+
         online, host_label = adapted.worker_status(owner, now_ts, stale_s=worker_stale_s)
         if not online:
-            messages.append(f"{plat}: PC {host_label} offline; pedido fica na fila")
+            messages.append(f"{plat}: PC {host_label} offline; pedido fica na fila{sched_suffix}")
         else:
-            messages.append(f"{plat}: publicacao enfileirada")
+            messages.append(f"{plat}: publicacao enfileirada{sched_suffix}")
 
     return "\n".join(messages) if messages else "nenhuma plataforma configurada"
 
@@ -770,6 +970,83 @@ def _secret_values(tokens_map: dict[str, Any], extra: Iterable[str] = ()) -> lis
     return vals
 
 
+def _download_from_discord(
+    *,
+    found: dict[str, Any],
+    root: Path | None,
+    clip_id: str,
+    plat: str,
+    discord_client: Any | None,
+    reg: Registro | None,
+    secrets: Iterable[str] = (),
+) -> tuple[Path | None, str | None, str | None]:
+    discord_info = (
+        found.get("discord")
+        if isinstance(found.get("discord"), dict)
+        else (found.get("registro") or {}).get("discord")
+        or (found.get("clip") or {}).get("discord")
+        or {}
+    )
+    if not isinstance(discord_info, dict):
+        discord_info = {}
+    d_thread = discord_info.get("thread_id") or found.get("thread_id")
+    d_msg = discord_info.get("message_id")
+    d_att = discord_info.get("attachment_id")
+    if not (d_thread and d_msg and d_att):
+        return None, "arquivo_ausente", f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}"
+
+    client = discord_client
+    if client is None:
+        bot_token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+        if not bot_token:
+            return None, "arquivo_ausente", f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}"
+        from .discord_rest import DiscordRest
+
+        client = DiscordRest(bot_token)
+
+    try:
+        msg = client.get_message(d_thread, d_msg)
+    except Exception as exc:
+        if getattr(exc, "status", None) == 404 or "HTTP 404" in str(exc):
+            if reg is not None:
+                reg.marcar(clip_id, status="perdido")
+            return None, "clipe_perdido", "clipe perdido: mensagem do Discord apagada"
+        return None, "erro_download", _sanitize_text(str(exc), secrets)
+
+    atts = msg.get("attachments") or []
+    att = next((a for a in atts if str(a.get("id") or "") == str(d_att)), None)
+    if att is None or not att.get("url"):
+        if reg is not None:
+            reg.marcar(clip_id, status="perdido")
+        return None, "clipe_perdido", "clipe perdido: mensagem do Discord apagada"
+
+    base_out = root if root is not None else Path(os.environ.get("OUT_DIR") or "out")
+    tmp_dl = base_out / ".tmp_publicar" / f"{clip_id}_{plat}_{uuid.uuid4().hex[:8]}.mp4"
+    expected_size = int(found.get("tamanho") or discord_info.get("size") or att.get("size") or 0)
+    max_bytes = (expected_size + 1024) if expected_size > 0 else 25 * 1024 * 1024
+
+    try:
+        _, dl_sha = client.download(str(att["url"]), tmp_dl, max_bytes=max_bytes)
+    except Exception as exc:
+        tmp_dl.unlink(missing_ok=True)
+        if getattr(exc, "status", None) == 404 or "HTTP 404" in str(exc):
+            if reg is not None:
+                reg.marcar(clip_id, status="perdido")
+            return None, "clipe_perdido", "clipe perdido: mensagem do Discord apagada"
+        return None, "erro_download", _sanitize_text(str(exc), secrets)
+
+    expected_sha = (
+        found.get("sha256")
+        or (found.get("registro") or {}).get("sha256")
+        or (found.get("clip") or {}).get("sha256")
+    )
+    if expected_sha and dl_sha != expected_sha:
+        tmp_dl.unlink(missing_ok=True)
+        return None, "sha256_divergente", "arquivo do Discord diferente do registrado"
+
+    return tmp_dl, None, None
+
+
 def run_pending(
     store: Any,
     worker_id: str | None,
@@ -785,16 +1062,31 @@ def run_pending(
     refreshers: dict[str, Callable[..., dict[str, Any]]] | None = None,
     save_tokens_fn: Callable[[dict[str, Any], Path | str | None], None] | None = None,
     discord_post: Callable[[str, str], Any] | None = None,
+    discord_client: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Execute pending publish requests owned by `worker_id` and reply in the clip thread."""
     adapted = _adapt_store(store)
     root = Path(out_root) if out_root is not None else getattr(adapted, "out_root", None)
     pol = _resolve_policy(policy, policy_path, root)
     save_fn = save_tokens_fn or _save_tokens
+    mongo_db = getattr(adapted, "db", None)
+    reg = Registro(root, mongo=mongo_db) if root is not None else None
     outcomes: list[dict[str, Any]] = []
 
-    for req in adapted.find_pending(worker_id=worker_id):
+    now_fn_ts = _now_ts(now)
+    if isinstance(adapted, (LocalStore, MongoStore)):
+        pending_reqs = adapted.find_pending(worker_id=worker_id, now=now_fn_ts)
+    else:
+        try:
+            pending_reqs = adapted.find_pending(worker_id=worker_id, now=now_fn_ts)
+        except TypeError:
+            pending_reqs = adapted.find_pending(worker_id=worker_id)
+
+    for req in pending_reqs:
         now_ts = _now_ts(now)
+        sched_ts = _parse_ts(req.get("agendar_para"))
+        if sched_ts is not None and sched_ts > now_ts:
+            continue
         req_id = req["_id"]
         clip_id = req["clip_id"]
         plat = req["plataforma"]
@@ -828,8 +1120,7 @@ def run_pending(
             finish("adiado", {"erro": "cota_diaria"}, f"[{plat}] adiado: cota diaria atingida ({plat})")
             continue
 
-        mp4_path = found.get("mp4_path") if found else None
-        if found is None or mp4_path is None or not Path(mp4_path).is_file():
+        if found is None:
             finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
             continue
 
@@ -843,113 +1134,191 @@ def run_pending(
             adapted.update_request(req_id, {"status": "pending"})
             continue
 
-        tok_map = _load_tokens(tokens, tokens_path)
-        plat_tok = dict(tok_map.get(plat) or {})
-        secrets = _secret_values(tok_map)
-
-        def do_refresh() -> str:
-            ref_fn = (refreshers or {}).get(plat) or (
-                lambda p, t: _default_refresh(p, t, tokens_path=tokens_path)
+        mp4_raw = found.get("mp4_path")
+        mp4_path = Path(mp4_raw) if mp4_raw is not None else None
+        tmp_dl: Path | None = None
+        if mp4_path is None or not mp4_path.is_file():
+            tmp_dl, dl_err, dl_reply = _download_from_discord(
+                found=found,
+                root=root,
+                clip_id=clip_id,
+                plat=plat,
+                discord_client=discord_client,
+                reg=reg,
             )
-            refreshed = ref_fn(plat, plat_tok)
-            if isinstance(refreshed, str):
-                new_access = refreshed
-                new_refresh = ""
-            elif isinstance(refreshed, dict):
-                new_access = str(refreshed.get("access_token") or "")
-                new_refresh = str(refreshed.get("refresh_token") or "")
-            else:
-                new_access = ""
-                new_refresh = ""
-            if not new_access:
-                raise RuntimeError("refresh returned no access_token")
-            plat_tok["access_token"] = new_access
-            if new_refresh:
-                plat_tok["refresh_token"] = new_refresh
-                tok_map[plat] = plat_tok
-                save_fn(tok_map, tokens_path)
-            else:
-                tok_map[plat] = plat_tok
-            secrets.extend(_secret_values(tok_map))
-            return str(new_access)
-
-        access_token = plat_tok.get("access_token")
-        if not access_token:
-            if not plat_tok.get("refresh_token"):
-                finish("erro_auth", {"erro": "sem_token"}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+            if tmp_dl is None:
+                finish("erro_arquivo", {"erro": dl_err or "arquivo_ausente"}, dl_reply or f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
                 continue
-            try:
-                access_token = do_refresh()
-            except Exception as exc:
-                safe_err = _sanitize_text(str(exc), secrets)
-                finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
-                continue
-
-        pub_fn = (publishers or {}).get(plat)
-        clip_entry = found["clip"]
-
-        def invoke(tok: str) -> dict[str, Any]:
-            if pub_fn is not None:
-                return _call_publisher(pub_fn, plat, Path(mp4_path), clip_entry, tok)
-            return _default_publish(plat, Path(mp4_path), clip_entry, tok, refresh=do_refresh)
+            mp4_path = tmp_dl
 
         try:
-            res = invoke(str(access_token))
-        except Exception as exc:
-            if _is_401_error(exc):
+            tok_map = _load_tokens(tokens, tokens_path)
+            plat_tok = dict(tok_map.get(plat) or {})
+            secrets = _secret_values(tok_map)
+
+            def do_refresh() -> str:
+                ref_fn = (refreshers or {}).get(plat) or (
+                    lambda p, t: _default_refresh(p, t, tokens_path=tokens_path)
+                )
+                refreshed = ref_fn(plat, plat_tok)
+                if isinstance(refreshed, str):
+                    new_access = refreshed
+                    new_refresh = ""
+                elif isinstance(refreshed, dict):
+                    new_access = str(refreshed.get("access_token") or "")
+                    new_refresh = str(refreshed.get("refresh_token") or "")
+                else:
+                    new_access = ""
+                    new_refresh = ""
+                if not new_access:
+                    raise RuntimeError("refresh returned no access_token")
+                plat_tok["access_token"] = new_access
+                if new_refresh:
+                    plat_tok["refresh_token"] = new_refresh
+                    tok_map[plat] = plat_tok
+                    save_fn(tok_map, tokens_path)
+                else:
+                    tok_map[plat] = plat_tok
+                secrets.extend(_secret_values(tok_map))
+                return str(new_access)
+
+            access_token = plat_tok.get("access_token")
+            if not access_token:
+                if not plat_tok.get("refresh_token"):
+                    finish("erro_auth", {"erro": "sem_token"}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                    continue
                 try:
                     access_token = do_refresh()
-                    res = invoke(access_token)
-                except Exception as exc2:
-                    safe_err = _sanitize_text(str(exc2), secrets)
-                    if _is_account_error(exc2):
-                        finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
-                    else:
-                        finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                except Exception as exc:
+                    safe_err = _sanitize_text(str(exc), secrets)
+                    finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
                     continue
-            elif _is_account_error(exc):
-                safe_err = _sanitize_text(str(exc), secrets)
-                finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+
+            pub_fn = (publishers or {}).get(plat)
+            clip_entry = found["clip"]
+
+            def invoke(tok: str) -> dict[str, Any]:
+                if pub_fn is not None:
+                    return _call_publisher(pub_fn, plat, mp4_path, clip_entry, tok)
+                return _default_publish(plat, mp4_path, clip_entry, tok, refresh=do_refresh)
+
+            try:
+                res = invoke(str(access_token))
+            except FileNotFoundError:
+                if tmp_dl is not None:
+                    finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
+                    continue
+                tmp_dl, dl_err, dl_reply = _download_from_discord(
+                    found=found,
+                    root=root,
+                    clip_id=clip_id,
+                    plat=plat,
+                    discord_client=discord_client,
+                    reg=reg,
+                    secrets=secrets,
+                )
+                if tmp_dl is None:
+                    finish("erro_arquivo", {"erro": dl_err or "arquivo_ausente"}, dl_reply or f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
+                    continue
+                mp4_path = tmp_dl
+                try:
+                    res = invoke(str(access_token))
+                except Exception as exc_retry:
+                    if _is_401_error(exc_retry):
+                        try:
+                            access_token = do_refresh()
+                            res = invoke(access_token)
+                        except Exception as exc2:
+                            safe_err = _sanitize_text(str(exc2), secrets)
+                            if _is_account_error(exc2):
+                                finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                            else:
+                                finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                            continue
+                    elif _is_account_error(exc_retry):
+                        safe_err = _sanitize_text(str(exc_retry), secrets)
+                        finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                        continue
+                    else:
+                        safe_err = _sanitize_text(str(exc_retry), secrets)
+                        finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
+                        continue
+            except Exception as exc:
+                if _is_401_error(exc):
+                    try:
+                        access_token = do_refresh()
+                        res = invoke(access_token)
+                    except Exception as exc2:
+                        safe_err = _sanitize_text(str(exc2), secrets)
+                        if _is_account_error(exc2):
+                            finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                        else:
+                            finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                        continue
+                elif _is_account_error(exc):
+                    safe_err = _sanitize_text(str(exc), secrets)
+                    finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                    continue
+                else:
+                    safe_err = _sanitize_text(str(exc), secrets)
+                    finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
+                    continue
+
+            if isinstance(res, dict) and res.get("status") in ("erro_conta", "erro_auth", "erro"):
+                st = str(res["status"])
+                safe_err = _sanitize_text(str(res.get("error") or res.get("erro") or st), secrets)
+                if st == "erro_conta":
+                    msg = f"[{plat}] erro_conta: deixe a conta do TikTok como privada"
+                elif st == "erro_auth":
+                    msg = f"[{plat}] erro_auth: refaca clipes auth {plat}"
+                else:
+                    msg = f"[{plat}] erro: {safe_err}"
+                finish(st, {"erro": safe_err}, msg)
                 continue
+
+            try:
+                _record_quota(plat, now_ts, quota_path=quota_path, out_root=root)
+            except Exception as exc:
+                safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+                print(f"[publicacao] falha ao registrar cota de {clip_id} ({safe_err})", flush=True)
+            pub_id = str(res.get("video_id") or res.get("publish_id") or res.get("id") or "")
+            if plat == "youtube":
+                priv = "private"
+                url = str(res.get("url") or (f"https://youtube.com/shorts/{pub_id}" if pub_id else ""))
+                resultado: dict[str, Any] = {"video_id": pub_id, "privacidade": priv}
+                if url:
+                    resultado["url"] = url
             else:
-                safe_err = _sanitize_text(str(exc), secrets)
-                finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
-                continue
+                priv = "SELF_ONLY"
+                url = str(res.get("url") or "")
+                resultado = {"publish_id": pub_id, "privacidade": priv}
+                if url:
+                    resultado["url"] = url
 
-        if isinstance(res, dict) and res.get("status") in ("erro_conta", "erro_auth", "erro"):
-            st = str(res["status"])
-            safe_err = _sanitize_text(str(res.get("error") or res.get("erro") or st), secrets)
-            if st == "erro_conta":
-                msg = f"[{plat}] erro_conta: deixe a conta do TikTok como privada"
-            elif st == "erro_auth":
-                msg = f"[{plat}] erro_auth: refaca clipes auth {plat}"
-            else:
-                msg = f"[{plat}] erro: {safe_err}"
-            finish(st, {"erro": safe_err}, msg)
-            continue
-
-        _record_quota(plat, now_ts, quota_path=quota_path, out_root=root)
-        pub_id = str(res.get("video_id") or res.get("publish_id") or res.get("id") or "")
-        if plat == "youtube":
-            priv = "private"
-            url = str(res.get("url") or (f"https://youtube.com/shorts/{pub_id}" if pub_id else ""))
-            resultado: dict[str, Any] = {"video_id": pub_id, "privacidade": priv}
-            if url:
-                resultado["url"] = url
-        else:
-            priv = "SELF_ONLY"
-            url = str(res.get("url") or "")
-            resultado = {"publish_id": pub_id, "privacidade": priv}
-            if url:
-                resultado["url"] = url
-
-        _record_clip_publication(
-            found.get("clips_json_path"),
-            clip_id,
-            {"plataforma": plat, "id": pub_id, "privacidade": priv, **({"url": url} if url else {})},
-        )
-        link_or_id = url or pub_id
-        reply = _sanitize_text(f"[{plat}] ok: {link_or_id}", secrets)
-        finish("ok", resultado, reply)
+            try:
+                _record_clip_publication(
+                    found.get("clips_json_path"),
+                    clip_id,
+                    {"plataforma": plat, "id": pub_id, "privacidade": priv, **({"url": url} if url else {})},
+                )
+            except Exception as exc:
+                safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+                print(f"[publicacao] falha ao atualizar clips.json de {clip_id} ({safe_err})", flush=True)
+            if reg is not None:
+                try:
+                    reg.registrar_publicacao(
+                        clip_id,
+                        plat,
+                        {"id": pub_id, "url": url, "em": now_ts},
+                    )
+                except Exception as exc:
+                    safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+                    print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({safe_err})", flush=True)
+            link_or_id = url or pub_id
+            reply = _sanitize_text(f"[{plat}] ok: {link_or_id}", secrets)
+            finish("ok", resultado, reply)
+        finally:
+            if tmp_dl is not None:
+                tmp_dl.unlink(missing_ok=True)
 
     return outcomes

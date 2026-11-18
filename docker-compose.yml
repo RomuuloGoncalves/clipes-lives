@@ -36,6 +36,9 @@ services:
       DISCORD_GUILD_ID:
       DISCORD_ALLOWED_USER_IDS:
       CLIPES_DISCORD_MAX_MB:
+      CLIPES_MASTER_MODE:
+      CLIPES_RETENCAO_H:
+      CLIPES_REGISTRO_VERIFICAR:
       YOUTUBE_CLIENT_ID:
       YOUTUBE_CLIENT_SECRET:
       GOOGLE_CLIENT_ID:
@@ -48,6 +51,8 @@ services:
       CLIPES_OAUTH_PORT:
       CLIPES_YT_MAX_DIA:
       CLIPES_TIKTOK_MAX_DIA:
+      CLIPES_AGENDA_HORARIOS: ${CLIPES_AGENDA_HORARIOS-11:30,19:00}
+      CLIPES_TZ: ${CLIPES_TZ:-America/Sao_Paulo}
     volumes:
       - clipes_models:/cache
       - ${OUT_DIR:-./out}:/out
@@ -73,6 +78,9 @@ services:
       DISCORD_GUILD_ID:
       DISCORD_ALLOWED_USER_IDS:
       CLIPES_DISCORD_MAX_MB:
+      CLIPES_MASTER_MODE:
+      CLIPES_RETENCAO_H:
+      CLIPES_REGISTRO_VERIFICAR:
       YOUTUBE_CLIENT_ID:
       YOUTUBE_CLIENT_SECRET:
       GOOGLE_CLIENT_ID:
@@ -83,6 +91,8 @@ services:
       CLIPES_TOKENS_PATH:
       CLIPES_YT_MAX_DIA:
       CLIPES_TIKTOK_MAX_DIA:
+      CLIPES_AGENDA_HORARIOS: ${CLIPES_AGENDA_HORARIOS-11:30,19:00}
+      CLIPES_TZ: ${CLIPES_TZ:-America/Sao_Paulo}
     volumes:
       - clipes_models:/cache
       - ${OUT_DIR:-./out}:/out

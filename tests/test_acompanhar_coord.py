@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from types import SimpleNamespace
 
 import mongomock
@@ -179,3 +180,64 @@ def test_supervisor_ctrl_c_libera_lease_sem_marcar_ended(tmp_path, monkeypatch):
         assert doc["status"] == "live"
         assert doc["owner"] is None
         assert doc["lease_until"] is None
+
+
+def test_supervisor_keepalive_renova_beat_e_lease_durante_pipeline_lento(tmp_path, monkeypatch):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "1")
+    monkeypatch.setenv("CLIPES_BEAT_S", "1")
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-keep", now=clock.now, lease_s=90)
+    pool = FakeMultiPool(clock, {"gaules": B + 320})
+
+    in_pipeline = [False]
+    beat_during_pipe: list[bool] = []
+    renew_during_pipe: list[str] = []
+    orig_beat = coord.beat
+    orig_renew = coord.renew
+
+    def tracked_beat(*args, **kwargs):
+        if in_pipeline[0]:
+            beat_during_pipe.append(True)
+        return orig_beat(*args, **kwargs)
+
+    def tracked_renew(lid):
+        if in_pipeline[0]:
+            renew_during_pipe.append(lid)
+        return orig_renew(lid)
+
+    coord.beat = tracked_beat
+    coord.renew = tracked_renew
+
+    ran_once = [False]
+
+    def slow_pipe(job_dir, out_root):
+        if not ran_once[0]:
+            ran_once[0] = True
+            in_pipeline[0] = True
+            try:
+                time.sleep(1.25)
+            finally:
+                in_pipeline[0] = False
+        return {"clips": []}
+
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("gaules")],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=slow_pipe,
+        coord=coord,
+        stream_id="99",
+        is_live=lambda u: True,
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    res = sup.run()
+
+    assert res["status"] == "ended"
+    assert beat_during_pipe
+    assert "twitch:gaules:99" in renew_during_pipe
