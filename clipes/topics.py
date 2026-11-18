@@ -12,6 +12,7 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import rankdata
 
+from . import capacidade
 from .models import SignalBundle, TopicSegment, Word
 from .render import TITLE_KEYWORDS
 from .signals import signal_prosody
@@ -83,7 +84,7 @@ def embed_sentences(texts: list[str], onnx_path: str | None = None) -> np.ndarra
         token_type_ids = np.array([e.type_ids for e in encoded], dtype=np.int64)
 
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = int(os.environ.get("CLIPES_CPU_THREADS", "6"))
+        opts.intra_op_num_threads = capacidade.cpu_threads()
         opts.inter_op_num_threads = 1
         sess = ort.InferenceSession(str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])
 

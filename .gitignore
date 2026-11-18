@@ -7,3 +7,6 @@ out/
 dist/
 build/
 .env
+*.env
+.env.*
+segredos.env

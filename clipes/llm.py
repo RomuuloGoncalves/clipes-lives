@@ -13,10 +13,11 @@ import tempfile
 import time
 import unicodedata
 import urllib.request
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .capacidade import cpu_threads
 from .models import IngestResult, SnappedClip, Word
 from .render import generate_title
 
@@ -43,8 +44,10 @@ CLIP_JSON_SCHEMA: dict[str, Any] = {
         },
         "nota": {"type": "number", "minimum": 0, "maximum": 10},
         "motivo": {"type": "string", "maxLength": 120},
+        "gancho_topo": {"type": "string", "maxLength": 35},
+        "descricao_longa": {"type": "string", "maxLength": 500},
     },
-    "required": ["titulo", "gancho", "hashtags", "nota", "motivo"],
+    "required": ["titulo", "gancho", "hashtags", "nota", "motivo", "gancho_topo", "descricao_longa"],
     "additionalProperties": False,
 }
 
@@ -225,7 +228,7 @@ def llama_server_session(
     if not Path(bin_path).is_file():
         raise FileNotFoundError(f"llama-server binary not found: {bin_path}")
 
-    n_threads = int(threads or os.environ.get("CLIPES_CPU_THREADS", "6"))
+    n_threads = int(threads or cpu_threads())
     listen_port = port or _free_port(host)
     base_url = f"http://{host}:{listen_port}"
 
@@ -310,7 +313,7 @@ def complete(
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 300,
+        "max_tokens": 600,
         "response_format": {
             "type": "json_object",
             "schema": schema,
@@ -522,6 +525,75 @@ def format_three_line_caption(
     return f"{line1}\n{credit}\n{line3}"
 
 
+def pick_hook_top(raw: str, title: str, transcript: str, reference_text: str = "") -> str:
+    """Gancho de topo (<= 35, sem emoji, sem entidade inventada); inválido -> título cortado ou ""."""
+    limit = 35
+    clean = " ".join(str(raw or "").split())
+    if (
+        clean
+        and len(clean) <= limit
+        and not _EMOJI_RE.search(clean)
+        and not _URL_OR_MENTION_RE.search(clean)
+        and validate_no_hallucinated_entities(clean, transcript, reference_text)
+    ):
+        return clean
+    t = " ".join(str(title or "").split())
+    if len(t) > limit:
+        cut = t[: limit + 1]
+        if " " not in cut:
+            return ""
+        t = cut.rsplit(" ", 1)[0]
+    t = t.rstrip(" ,;:-")
+    return "" if _EMOJI_RE.search(t) else t
+
+
+def long_paragraph_fallback(clip: SnappedClip, limit: int = 320) -> str:
+    """Primeiras frases completas da transcrição do clipe, até `limit` caracteres."""
+    text = " ".join(clip.text.split())
+    out = ""
+    for sent in re.split(r"(?<=[.!?…])\s+", text):
+        nxt = f"{out} {sent}".strip()
+        if len(nxt) > limit:
+            break
+        out = nxt
+    if out or not text:
+        return out
+    cut = text[: limit + 1]  # primeira frase sozinha estoura: corta na palavra
+    return (cut.rsplit(" ", 1)[0] if " " in cut and len(text) > limit else text[:limit]).rstrip()
+
+
+def pick_long_description(raw: str, clip: SnappedClip, reference_text: str = "") -> tuple[str, str]:
+    """(parágrafo, fonte): "llm" se 150-500, sem URL e sem entidade inventada; senão fallback."""
+    clean = " ".join(str(raw or "").split())
+    if (
+        150 <= len(clean) <= 500
+        and not _URL_OR_MENTION_RE.search(clean)
+        and validate_no_hallucinated_entities(clean, clip.text, reference_text)
+    ):
+        return clean, "llm"
+    paragraph = long_paragraph_fallback(clip)
+    return (paragraph, "fallback") if paragraph else ("", "")
+
+
+def format_long_description(
+    title: str,
+    paragraph: str,
+    channel: str,
+    url: str,
+    hashtags: list[str],
+    part_index: int = 1,
+    part_total: int = 1,
+) -> str:
+    """Título, parágrafo, crédito, live completa (+ parte), hashtags."""
+    live = f"Live completa: {url}"
+    if part_total > 1:
+        live += f" · Parte {part_index}/{part_total}"
+    return (
+        f"{' '.join(title.split())}\n\n{paragraph}\n\n"
+        f"Crédito: {channel or 'streamer'}\n{live}\n\n{' '.join(hashtags)}"
+    )
+
+
 def _infer_channel(ing: IngestResult) -> str:
     explicit = str(getattr(ing, "channel", "") or "").strip()
     if explicit:
@@ -562,8 +634,13 @@ def _build_clip_prompt(clip_text: str, ing: IngestResult, channel: str) -> str:
         f"<transcricao>{truncated}</transcricao>\n\n"
         "Gere JSON com:\n"
         "- titulo: <= 60 chars, termine ou contenha ? ou !, no máximo 1 emoji, "
+        "sobre o conflito, a revelação ou a reação do trecho (nada genérico e nunca o título da live), "
         "SEM inventar nomes próprios ausentes da transcrição/título.\n"
         "- gancho: frase curta (<= 140 chars) apresentando o momento.\n"
+        "- gancho_topo: <= 35 chars, pergunta ou promessa que prenda o espectador, "
+        "sem emoji e sem entregar o desfecho.\n"
+        "- descricao_longa: 2 a 4 frases (150 a 500 chars) resumindo o momento, "
+        "sem URL e sem inventar nomes ou números ausentes da transcrição.\n"
         "- hashtags: 3 a 5 hashtags PT-BR específicas (sem #fyp, #foryou, #viral, #reels, sem hífen).\n"
         "- nota: número de 0 a 10 com base na rubrica:\n"
         "  0-3: fala desconexa sem clímax;\n"
@@ -591,6 +668,16 @@ def _apply_fallback(
         clip.title, channel, ing.url, clip.hashtags,
         part_index=part_index, part_total=part_total,
     )
+    clip.hook_top = pick_hook_top("", clip.title, clip.text)
+    paragraph = long_paragraph_fallback(clip)
+    if paragraph:
+        clip.description_source = "fallback"
+        clip.description_long = format_long_description(
+            clip.title, paragraph, channel, ing.url, clip.hashtags, part_index, part_total
+        )
+    else:
+        clip.description_source = ""
+        clip.description_long = ""
 
 
 def _sort_with_tie_break(clips: list[SnappedClip], tie_delta: float = 0.02) -> None:
@@ -658,56 +745,89 @@ def enrich_clips_with_llm(
             _apply_fallback(clip, words, ing, channel)
         return
 
+    from . import cloud_llm  # import tardio: cloud_llm importa _THINK_RE deste módulo
+
+    cloud_llm.reset_round()
+    stack = ExitStack()
+    server_url: str | None = None
+    server_failed = False
     try:
-        with llama_server_session() as server_url:
-            for clip in clips:
-                if not clip.text.strip():
-                    _apply_fallback(clip, words, ing, channel)
-                    continue
-                prompt = _build_clip_prompt(clip.text, ing, channel)
-                try:
-                    res = complete(prompt, schema=CLIP_JSON_SCHEMA, server_url=server_url, timeout=eff_timeout)
-                except Exception as exc:
-                    logger.warning("[llm] Clip completion failed (%s); using heuristic fallback", exc)
-                    _apply_fallback(clip, words, ing, channel)
-                    continue
+        for clip in clips:
+            if not clip.text.strip():
+                _apply_fallback(clip, words, ing, channel)
+                continue
+            prompt = _build_clip_prompt(clip.text, ing, channel)
+            res: dict[str, Any] | None = None
+            source = "llm"
+            cloud = cloud_llm.complete_cloud(prompt, CLIP_JSON_SCHEMA, DEFAULT_SYSTEM_PROMPT)
+            if cloud is not None:
+                res, source = cloud
+            else:
+                # nuvem sem resposta: sessão local lazy, uma por rodada
+                if server_url is None and not server_failed:
+                    try:
+                        server_url = stack.enter_context(llama_server_session())
+                    except Exception as exc:
+                        server_failed = True
+                        logger.warning("[llm] llama-server unavailable (%s); applying deterministic fallback", exc)
+                if server_url is not None:
+                    try:
+                        res = complete(prompt, schema=CLIP_JSON_SCHEMA, server_url=server_url, timeout=eff_timeout)
+                    except Exception as exc:
+                        logger.warning("[llm] Clip completion failed (%s); using heuristic fallback", exc)
+            if res is None:
+                _apply_fallback(clip, words, ing, channel)
+                continue
 
-                raw_title = " ".join(str(res.get("titulo", "")).split())
-                if validate_title(raw_title, clip.text, reference_text) and not is_title_echo(raw_title, ing.title):
-                    clip.title = raw_title
-                    clip.title_source = "llm"
-                else:
-                    clip.title = generate_title(clip, words)
-                    clip.title_source = "heuristic_fallback"
+            raw_title = " ".join(str(res.get("titulo", "")).split())
+            if validate_title(raw_title, clip.text, reference_text) and not is_title_echo(raw_title, ing.title):
+                clip.title = raw_title
+                clip.title_source = source
+            else:
+                clip.title = generate_title(clip, words)
+                clip.title_source = "heuristic_fallback"
 
-                raw_tags = res.get("hashtags", [])
-                if not isinstance(raw_tags, list):
-                    raw_tags = []
-                clip.hashtags = sanitize_hashtags(
-                    [str(t) for t in raw_tags],
-                    channel=channel,
-                    title=f"{ing.title} {clip.title}",
+            raw_tags = res.get("hashtags", [])
+            if not isinstance(raw_tags, list):
+                raw_tags = []
+            clip.hashtags = sanitize_hashtags(
+                [str(t) for t in raw_tags],
+                channel=channel,
+                title=f"{ing.title} {clip.title}",
+            )
+
+            try:
+                nota = float(res.get("nota", 0.0))
+            except (TypeError, ValueError):
+                nota = 0.0
+            clip.llm_score = round(min(10.0, max(0.0, nota)), 2)
+            clip.llm_reason = " ".join(str(res.get("motivo", "")).split())[:120]
+
+            raw_hook = " ".join(str(res.get("gancho", "")).split())
+            hook = raw_hook if validate_hook(raw_hook, clip.text, reference_text) else clip.title
+            part_index = int(getattr(clip, "part_index", 1) or 1)
+            part_total = int(getattr(clip, "part_total", 1) or 1)
+            clip.caption = format_three_line_caption(
+                hook, channel, ing.url, clip.hashtags,
+                part_index=part_index, part_total=part_total,
+            )
+            clip.hook_top = pick_hook_top(str(res.get("gancho_topo", "")), clip.title, clip.text, reference_text)
+            paragraph, clip.description_source = pick_long_description(
+                str(res.get("descricao_longa", "")), clip, reference_text
+            )
+            clip.description_long = (
+                format_long_description(
+                    clip.title, paragraph, channel, ing.url, clip.hashtags, part_index, part_total
                 )
-
-                try:
-                    nota = float(res.get("nota", 0.0))
-                except (TypeError, ValueError):
-                    nota = 0.0
-                clip.llm_score = round(min(10.0, max(0.0, nota)), 2)
-                clip.llm_reason = " ".join(str(res.get("motivo", "")).split())[:120]
-
-                raw_hook = " ".join(str(res.get("gancho", "")).split())
-                hook = raw_hook if validate_hook(raw_hook, clip.text, reference_text) else clip.title
-                part_index = int(getattr(clip, "part_index", 1) or 1)
-                part_total = int(getattr(clip, "part_total", 1) or 1)
-                clip.caption = format_three_line_caption(
-                    hook, channel, ing.url, clip.hashtags,
-                    part_index=part_index, part_total=part_total,
-                )
+                if paragraph
+                else ""
+            )
     except Exception as exc:
-        logger.warning("[llm] llama-server unavailable (%s); applying deterministic fallback", exc)
+        logger.warning("[llm] enrichment failed (%s); applying deterministic fallback", exc)
         for clip in clips:
             if not clip.caption:
                 _apply_fallback(clip, words, ing, channel)
+    finally:
+        stack.close()
 
     _sort_with_tie_break(clips)

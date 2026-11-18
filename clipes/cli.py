@@ -14,13 +14,22 @@ from typing import Any
 
 import numpy as np
 
+from . import cloud_llm
 from .asr import transcribe_candidates, transcribe_fast_blocks
 from .candidates import pick_candidate_peaks, pick_quota_candidates
 from .eval import evaluate_clips
-from .ingest import format_channel_credit, ingest
-from .llm import enrich_clips_with_llm, format_three_line_caption, sanitize_hashtags
+from .ingest import format_channel_credit, ingest, probe_metadata, sanitize_id
+from .llm import (
+    enrich_clips_with_llm,
+    format_long_description,
+    format_three_line_caption,
+    long_paragraph_fallback,
+    pick_hook_top,
+    sanitize_hashtags,
+)
 from .models import CandidatePeak, SignalBundle, TopicSegment, Word
-from .render import OUTRO_DURATION, generate_title, is_blur_bg_enabled, render_clip
+from .monitor import follow_live
+from .render import OUTRO_DURATION, clip_stem, generate_title, is_blur_bg_enabled, render_clip
 from .signals import compute_rms_db, compute_signals, triage_audio_blocks
 from .snap import select_clips
 from .topics import score_topic_segments
@@ -37,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-dur", type=float, default=65.0, help="Duração máxima do clipe em s (padrão: 65)")
     p.add_argument("--live-minutes", type=float, default=20.0,
                    help="Minutos a gravar se a URL for uma live ativa (padrão: 20)")
+    p.add_argument("--ate-acabar", action="store_true",
+                   help="Se a URL for uma live ativa, clipa em janelas contínuas até ela acabar")
     p.add_argument("--chat", action=argparse.BooleanOptionalAction, default=True,
                    help="Usar sinal de chat replay quando disponível (padrão: --chat)")
     p.add_argument("--whisper-model", default=None,
@@ -66,6 +77,7 @@ def _write_run_readme(
     url: str,
     clips_data: list[dict[str, Any]],
     timings: dict[str, float],
+    cloud_providers: list[str] | None = None,
 ) -> None:
     lines = [
         f"# {title}",
@@ -73,12 +85,16 @@ def _write_run_readme(
         f"- **Video ID:** `{video_id}`",
         f"- **URL:** {url}",
         f"- **Clipes gerados:** {len(clips_data)}",
+    ]
+    if cloud_providers:
+        lines.extend(["", f"Texto da transcrição enviado a: {', '.join(cloud_providers)}"])
+    lines.extend([
         "",
         "## Clipes",
         "",
         "| Arquivo | Parte | Início | Fim | Duração | Score | Sinais | Título |",
         "|---|---|---:|---:|---:|---:|---|---|",
-    ]
+    ])
     for c in clips_data:
         sigs = ", ".join(c["signals"])
         p_idx = c.get("part_index", 1)
@@ -194,6 +210,29 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return 2
 
     out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
+    cloud_llm.set_out_dir(out_root)
+    if getattr(args, "ate_acabar", False):
+        meta = probe_metadata(args.url)
+        if bool(meta.get("is_live")):
+            out_root.mkdir(parents=True, exist_ok=True)
+            print(f"[live] Live ativa detectada; acompanhando até acabar: {args.url}", flush=True)
+            follow_kwargs: dict[str, Any] = {}
+            sig_params = inspect.signature(follow_live).parameters
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+            if has_varkw or "max_dur" in sig_params:
+                follow_kwargs["max_dur"] = args.max_dur
+            if (has_varkw or "stream_id" in sig_params) and isinstance(meta, dict) and meta.get("id"):
+                follow_kwargs["stream_id"] = str(meta["id"])
+            if has_varkw or "coord" in sig_params:
+                if os.environ.get("CLIPES_MONGO_URI", "").strip():
+                    from .monitor import _connect_coord_for_follow
+
+                    follow_kwargs["coord"] = _connect_coord_for_follow(out_root)
+                else:
+                    follow_kwargs["coord"] = None
+            follow_live(args.url, out_root, **follow_kwargs)
+            return 0
+
     timings: dict[str, float] = {}
 
     t0 = time.perf_counter()
@@ -329,6 +368,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return 0
 
     t_llm = time.perf_counter()
+    cloud_llm.reset_round()
     try:
         enrich_clips_with_llm(clips, words, ing, enabled=not getattr(args, "no_llm", False))
     except Exception as exc:
@@ -337,12 +377,16 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     t5 = time.perf_counter()
     default_layout = "blurred_16x9" if is_blur_bg_enabled() else "black_bars_16x9"
+    safe_video_id = sanitize_id(ing.video_id)
+    effective_channel = channel_credit or getattr(ing, "channel", "") or ing.title
     group_totals: dict[str, float] = {}
     for c in clips:
         if c.group_id:
             group_totals[c.group_id] = round(group_totals.get(c.group_id, 0.0) + c.duration, 2)
     clips_payload: list[dict[str, Any]] = []
     for idx, clip in enumerate(clips, 1):
+        part_index = int(getattr(clip, "part_index", 1) or 1)
+        part_total = int(getattr(clip, "part_total", 1) or 1)
         if not clip.title:
             clip.title = generate_title(clip, words)
             if not getattr(clip, "title_source", ""):
@@ -352,18 +396,34 @@ def run_pipeline(args: argparse.Namespace) -> int:
         if not getattr(clip, "caption", ""):
             clip.caption = format_three_line_caption(
                 clip.title,
-                channel_credit or getattr(ing, "channel", "") or ing.title,
+                effective_channel,
                 ing.url,
                 clip.hashtags,
-                part_index=int(getattr(clip, "part_index", 1) or 1),
-                part_total=int(getattr(clip, "part_total", 1) or 1),
+                part_index=part_index,
+                part_total=part_total,
             )
+        if not getattr(clip, "hook_top", "") and not getattr(clip, "description_source", ""):
+            clip.hook_top = pick_hook_top(
+                "", clip.title, clip.text, f"{ing.title} {effective_channel}".strip()
+            )
+        if not getattr(clip, "description_long", ""):
+            paragraph = long_paragraph_fallback(clip)
+            if paragraph:
+                clip.description_long = format_long_description(
+                    clip.title,
+                    paragraph,
+                    effective_channel,
+                    ing.url,
+                    clip.hashtags,
+                    part_index=part_index,
+                    part_total=part_total,
+                )
+                if not getattr(clip, "description_source", ""):
+                    clip.description_source = "fallback"
+            else:
+                clip.description_source = ""
         if args.skip_render:
-            clip.output_file = (
-                f"clip_{idx:02d}_part{clip.part_index}of{clip.part_total}.mp4"
-                if clip.part_total > 1
-                else f"clip_{idx:02d}.mp4"
-            )
+            clip.output_file = f"{clip_stem(idx, clip)}.mp4"
             clip_layout = default_layout
         else:
             print(
@@ -394,13 +454,20 @@ def run_pipeline(args: argparse.Namespace) -> int:
         if clip.caption:
             txt_path = ing.out_dir / Path(clip.output_file).with_suffix(".txt")
             txt_path.write_text(clip.caption, encoding="utf-8")
+        if getattr(clip, "description_long", ""):
+            desc_path = ing.out_dir / Path(clip.output_file).with_suffix(".descricao.txt")
+            desc_path.write_text(clip.description_long, encoding="utf-8")
 
         clip_entry: dict[str, Any] = {
             "index": idx,
+            "clip_id": f"{safe_video_id}_c{idx:02d}",
             "file": clip.output_file,
             "title": clip.title,
             "title_source": str(getattr(clip, "title_source", "") or "heuristic_fallback"),
+            "hook_top": str(getattr(clip, "hook_top", "") or ""),
             "caption": clip.caption,
+            "description_long": str(getattr(clip, "description_long", "") or ""),
+            "description_source": str(getattr(clip, "description_source", "") or ""),
             "hashtags": list(clip.hashtags),
             "llm_score": getattr(clip, "llm_score", None),
             "llm_reason": str(getattr(clip, "llm_reason", "") or ""),
@@ -451,7 +518,11 @@ def run_pipeline(args: argparse.Namespace) -> int:
     (ing.out_dir / "clips.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
     )
-    _write_run_readme(ing.out_dir, ing.video_id, ing.title, ing.url, clips_payload, timings)
+    used_providers = [] if getattr(args, "no_llm", False) else cloud_llm.providers_used()
+    _write_run_readme(
+        ing.out_dir, ing.video_id, ing.title, ing.url, clips_payload, timings,
+        cloud_providers=used_providers,
+    )
     print(f"[done] Output written to {ing.out_dir} in {timings['total_s']:.1f}s", flush=True)
     return 0
 

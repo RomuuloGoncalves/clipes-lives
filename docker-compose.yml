@@ -3,7 +3,7 @@ services:
     build: .
     image: clipes-lives:latest
     user: "${UID:-1000}:${GID:-1000}"
-    mem_limit: 8g
+    mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
     environment:
@@ -13,15 +13,79 @@ services:
       HF_HOME: /cache/huggingface
       CLIPES_WHISPER_MODEL: ${CLIPES_WHISPER_MODEL:-small}
       CLIPES_CPU_THREADS: ${CLIPES_CPU_THREADS:-3}
+      GEMINI_API_KEYS:
+      CLIPES_GEMINI_MODELS:
+      CLIPES_GEMINI_MIN_INTERVAL_S:
+      CLIPES_LLM_BACKEND:
+      CLIPES_HOOK_TOP:
+      CLIPES_MONGO_URI:
+      CLIPES_ALIAS:
+      CLIPES_LEASE_S:
+      CLIPES_BEAT_S:
+      CLIPES_MIN_FREE_GB:
+      DISCORD_BOT_TOKEN:
+      DISCORD_CHANNEL_ID:
+      DISCORD_GUILD_ID:
+      DISCORD_ALLOWED_USER_IDS:
+      CLIPES_DISCORD_MAX_MB:
+      YOUTUBE_CLIENT_ID:
+      YOUTUBE_CLIENT_SECRET:
+      GOOGLE_CLIENT_ID:
+      GOOGLE_CLIENT_SECRET:
+      TIKTOK_CLIENT_KEY:
+      TIKTOK_CLIENT_ID:
+      TIKTOK_CLIENT_SECRET:
+      CLIPES_TOKENS_PATH:
+      CLIPES_OAUTH_BIND:
+      CLIPES_OAUTH_PORT:
+      CLIPES_YT_MAX_DIA:
+      CLIPES_TIKTOK_MAX_DIA:
     volumes:
       - clipes_models:/cache
       - ${OUT_DIR:-${HOME}/Downloads/clipes-lives}:/out
+      - ${CLIPES_CONFIG_DIR:-${HOME}/.config/clipes-lives}:/config
+
+  bot:
+    image: clipes-lives:latest
+    user: "${UID:-1000}:${GID:-1000}"
+    profiles: ["bot"]
+    restart: on-failure:3
+    mem_limit: ${CLIPES_MEM:-8g}
+    cpus: ${CLIPES_CPUS:-3}
+    cpu_shares: 256
+    environment:
+      OUT_DIR: /out
+      HOME: /cache
+      XDG_CACHE_HOME: /cache
+      HF_HOME: /cache/huggingface
+      CLIPES_MONGO_URI:
+      CLIPES_ALIAS:
+      DISCORD_BOT_TOKEN:
+      DISCORD_CHANNEL_ID:
+      DISCORD_GUILD_ID:
+      DISCORD_ALLOWED_USER_IDS:
+      CLIPES_DISCORD_MAX_MB:
+      YOUTUBE_CLIENT_ID:
+      YOUTUBE_CLIENT_SECRET:
+      GOOGLE_CLIENT_ID:
+      GOOGLE_CLIENT_SECRET:
+      TIKTOK_CLIENT_KEY:
+      TIKTOK_CLIENT_ID:
+      TIKTOK_CLIENT_SECRET:
+      CLIPES_TOKENS_PATH:
+      CLIPES_YT_MAX_DIA:
+      CLIPES_TIKTOK_MAX_DIA:
+    volumes:
+      - clipes_models:/cache
+      - ${OUT_DIR:-${HOME}/Downloads/clipes-lives}:/out
+      - ${CLIPES_CONFIG_DIR:-${HOME}/.config/clipes-lives}:/config
+    command: ["python", "-m", "clipes", "bot"]
 
   # Testes: sem montar a pasta de saida (o Docker criaria ~/Downloads/clipes-lives como root).
   test:
     image: clipes-lives:latest
     user: "${UID:-1000}:${GID:-1000}"
-    mem_limit: 8g
+    mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
     environment:

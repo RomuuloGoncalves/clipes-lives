@@ -1,0 +1,2 @@
+# Variaveis de ambiente na Vercel: PAINEL_SENHA, PAINEL_MONGO_URI (opcional: PAINEL_MONGO_DB, CLIPES_BEAT_S)
+pymongo
