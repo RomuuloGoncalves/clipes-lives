@@ -251,6 +251,62 @@ def test_llama_server_session_terminates_child_on_exception(tmp_path: Path, monk
     assert fake_proc_holder[0].killed is True
 
 
+def test_llama_server_session_uses_cpu_threads_by_default(tmp_path: Path, monkeypatch):
+    import subprocess
+    import urllib.request
+
+    from clipes import llm
+    from clipes.capacidade import cpu_threads
+
+    fake_gguf = tmp_path / "model.gguf"
+    fake_gguf.write_bytes(b"GGUF")
+    fake_bin = tmp_path / "llama-server"
+    fake_bin.write_text("#!/bin/sh\n", encoding="utf-8")
+
+    monkeypatch.setenv("CLIPES_LLM_GGUF", str(fake_gguf))
+    monkeypatch.delenv("CLIPES_CPU_THREADS", raising=False)
+
+    cmds: list[list[str]] = []
+
+    class FakeProc:
+        def __init__(self, cmd, **kwargs):
+            cmds.append(cmd)
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            pass
+
+        def wait(self, timeout=None):
+            return 0
+
+        def kill(self):
+            pass
+
+    class FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc(cmd, **kw))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=1.0: FakeResp())
+
+    expected_default = str(cpu_threads())
+    with llm.llama_server_session(server_bin=str(fake_bin)):
+        pass
+    assert cmds[-1][cmds[-1].index("-t") + 1] == expected_default
+
+    monkeypatch.setattr(llm, "cpu_threads", lambda: 5)
+    with llm.llama_server_session(server_bin=str(fake_bin)):
+        pass
+    assert cmds[-1][cmds[-1].index("-t") + 1] == "5"
+
+
 def test_validate_no_hallucinated_entities_and_title_rules():
     from clipes.llm import validate_no_hallucinated_entities, validate_title
 

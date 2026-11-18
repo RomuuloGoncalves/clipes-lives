@@ -17,6 +17,7 @@ from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from .capacidade import cpu_threads
 from .models import IngestResult, SnappedClip, Word
 from .render import generate_title
 
@@ -227,7 +228,7 @@ def llama_server_session(
     if not Path(bin_path).is_file():
         raise FileNotFoundError(f"llama-server binary not found: {bin_path}")
 
-    n_threads = int(threads or os.environ.get("CLIPES_CPU_THREADS", "6"))
+    n_threads = int(threads or cpu_threads())
     listen_port = port or _free_port(host)
     base_url = f"http://{host}:{listen_port}"
 
