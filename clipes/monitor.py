@@ -19,6 +19,7 @@ import urllib.request
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -859,6 +860,171 @@ class _CoordSession:
         return self.online
 
 
+def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _policy_status_text(policy: ChannelPolicy, channel: str, ready_at: Any) -> str:
+    if channel and not policy.permits(channel):
+        return "bloqueado pela policy"
+    delay_h = policy.delay_h.get(channel, 0.0)
+    if delay_h > 0 and ready_at is not None:
+        ready_str = datetime.fromtimestamp(float(ready_at), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        return f"aguardar ate {ready_str} (delay {delay_h:g}h)"
+    return "liberado"
+
+
+def _format_clip_discord_message(
+    clip: dict[str, Any],
+    clip_id: str,
+    policy_status: str,
+    too_large_path: Path | None = None,
+) -> str:
+    title = str(clip.get("title") or clip_id)
+    hook = str(clip.get("hook_top") or "-")
+    score_val = clip.get("llm_score") if clip.get("llm_score") is not None else clip.get("score")
+    score_txt = f"{score_val}" if score_val is not None else "-"
+    ai_src = str(clip.get("title_source") or clip.get("description_source") or clip.get("llm_reason") or "-")
+    caption = str(clip.get("caption") or "-")
+    desc_long = str(clip.get("description_long") or "-")
+
+    head = (
+        f"**{title}** (`{clip_id}`)\n"
+        f"Gancho: {hook}\n"
+        f"Nota/IA: {score_txt} ({ai_src})\n"
+        f"Legenda: {caption}\n"
+    )
+    tail = f"Policy: {policy_status}\nPara publicar: `publicar {clip_id}`"
+    if too_large_path is not None:
+        tail = f"arquivo grande demais para o Discord: `{too_large_path}`\n" + tail
+
+    budget = 2000 - len(head) - len(tail) - len("Descricao: \n")
+    if budget < 20:
+        desc_part = ""
+    elif len(desc_long) > budget:
+        desc_part = f"Descricao: {desc_long[: max(0, budget - 3)]}...\n"
+    else:
+        desc_part = f"Descricao: {desc_long}\n"
+    return (head + desc_part + tail)[:2000]
+
+
+def _notify_discord_job(
+    completed_dir: Path,
+    job: dict[str, Any],
+    result: dict[str, Any],
+    policy: ChannelPolicy,
+    *,
+    discord_client: Any | None = None,
+    discord_channel_id: str | None = None,
+    preview_fn: Callable[..., Path | None] | None = None,
+) -> None:
+    token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+    if not token:
+        return
+    target_channel = (discord_channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
+    if not target_channel:
+        return
+
+    client = discord_client
+    if client is None:
+        from .discord_rest import DiscordRest
+
+        client = DiscordRest(token)
+
+    out_dir_raw = result.get("output_dir")
+    out_dir = Path(out_dir_raw) if out_dir_raw else None
+    clips_json_path = (out_dir / "clips.json") if out_dir is not None else None
+
+    manifest: dict[str, Any] | None = None
+    if clips_json_path is not None and clips_json_path.is_file():
+        manifest = json.loads(clips_json_path.read_text(encoding="utf-8"))
+        clips = list(manifest.get("clips") or [])
+    else:
+        clips = list(result.get("clips") or [])
+
+    if not clips or all(isinstance(c.get("discord"), dict) and c["discord"].get("message_id") for c in clips):
+        return
+
+    completed_job = _read_job(completed_dir) if (completed_dir / "job.json").is_file() else dict(job)
+    channel_name = str(job.get("channel") or (manifest or {}).get("channel") or "")
+    live_title = str((manifest or {}).get("title") or job.get("title") or job.get("job_id") or channel_name)
+    live_url = str((manifest or {}).get("url") or job.get("url") or "")
+    video_id = str((manifest or {}).get("video_id") or result.get("video_id") or job.get("job_id") or "clip")
+    policy_status = _policy_status_text(policy, channel_name, completed_job.get("ready_at"))
+
+    thread_id = (
+        ((manifest or {}).get("discord") or {}).get("thread_id")
+        or ((completed_job.get("discord") or {}).get("thread_id"))
+        or next(
+            (c["discord"]["thread_id"] for c in clips if isinstance(c.get("discord"), dict) and c["discord"].get("thread_id")),
+            None,
+        )
+    )
+
+    try:
+        if not thread_id:
+            header = f"**{channel_name}** — {live_title}\nClipes: {len(clips)}"
+            if live_url:
+                header += f"\n{live_url}"
+            header_resp = client.post(target_channel, header[:2000])
+            header_msg_id = str(header_resp["id"])
+            thread_name = f"{channel_name} · {live_title[:70]}" if channel_name else live_title[:70]
+            thread_id = str(client.thread_from(target_channel, header_msg_id, thread_name, auto_archive_duration=1440))
+
+            if manifest is not None and clips_json_path is not None:
+                manifest_discord = dict(manifest.get("discord") or {})
+                manifest_discord.update(thread_id=thread_id, header_message_id=header_msg_id)
+                manifest["discord"] = manifest_discord
+                _write_json_atomic(clips_json_path, manifest)
+
+            job_discord = dict(completed_job.get("discord") or {})
+            job_discord.update(thread_id=thread_id, header_message_id=header_msg_id)
+            completed_job["discord"] = job_discord
+            _write_job(completed_dir, completed_job)
+
+        for idx, clip in enumerate(clips, start=1):
+            if isinstance(clip.get("discord"), dict) and clip["discord"].get("message_id"):
+                continue
+            clip_id = str(clip.get("clip_id") or f"{video_id}_c{int(clip.get('index', idx)):02d}")
+            file_rel = clip.get("file")
+            mp4_path = (out_dir / file_rel) if (out_dir is not None and file_rel) else None
+
+            attach_path: Path | None = None
+            too_large_path: Path | None = None
+            if mp4_path is not None and mp4_path.is_file():
+                preview_impl = preview_fn
+                if preview_impl is None:
+                    from .previa import preview_for_discord as preview_impl
+                duration = float(clip.get("rendered_duration") or clip.get("duration") or 60.0)
+                attach_path = preview_impl(mp4_path, duration, out_dir / ".cache")
+                if attach_path is None:
+                    too_large_path = mp4_path
+
+            msg_text = _format_clip_discord_message(clip, clip_id, policy_status, too_large_path=too_large_path)
+            msg_resp = client.post(thread_id, msg_text, file=attach_path)
+            msg_id = str(msg_resp["id"])
+
+            clip["discord"] = {"thread_id": thread_id, "message_id": msg_id}
+            if manifest is not None and clips_json_path is not None:
+                manifest["clips"] = clips
+                _write_json_atomic(clips_json_path, manifest)
+
+            job_discord = dict(completed_job.get("discord") or {})
+            job_clips = dict(job_discord.get("clips") or {})
+            job_clips[clip_id] = msg_id
+            job_discord["thread_id"] = thread_id
+            job_discord["clips"] = job_clips
+            completed_job["discord"] = job_discord
+            _write_job(completed_dir, completed_job)
+    except Exception as exc:
+        err_text = f"{type(exc).__name__}: {exc}".replace(token, "***")
+        completed_job["discord_error"] = err_text[-500:]
+        _write_job(completed_dir, completed_job)
+        print(f"[discord] falha ao enviar previa ({err_text[-200:]})", flush=True)
+
+
 def run_worker_step(
     queue: DiskQueue,
     out_root: Path,
@@ -869,6 +1035,9 @@ def run_worker_step(
     on_mongo_error: Callable[[BaseException], None] | None = None,
     lost_lives: set[str] | None = None,
     on_job_active: Callable[[str | None], None] | None = None,
+    discord_client: Any | None = None,
+    discord_channel_id: str | None = None,
+    preview_fn: Callable[..., Path | None] | None = None,
 ) -> bool:
     """Process one pending job end to end (never publishes). False when the queue is empty."""
     job_dir = queue.claim_next()
@@ -938,7 +1107,7 @@ def run_worker_step(
     clips = result.get("clips") or []
     final_status = "done" if clips else "rejected"
     score = max((float(c["score"]) for c in clips), default=0.0)
-    queue.complete(job_dir, final_status, {
+    completed_dir = queue.complete(job_dir, final_status, {
         "ready_at": job["created_at"] + policy.delay_h.get(channel, 0.0) * 3600,
         "score": score,
         "clips": len(clips),
@@ -953,6 +1122,16 @@ def run_worker_step(
             if not _is_mongo_error(mexc):
                 raise
             report_mongo_error(mexc)
+    if final_status == "done":
+        _notify_discord_job(
+            completed_dir,
+            job,
+            result,
+            policy,
+            discord_client=discord_client,
+            discord_channel_id=discord_channel_id,
+            preview_fn=preview_fn,
+        )
     return True
 
 
@@ -1282,6 +1461,10 @@ async def run_monitor(
     beat_s: float | None = None,
     alias: str | None = None,
     kill_children: Callable[[], None] | None = None,
+    discord_client: Any | None = None,
+    discord_channel_id: str | None = None,
+    preview_fn: Callable[..., Path | None] | None = None,
+    run_pending_fn: Callable[..., list[dict[str, Any]]] | None = None,
 ) -> None:
     """IRC -> ChannelSpikeDetector -> rolling recorder -> capture_job -> DiskQueue, plus 1 sequential worker.
 
@@ -1508,6 +1691,8 @@ async def run_monitor(
                 run_worker_step, queue, out_root, policy, pipeline,
                 coord=active_coord, on_mongo_error=on_err, lost_lives=lost_lives,
                 on_job_active=lambda jid: current_job.__setitem__(0, jid),
+                discord_client=discord_client, discord_channel_id=discord_channel_id,
+                preview_fn=preview_fn,
             ):
                 await sleep(WORKER_IDLE_S)
 
@@ -1546,6 +1731,33 @@ async def run_monitor(
                         await asyncio.to_thread(active_coord.mark_command, cmd["_id"], "feito")
                         print("[comando] liberar recursos", flush=True)
                         raise SystemExit(75)
+                    if os.environ.get("DISCORD_BOT_TOKEN", "").strip():
+                        runner = run_pending_fn
+                        if runner is None:
+                            from . import publicacao
+
+                            runner = publicacao.run_pending
+                        discord_post = (
+                            (lambda tid, msg: discord_client.post(tid, msg))
+                            if discord_client is not None
+                            else None
+                        )
+                        try:
+                            await asyncio.to_thread(
+                                runner,
+                                active_coord,
+                                active_coord.worker_id,
+                                out_root=out_root,
+                                now=now,
+                                policy=policy,
+                                discord_post=discord_post,
+                            )
+                        except Exception as exc:
+                            if _is_mongo_error(exc):
+                                coord_session.mark_offline(exc)
+                            else:
+                                uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
+                                print(f"[publicar] erro no heartbeat ({_sanitize_error(exc, uri)})", flush=True)
             wait_rem = beat_interval if active_coord is None else max(1.0, beat_interval - (now() - last_beat))
             await sleep(max(1.0, wait_rem))
 
