@@ -6,11 +6,18 @@ import os
 import re
 import shutil
 import subprocess
+import sys
+import types
+import wave
 from pathlib import Path
 
+import numpy as np
 import pytest
 
+import clipes.capacidade as capacidade_mod
+from clipes.asr import transcribe_candidates, transcribe_fast_blocks
 from clipes.capacidade import capacity, cpu_threads, worker_id
+from clipes.models import CandidatePeak
 
 
 def _make_sysfs(root: Path, cpu_max: str | None = "300000 100000", mem_max: str | None = "max") -> Path:
@@ -139,3 +146,50 @@ def test_worker_id_creates_once_and_reuses(tmp_path):
     assert (out / ".worker_id").read_text(encoding="utf-8").strip() == first
     second = worker_id(out)
     assert second == first
+
+
+def _write_wav(path: Path, seconds: float = 2.0, sr: int = 16000) -> None:
+    samples = np.zeros(int(seconds * sr), dtype=np.int16)
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(samples.tobytes())
+
+
+def test_asr_uses_cpu_threads_when_env_unset(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_CPU_THREADS", raising=False)
+    wav_path = tmp_path / "audio.wav"
+    _write_wav(wav_path, seconds=2.0)
+
+    received_threads: list[int] = []
+
+    class FakeInfo:
+        language = "pt"
+        language_probability = 0.99
+
+    class FakeWhisperModel:
+        def __init__(self, *args, **kwargs):
+            received_threads.append(kwargs["cpu_threads"])
+
+        def transcribe(self, audio_slice, **kwargs):
+            return [], FakeInfo()
+
+    fake_mod = types.ModuleType("faster_whisper")
+    fake_mod.WhisperModel = FakeWhisperModel
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_mod)
+
+    expected_real = cpu_threads()
+    cands = [CandidatePeak(peak=1.0, raw_score=0.9, start_win=0.0, end_win=2.0)]
+    (tmp_path / "c1").mkdir()
+    (tmp_path / "c3").mkdir()
+    transcribe_candidates(wav_path, cands, tmp_path / "c1", model_size="small")
+    transcribe_fast_blocks(wav_path, [(0.0, 2.0, 1.0)], tmp_path / "c2", model_size="small")
+    assert received_threads == [expected_real, expected_real]
+
+    # Sentinel override proves ASR delegates default threads to capacidade.cpu_threads()
+    received_threads.clear()
+    monkeypatch.setattr(capacidade_mod, "cpu_threads", lambda: 5)
+    transcribe_candidates(wav_path, cands, tmp_path / "c3", model_size="small")
+    transcribe_fast_blocks(wav_path, [(0.0, 2.0, 1.0)], tmp_path / "c4", model_size="small")
+    assert received_threads == [5, 5]
