@@ -564,7 +564,7 @@ def request(
     now_ts = _now_ts(now)
     pol = _resolve_policy(policy, policy_path, root)
     channel = found.get("channel") or ""
-    if channel and not pol.permits(channel):
+    if not pol.permits(channel):
         return "bloqueado pela politica"
 
     ready_at = _effective_ready_at(found, pol)
@@ -821,7 +821,7 @@ def run_pending(
             continue
 
         channel = found.get("channel") or ""
-        if channel and not pol.permits(channel):
+        if not pol.permits(channel):
             finish("erro", {"erro": "bloqueado pela politica"}, f"[{plat}] erro: bloqueado pela politica")
             continue
 

@@ -795,4 +795,76 @@ def test_run_pending_before_ready_at_keeps_pending_for_later_run(
     assert out_ready[0]["status"] == "ok"
 
 
+def test_empty_channel_is_blocked_by_allowed_policy_in_request_and_run_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """S2: clip with empty/unknown channel must not bypass policy.json allowed list."""
+    clip_dir = tmp_path / "2026-11-17 - VOD [vod1]"
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    (clip_dir / "clip_01.mp4").write_bytes(b"fake-mp4")
+    (clip_dir / "clips.json").write_text(
+        json.dumps({
+            "video_id": "vod1",
+            "title": "VOD sem canal",
+            "owner": "w-pc1",
+            "clips": [
+                {
+                    "index": 1,
+                    "clip_id": "vod1_c01",
+                    "file": "clip_01.mp4",
+                    "title": "Sem canal",
+                    "discord": {"thread_id": "thr-empty"},
+                }
+            ],
+        }),
+        encoding="utf-8",
+    )
+    (tmp_path / "policy.json").write_text(json.dumps({"allowed": ["gaules"]}), encoding="utf-8")
+
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"access_token": SECRET_ACCESS, "refresh_token": SECRET_REFRESH}})
+
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    res = request(store, "vod1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    assert res == "bloqueado pela politica"
+    assert store.find_pending() == []
+
+    # Even if a pending request already existed in store, run_pending must also block it
+    store.enqueue_request({
+        "_id": "vod1_c01:youtube",
+        "clip_id": "vod1_c01",
+        "plataforma": "youtube",
+        "owner": "w-pc1",
+        "pedido_por": ALLOWED_USER,
+        "status": "pending",
+        "resultado": None,
+        "thread_id": "thr-empty",
+        "criado_em": _dt_iso(T0),
+        "concluido_em": None,
+    })
+    called = False
+
+    def fake_yt(*args):
+        nonlocal called
+        called = True
+        return {"video_id": "should-not-upload"}
+
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": fake_yt},
+    )
+    assert called is False
+    assert outcomes[0]["status"] == "erro"
+    assert outcomes[0]["resultado"]["erro"] == "bloqueado pela politica"
+
+
+def _dt_iso(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None).isoformat()
+
+
 
