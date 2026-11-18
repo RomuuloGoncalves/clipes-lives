@@ -155,6 +155,7 @@ def test_com_coord_liga_add_start_e_finish_job_ao_redor_do_worker(tmp_path, monk
         channels=["canal"], out_root=out_root, policy=monitor.ChannelPolicy(),
         queue_root=queue_root, irc=irc, popen=FakePopen(), pipeline=pipeline,
         now=clock, sleep=clock.sleep, coord=coord,
+        stream_ids={"canal": "999"}, capacity_fn=lambda _: {"cpus": 4, "score": 30},
     ))
 
     jobs = list(db.jobs.find())
@@ -318,3 +319,209 @@ def test_run_worker_step_coord_timeout_segue_local_sem_vazar_uri(tmp_path, monke
     out = capsys.readouterr().out
     assert "supersecret" not in out
     assert "cluster0.example.mongodb.net" not in out
+
+
+# ---- T23: live claim, stream_id, 30/score wait, max_lives ----------------------------------------
+
+
+def test_helix_guarda_stream_id_e_sem_helix_usa_probe_metadata(tmp_path, monkeypatch):
+    """FILA-01 AC 1 & edge case: stream_id comes from Helix `id` or falls back to yt-dlp probe_metadata."""
+    monkeypatch.setenv("TWITCH_CLIENT_ID", "cid")
+    monkeypatch.setenv("TWITCH_CLIENT_SECRET", "csec")
+    monkeypatch.setattr(monitor, "_helix_cache", {})
+    monkeypatch.setattr(monitor, "_helix_stream_ids", {})
+
+    def fake_http(req):
+        if req.full_url == monitor.HELIX_TOKEN_URL:
+            return {"access_token": "tok"}, {}
+        return {"data": [{"id": "777888", "user_login": "canal_helix"}], "pagination": {}}, {}
+
+    monkeypatch.setattr(monitor, "_http_json", fake_http)
+    ch_file = tmp_path / "channels.txt"
+    ch_file.write_text("canal_local\n", encoding="utf-8")
+    discovered = monitor.discover_channels(ch_file, monitor.ChannelPolicy())
+    assert discovered == ["canal_local", "canal_helix"]
+    assert monitor._helix_stream_ids["canal_helix"] == "777888"
+
+    probe_calls = []
+
+    def fake_probe(url):
+        probe_calls.append(url)
+        return {"id": "555444", "is_live": True}
+
+    assert monitor._resolve_stream_id("canal_helix", probe=fake_probe) == "777888"
+    assert probe_calls == []
+    assert monitor._resolve_stream_id("canal_local", probe=fake_probe) == "555444"
+    assert probe_calls == ["https://www.twitch.tv/canal_local"]
+
+
+def test_coord_que_nega_claim_nunca_inicia_gravador(tmp_path, monkeypatch):
+    """FILA-01 AC 2-3: when claim_live returns False, streamlink/ffmpeg recorder is never started."""
+    clock = Clock()
+    db = mongomock.MongoClient().db
+    coord_a = Coord(db, "w-dono", now=clock)
+    coord_b = Coord(db, "w-eu", now=clock)
+    coord_a.ensure_live("twitch:canal:123", channel="canal", platform="twitch")
+    assert coord_a.claim_live("twitch:canal:123") is True  # another PC owns it
+
+    popen = FakePopen()
+
+    async def irc(channels, on_message, stop):
+        while clock() < T0 + 70:
+            await clock.sleep(1)
+        for i in range(12):
+            on_message("canal", clock(), f"u{i % 6}", "KKKK")
+        while clock() < T0 + 120:
+            await clock.sleep(1)
+        stop.set()
+
+    asyncio.run(monitor.run_monitor(
+        ["canal"], tmp_path / "out", monitor.ChannelPolicy(),
+        queue_root=tmp_path / "q", irc=irc, popen=popen,
+        pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+        coord=coord_b, stream_ids={"canal": "123"},
+        capacity_fn=lambda _: {"cpus": 6, "score": 30},
+    ))
+    assert popen.procs == []
+
+    # Also verify follow_live does not start recorder when claim is denied (renew lease so it's still active)
+    coord_a.renew("twitch:canal:123")
+    pool = monitor.RollingRecorderPool(tmp_path / "buf2", max_hot=0, max_on_demand=1, popen=popen)
+    res = monitor.follow_live(
+        "canal", tmp_path / "out2", pool=pool, coord=coord_b, stream_id="123",
+        is_live=lambda _: True, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+        capacity_fn=lambda _: {"cpus": 6, "score": 30},
+    )
+    assert res["status"] == "not_claimed"
+    assert popen.procs == []
+
+
+def test_max_lives_1_com_uma_live_propria_nao_reivindica_outra(tmp_path):
+    """PERF-02 AC 3: with max_lives=1 (from .perfil.json) and 1 owned live, a second live is not claimed."""
+    clock = Clock()
+    out_root = tmp_path / "out"
+    out_root.mkdir()
+    (out_root / ".perfil.json").write_text(
+        json.dumps({"razao": 0.4, "cpus": 3, "segundos_live": 300.0, "segundos_proc": 120.0, "medido_em": "x"}),
+        encoding="utf-8",
+    )
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-1", now=clock)
+    claimed_calls: list[str] = []
+    orig_claim = coord.claim_live
+
+    def spy_claim(live_id):
+        claimed_calls.append(live_id)
+        return orig_claim(live_id)
+
+    coord.claim_live = spy_claim
+    popen = FakePopen()
+
+    async def irc(channels, on_message, stop):
+        while clock() < T0 + 70:
+            await clock.sleep(1)
+        for i in range(12):
+            on_message("canal1", clock(), f"u{i % 6}", "KKKK")
+        while clock() < T0 + 85:
+            await clock.sleep(1)
+        for i in range(12):
+            on_message("canal2", clock(), f"u{i % 6}", "KKKK")
+        while clock() < T0 + 130:
+            await clock.sleep(1)
+        stop.set()
+
+    asyncio.run(monitor.run_monitor(
+        ["canal1", "canal2"], out_root, monitor.ChannelPolicy(),
+        queue_root=tmp_path / "q", irc=irc, popen=popen,
+        pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+        coord=coord, stream_ids={"canal1": "111", "canal2": "222"},
+        capacity_fn=lambda _: {"cpus": 3, "score": 15},
+    ))
+
+    assert claimed_calls == ["twitch:canal1:111"]
+    assert db.lives.find_one({"_id": "twitch:canal1:111"})["status"] == "live"
+    assert db.lives.find_one({"_id": "twitch:canal2:222"}) is None
+    assert [p.cmd[3] for p in popen.pipelines()] == ["twitch.tv/canal1"]
+
+
+def test_espera_proporcional_a_1_sobre_score_antes_do_claim(tmp_path):
+    """FILA-01 AC 9: wait before claim_live is 30s / capacity().score."""
+    waits: dict[int, float] = {}
+    sleep_args: dict[int, list[float]] = {}
+    for score in (3, 10):
+        clock = Clock()
+        recorded: list[float] = []
+
+        async def rec_sleep(seconds: float) -> None:
+            recorded.append(seconds)
+            await clock.sleep(seconds)
+
+        db = mongomock.MongoClient().db
+        coord = Coord(db, f"w-{score}", now=clock)
+        ensure_t: list[float] = []
+        claim_t: list[float] = []
+        orig_ensure = coord.ensure_live
+        orig_claim = coord.claim_live
+
+        def spy_ensure(live_id, **meta):
+            ensure_t.append(clock())
+            return orig_ensure(live_id, **meta)
+
+        def spy_claim(live_id):
+            claim_t.append(clock())
+            return orig_claim(live_id)
+
+        coord.ensure_live = spy_ensure
+        coord.claim_live = spy_claim
+
+        async def irc(channels, on_message, stop):
+            while clock() < T0 + 70:
+                await clock.sleep(1)
+            for i in range(12):
+                on_message("canal", clock(), f"u{i % 6}", "KKKK")
+            await stop.wait()
+
+        asyncio.run(run_until(
+            lambda: bool(claim_t),
+            channels=["canal"], out_root=tmp_path / f"out-{score}", policy=monitor.ChannelPolicy(),
+            queue_root=tmp_path / f"q-{score}", irc=irc, popen=FakePopen(),
+            pipeline=lambda *_: {"clips": []}, now=clock, sleep=rec_sleep,
+            coord=coord, stream_ids={"canal": f"s{score}"},
+            capacity_fn=lambda _: {"cpus": score, "score": score},
+        ))
+        waits[score] = claim_t[0] - ensure_t[0]
+        sleep_args[score] = recorded
+
+    assert 10.0 in sleep_args[3]
+    assert 3.0 in sleep_args[10]
+    assert waits[3] >= 10.0 and waits[10] >= 3.0
+    assert waits[3] > waits[10]
+
+    # Exact elapsed time in follow_live (no concurrent tick/worker loops advancing the fake clock)
+    exact_waits: dict[int, float] = {}
+    for score in (3, 6):
+        clock = Clock()
+        db = mongomock.MongoClient().db
+        coord = Coord(db, f"wf-{score}", now=clock)
+        times: list[float] = []
+        orig_ensure = coord.ensure_live
+
+        def spy_e(live_id, **meta):
+            times.append(clock())
+            return orig_ensure(live_id, **meta)
+
+        coord.ensure_live = spy_e
+        coord.claim_live = lambda lid: times.append(clock()) or False  # stop before starting ffmpeg
+
+        pool = monitor.RollingRecorderPool(tmp_path / f"buf-{score}", max_hot=0, max_on_demand=1, popen=FakePopen())
+        monitor.follow_live(
+            "canal", tmp_path / f"outf-{score}", pool=pool, coord=coord, stream_id=f"sf{score}",
+            is_live=lambda _: True, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+            capacity_fn=lambda _: {"cpus": score, "score": score},
+        )
+        exact_waits[score] = times[1] - times[0]
+
+    assert exact_waits[3] == pytest.approx(10.0)
+    assert exact_waits[6] == pytest.approx(5.0)
+    assert exact_waits[3] == pytest.approx(2.0 * exact_waits[6])
