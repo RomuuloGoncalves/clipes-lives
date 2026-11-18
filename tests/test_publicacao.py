@@ -900,4 +900,197 @@ def test_is_401_error_ignores_401_inside_clip_id_or_other_numbers(
     assert "clip-401-c01" in outcomes[0]["resultado"]["erro"]
 
 
+def test_run_pending_without_injected_publishers_refreshes_on_401_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Onda C: run_pending without injected publishers passes refresh=do_refresh to _default_publish.
+
+    Simulates HTTP 401 on first attempt and 200 after do_refresh() with real
+    publicar_youtube and publicar_tiktok modules, monkeypatched urlopen and oauth.refresh_*,
+    validating status == 'ok', rotated token storage, and zero token leaks.
+    """
+    import io
+    import urllib.error
+    import urllib.request
+    from email.message import Message
+
+    from clipes import oauth, publicar_tiktok, publicar_youtube
+
+    _make_clip_fixture(tmp_path, clip_id="live1_c01", owner="w-pc1")
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+
+    old_yt_token = "ya29.expired-yt-access-token-xyz"
+    new_yt_token = "ya29.fresh-yt-access-token-abc"
+    yt_refresh_token = "1//secret-google-refresh-token-123"
+
+    old_tt_token = "act.expired-tiktok-access-token-xyz"
+    new_tt_token = "act.fresh-tiktok-access-token-abc"
+    tt_refresh_token = "rft.secret-tiktok-refresh-token-123"
+
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(
+        tokens_path,
+        {
+            "youtube": {
+                "access_token": old_yt_token,
+                "refresh_token": yt_refresh_token,
+            },
+            "tiktok": {
+                "access_token": old_tt_token,
+                "refresh_token": tt_refresh_token,
+                "open_id": "op-user-1",
+            },
+        },
+    )
+
+    yt_refresh_calls = 0
+    tt_refresh_calls = 0
+
+    def fake_refresh_google(refresh_tok: str, tokens_path: Path | None = None) -> str:
+        nonlocal yt_refresh_calls
+        yt_refresh_calls += 1
+        assert refresh_tok == yt_refresh_token
+        return new_yt_token
+
+    def fake_refresh_tiktok(refresh_tok: str, tokens_path: Path | None = None) -> str:
+        nonlocal tt_refresh_calls
+        tt_refresh_calls += 1
+        assert refresh_tok == tt_refresh_token
+        return new_tt_token
+
+    monkeypatch.setattr(oauth, "refresh_google", fake_refresh_google)
+    monkeypatch.setattr(oauth, "refresh_tiktok", fake_refresh_tiktok)
+    monkeypatch.setattr("clipes.publicar_youtube.probe_duration", lambda _: 45.0)
+
+    class _FakeHttpResp:
+        def __init__(self, status: int, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None):
+            self.status = status
+            self._raw = json.dumps(body).encode("utf-8") if body is not None else b""
+            self.headers = Message()
+            for k, v in (headers or {}).items():
+                self.headers[k] = v
+
+        def read(self) -> bytes:
+            return self._raw
+
+        def getcode(self) -> int:
+            return self.status
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: Any):
+            return False
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float = 30) -> _FakeHttpResp:
+        auth_header = str(req.headers.get("Authorization") or req.headers.get("authorization") or "")
+        url = req.full_url
+
+        # YouTube requests
+        if "googleapis.com" in url:
+            if auth_header == f"Bearer {old_yt_token}":
+                msg = Message()
+                fp = io.BytesIO(b'{"error": {"code": 401, "message": "Invalid Credentials"}}')
+                raise urllib.error.HTTPError(url, 401, "HTTP 401 Unauthorized", msg, fp)
+            assert auth_header == f"Bearer {new_yt_token}"
+            if req.get_method() == "POST":
+                return _FakeHttpResp(200, headers={"Location": "https://upload.youtube.test/session-yt-401"})
+            raise AssertionError(f"Unexpected YouTube URL: {url}")
+        if url == "https://upload.youtube.test/session-yt-401":
+            assert req.get_method() == "PUT"
+            assert auth_header == f"Bearer {new_yt_token}"
+            return _FakeHttpResp(200, body={"id": "yt-vid-recovered"})
+
+        # TikTok requests
+        if "tiktokapis.com" in url:
+            if auth_header == f"Bearer {old_tt_token}":
+                msg = Message()
+                fp = io.BytesIO(b'{"error": {"code": 401, "message": "Invalid Token"}}')
+                raise urllib.error.HTTPError(url, 401, "HTTP 401 Unauthorized", msg, fp)
+            assert auth_header == f"Bearer {new_tt_token}"
+            if url.endswith("/creator_info/query/"):
+                return _FakeHttpResp(200, body={
+                    "data": {"privacy_level_options": ["SELF_ONLY"]},
+                    "error": {"code": "ok", "message": ""},
+                })
+            if url.endswith("/video/init/"):
+                return _FakeHttpResp(200, body={
+                    "data": {"publish_id": "tt-pub-recovered", "upload_url": "https://upload.tiktok.test/sess-tt-401"},
+                    "error": {"code": "ok", "message": ""},
+                })
+            if url.endswith("/status/fetch/"):
+                return _FakeHttpResp(200, body={
+                    "data": {"status": "PUBLISH_COMPLETE"},
+                    "error": {"code": "ok", "message": ""},
+                })
+            raise AssertionError(f"Unexpected TikTok URL: {url}")
+        if url == "https://upload.tiktok.test/sess-tt-401":
+            assert req.get_method() == "PUT"
+            return _FakeHttpResp(201)
+
+        raise AssertionError(f"Unhandled request URL: {url}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    yt_defaults = list(publicar_youtube.publish.__defaults__)
+    yt_defaults[0] = fake_urlopen
+    monkeypatch.setattr(publicar_youtube.publish, "__defaults__", tuple(yt_defaults))
+
+    tt_defaults = list(publicar_tiktok.publish.__defaults__)
+    tt_defaults[0] = fake_urlopen
+    monkeypatch.setattr(publicar_tiktok.publish, "__defaults__", tuple(tt_defaults))
+
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    req_res = request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    assert "publicacao enfileirada" in req_res
+
+    thread_msgs: list[tuple[str, str]] = []
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        discord_post=lambda tid, msg: thread_msgs.append((tid, msg)),
+    )
+
+    assert len(outcomes) == 2
+    by_plat = {o["plataforma"]: o for o in outcomes}
+
+    assert by_plat["youtube"]["status"] == "ok"
+    assert by_plat["youtube"]["resultado"]["video_id"] == "yt-vid-recovered"
+    assert "yt-vid-recovered" in by_plat["youtube"]["resultado"]["url"]
+
+    assert by_plat["tiktok"]["status"] == "ok"
+    assert by_plat["tiktok"]["resultado"]["publish_id"] == "tt-pub-recovered"
+    assert by_plat["tiktok"]["resultado"]["privacidade"] == "SELF_ONLY"
+
+    assert yt_refresh_calls == 1
+    assert tt_refresh_calls == 1
+
+    assert stat.S_IMODE(tokens_path.stat().st_mode) == 0o600
+
+    assert len(thread_msgs) == 2
+    for tid, msg in thread_msgs:
+        assert tid == "thr-100"
+        assert "ok" in msg
+
+    all_secrets = [
+        old_yt_token,
+        new_yt_token,
+        yt_refresh_token,
+        old_tt_token,
+        new_tt_token,
+        tt_refresh_token,
+    ]
+    serialized_outcomes = json.dumps(outcomes)
+    serialized_threads = json.dumps(thread_msgs)
+    store_file_data = (tmp_path / ".publicacoes.json").read_text(encoding="utf-8")
+
+    for secret in all_secrets:
+        assert secret not in serialized_outcomes
+        assert secret not in serialized_threads
+        assert secret not in store_file_data
+
+
 
