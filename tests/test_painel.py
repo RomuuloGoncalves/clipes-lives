@@ -10,7 +10,7 @@ from http.server import HTTPServer
 import mongomock
 import pytest
 
-from painel.api X as status_fn
+from painel.api import _nucleo, comando, status as status_fn
 
 NOW = datetime(2026, 1, 1, 12, 0, 0)
 
@@ -111,3 +111,10 @@ def test_status_200(db, env):
     assert b"exemplo.invalid" not in corpo
 
 
+def test_comando_405_401_202_409(db, env):
+    assert chamar(comando, db, "GET", basic("s3"))[0] == 405
+    assert chamar(comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 401
+    assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1"})[0] == 400
+    assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 202
+    assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 409
+    assert db.commands.count_documents({}) == 1
