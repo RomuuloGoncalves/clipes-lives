@@ -91,6 +91,27 @@ Variáveis de ambiente de renderização:
   - `CLIPES_BRAND_LOGO`: caminho do logo **dentro do contêiner** (padrão `/app/assets/logo.jpg`; para usar outro arquivo, coloque em `~/.config/clipes-lives/` e aponte para `/config/<arquivo>`). Se o arquivo não existir, a barra renderiza apenas o texto.
   - `CLIPES_BAR_STYLE`: `claro` (padrão; fundo branco, texto preto, handle cinza) ou `escuro` (fundo preto, texto branco, handle cinza-claro).
   - `CLIPES_BAR_H`: altura da barra em pixels (padrão `420`, aceito de `300` a `600`).
+- Layout dividido (`CLIPES_LAYOUT`): empilha barra opcional, recorte da webcam e recorte do jogo em `1080x1920`, com a legenda falada centralizada na emenda (`barra + cam`) e crédito no rodapé (`y=1860`). Quando nenhuma webcam de overlay é detectada (ou a fonte já é vertical), o render cai para o layout `full` sem erro.
+  - `CLIPES_LAYOUT`: `split-barra` (padrão quando vazio), `split-cheio`, `split-fina` ou `full` (mantém o layout tradicional sem detecção de webcam).
+  - Variantes e orçamento de altura (`barra + webcam + jogo = 1920`):
+    - `split-barra` (padrão): `340 + 520 + 1060` px. Barra branca com logo, nome, handle e título fixo; sem gancho sobre a webcam.
+    - `split-cheio`: `0 + 768 + 1152` px. Sem barra; logo e nome com contorno sobre a webcam, e gancho de `0` a `5,4 s` sobre a webcam escurecida.
+    - `split-fina`: `170 + 700 + 1050` px. Barra escura (`#14141C`) com logo, nome e handle, e gancho de `0` a `5,4 s` sobre a webcam escurecida.
+  - `CLIPES_SPLIT_BAR_H` e `CLIPES_SPLIT_CAM_H`: sobrescrevem as alturas de barra e webcam; o jogo fica com o restante (`1920 - barra - cam`). Se a webcam ficar `< 400` px ou o jogo `< 900` px, o render ignora o ajuste e volta às alturas padrão da variante.
+  - `CLIPES_FACECAM_TTL_H`: validade em horas do cache local da detecção em `OUT_DIR/.facecam/<chave>.json` (padrão `12`). O cache é revalidado por clipe e invalidado se a resolução da fonte mudar.
+  - Override manual em `~/.config/clipes-lives/facecam.json` (montado em `/config/facecam.json`): define `[x, y, w, h]` normalizados (`0` a `1`) por canal ou `"nenhuma"` para forçar `full`, sobrescrevendo a detecção local. Exemplo para o Alanzoka (`x=10..430`, `y=8..320` em `1920x1080`):
+    ```json
+    {
+      "alanzoka": [0.0052, 0.0074, 0.2188, 0.2889],
+      "canal_sem_cam": "nenhuma"
+    }
+    ```
+  - Smoke manual: rode um VOD com webcam nas três variantes e confira no `clips.json` se cada clipe registrou `layout: "split_webcam"`, `layout_fallback: false` e `facecam`:
+    ```sh
+    CLIPES_LAYOUT=split-barra ./clipar "<url do VOD com webcam>" --max-clips 1
+    CLIPES_LAYOUT=split-cheio ./clipar "<url do VOD com webcam>" --max-clips 1
+    CLIPES_LAYOUT=split-fina  ./clipar "<url do VOD com webcam>" --max-clips 1
+    ```
 
 Se um vídeo ou live contínua (ex.: só música) não gerar picos/clipes válidos, o pipeline encerra normalmente (código `0`), grava `clips.json` vazio com o motivo e imprime aviso claro.
 

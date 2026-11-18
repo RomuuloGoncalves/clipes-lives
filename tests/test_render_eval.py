@@ -303,6 +303,7 @@ def test_filter_chains_outro_and_blur_env(tmp_path: Path, monkeypatch):
     from types import SimpleNamespace
     from clipes import render as render_mod
 
+    monkeypatch.setenv("CLIPES_LAYOUT", "full")
     ass_path = tmp_path / "clip.ass"
 
     # Default (unset) -> black bars; CLIPES_BLUR_BG=1 -> split/boxblur/overlay + tpad before subtitles + no video fade
@@ -836,6 +837,7 @@ def test_master_mode_discord_flags_720_last_stage_rerender_and_livre(tmp_path: P
     from types import SimpleNamespace
     from clipes import render as render_mod
 
+    monkeypatch.setenv("CLIPES_LAYOUT", "full")
     monkeypatch.delenv("CLIPES_BLUR_BG", raising=False)
     monkeypatch.setenv("CLIPES_MASTER_MODE", "discord")
     monkeypatch.setenv("CLIPES_DISCORD_MAX_MB", "10")
@@ -945,6 +947,7 @@ def test_master_mode_discord_retry_falha_mantem_master_e_marca_cabe_discord_fals
     from types import SimpleNamespace
     from clipes import render as render_mod
 
+    monkeypatch.setenv("CLIPES_LAYOUT", "full")
     monkeypatch.delenv("CLIPES_BLUR_BG", raising=False)
     monkeypatch.setenv("CLIPES_MASTER_MODE", "discord")
     monkeypatch.setenv("CLIPES_DISCORD_MAX_MB", "10")

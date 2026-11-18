@@ -9,6 +9,7 @@ import subprocess
 import time
 import unicodedata
 from pathlib import Path
+from typing import Any
 
 from .ingest import js_runtime_args
 from .models import SnappedClip, Word
@@ -21,6 +22,8 @@ DEFAULT_BAR_H = 420
 MIN_BAR_H = 300
 MAX_BAR_H = 600
 DEFAULT_BRAND_LOGO = "/app/assets/logo.jpg"
+DEFAULT_LAYOUT = "split-barra"
+VALID_LAYOUTS = ("full", "split-cheio", "split-barra", "split-fina")
 
 _BAR_STYLES: dict[str, tuple[str, str, str]] = {
     "claro": ("#FFFFFF", "#000000", "#606060"),
@@ -28,6 +31,115 @@ _BAR_STYLES: dict[str, tuple[str, str, str]] = {
 }
 
 _WARNED_MISSING_LOGOS: set[str] = set()
+
+
+@dataclass(frozen=True)
+class _SplitStyle:
+    bar_bg: str
+    fg: str
+    handle_fg: str
+    text_outline: int
+    text_shadow: int
+    logo_size: int
+    logo_x: int
+    logo_y: int
+    text_x_with_logo: int
+    text_x_no_logo: int
+    name_y: int
+    handle_y: int
+    handle_only_y: int
+    name_fs: int
+    handle_fs: int
+    title_in_bar: bool
+    hook_on_cam: bool
+
+
+_SPLIT_STYLES: dict[str, _SplitStyle] = {
+    "split-cheio": _SplitStyle(
+        bar_bg="",
+        fg="#FFFFFF",
+        handle_fg="#E0E0E0",
+        text_outline=4,
+        text_shadow=1,
+        logo_size=140,
+        logo_x=40,
+        logo_y=30,
+        text_x_with_logo=205,
+        text_x_no_logo=40,
+        name_y=48,
+        handle_y=104,
+        handle_only_y=82,
+        name_fs=50,
+        handle_fs=36,
+        title_in_bar=False,
+        hook_on_cam=True,
+    ),
+    "split-barra": _SplitStyle(
+        bar_bg="#FFFFFF",
+        fg="#101010",
+        handle_fg="#707070",
+        text_outline=0,
+        text_shadow=0,
+        logo_size=150,
+        logo_x=50,
+        logo_y=30,
+        text_x_with_logo=235,
+        text_x_no_logo=50,
+        name_y=52,
+        handle_y=114,
+        handle_only_y=86,
+        name_fs=54,
+        handle_fs=38,
+        title_in_bar=True,
+        hook_on_cam=False,
+    ),
+    "split-fina": _SplitStyle(
+        bar_bg="#14141C",
+        fg="#FFFFFF",
+        handle_fg="#E0E0E0",
+        text_outline=0,
+        text_shadow=0,
+        logo_size=120,
+        logo_x=40,
+        logo_y=25,
+        text_x_with_logo=190,
+        text_x_no_logo=40,
+        name_y=36,
+        handle_y=94,
+        handle_only_y=67,
+        name_fs=50,
+        handle_fs=36,
+        title_in_bar=False,
+        hook_on_cam=True,
+    ),
+}
+
+
+def resolve_layout_mode() -> str:
+    """Resolve CLIPES_LAYOUT env var; empty defaults to split-barra."""
+    raw = os.environ.get("CLIPES_LAYOUT", "").strip().lower()
+    if not raw:
+        return DEFAULT_LAYOUT
+    if raw in VALID_LAYOUTS:
+        return raw
+    print(f"[layout] CLIPES_LAYOUT invalido ({raw!r}); usando {DEFAULT_LAYOUT}", flush=True)
+    return DEFAULT_LAYOUT
+
+
+def _resolve_split_variante(split: Any, variante: str | None = None) -> str:
+    bar_h = int(getattr(split, "bar_h", 0))
+    cand = (variante or getattr(split, "variante", "") or "").strip().lower()
+    if cand == "split-barra" and bar_h < MIN_BAR_H:
+        return "split-cheio"
+    if cand in _SPLIT_STYLES:
+        if bar_h <= 0 and cand != "split-cheio":
+            return "split-cheio"
+        return cand
+    if bar_h <= 0:
+        return "split-cheio"
+    if bar_h <= 220:
+        return "split-fina"
+    return "split-barra"
 
 
 @dataclass(frozen=True)
@@ -206,7 +318,7 @@ def _ass_time(seconds: float) -> str:
 
 
 def _ass_escape(text: str) -> str:
-    return text.replace("\\", "").replace("{", "(").replace("}", ")")
+    return " ".join(text.replace("\\", "").replace("{", "(").replace("}", ")").split())
 
 
 def is_hook_top_enabled() -> bool:
@@ -288,6 +400,8 @@ def build_ass(
     hook_top: str = "",
     title: str = "",
     bar: BarConfig | None = None,
+    split: Any | None = None,
+    variante: str | None = None,
 ) -> int:
     """Write word-highlighted ASS subtitles, channel credit, and end card. Returns dialogue count."""
     content_dur = max(0.0, clip_end - clip_start)
@@ -296,29 +410,93 @@ def build_ass(
         w for w in words
         if w.end > clip_start and w.start < clip_end and w.clean
     ]
-    wrapped_hook = (
-        wrap_top_hook(hook_top)
-        if (bar is None and hook_top and content_dur > 0 and is_hook_top_enabled())
-        else ""
+
+    split_style = (
+        _SPLIT_STYLES[_resolve_split_variante(split, variante)]
+        if split is not None
+        else None
     )
-    part_y = (bar.h + 70) if bar is not None else 490
-    credit_y = (bar.h + 20) if bar is not None else 600
-    card_y = (bar.h + (height - bar.h) // 2) if bar is not None else (height // 2)
+
+    if split is not None and split_style is not None:
+        wrapped_hook = (
+            wrap_top_hook(hook_top, max_chars=14, max_lines=3)
+            if (split_style.hook_on_cam and hook_top.strip() and content_dur > 0 and is_hook_top_enabled())
+            else ""
+        )
+        hook_dur = min(5.4, content_dur)
+        hook_y = split.bar_h + split.cam_h // 2
+        hook_fs = 64
+        hook_margin_l = 60
+        hook_margin_r = 60
+        hook_pop = r"\fscx75\fscy75\t(0,200,\fscx106\fscy106)\t(200,300,\fscx100\fscy100)"
+        part_y = split.emenda_y + 70
+        part_align = 7
+        part_pos = f"{{\\an7\\pos(120,{part_y})}}"
+        credit_fs = 34
+        credit_align = 5
+        credit_pos = f"\\an5\\pos({width // 2},1860)"
+        card_y = split.emenda_y + split.game_h // 2
+        cap_style_line = (
+            "Style: Cap,DejaVu Sans,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+            "-1,0,0,0,100,100,0,0,1,5,2,5,60,60,0,1\n"
+        )
+        cap_prefix = f"{{\\an5\\pos({width // 2},{split.emenda_y})}}"
+    else:
+        wrapped_hook = (
+            wrap_top_hook(hook_top)
+            if (bar is None and hook_top and content_dur > 0 and is_hook_top_enabled())
+            else ""
+        )
+        hook_dur = min(5.0, content_dur)
+        hook_y = 365
+        hook_fs = 64
+        hook_margin_l = SAFE_MARGIN_L
+        hook_margin_r = SAFE_MARGIN_R
+        hook_pop = r"\fscx75\fscy75\t(0,220,\fscx106\fscy106)\t(220,320,\fscx100\fscy100)"
+        part_y = (bar.h + 70) if bar is not None else 490
+        part_align = 8
+        part_pos = f"{{\\an8\\pos({width // 2},{part_y})}}"
+        credit_y = (bar.h + 20) if bar is not None else 600
+        credit_fs = 38
+        credit_align = 7
+        credit_pos = f"\\pos(120,{credit_y})"
+        card_y = (bar.h + (height - bar.h) // 2) if bar is not None else (height // 2)
+        cap_style_line = (
+            "Style: Cap,DejaVu Sans,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+            f"-1,0,0,0,100,100,0,0,1,5,2,2,{SAFE_MARGIN_L},{SAFE_MARGIN_R},{SAFE_MARGIN_V},1\n"
+        )
+        cap_prefix = ""
 
     part_style = (
         "Style: PartBadge,DejaVu Sans,52,&H0000FFFF,&H0000FFFF,&H00000000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,4,2,8,{SAFE_MARGIN_L},{SAFE_MARGIN_R},{part_y},1\n"
+        f"-1,0,0,0,100,100,0,0,1,4,2,{part_align},{SAFE_MARGIN_L},{SAFE_MARGIN_R},{part_y},1\n"
         if part_total > 1
         else ""
     )
     hook_style = (
-        "Style: TopHook,DejaVu Sans,64,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,6,3,5,{SAFE_MARGIN_L},{SAFE_MARGIN_R},0,1\n"
+        f"Style: TopHook,DejaVu Sans,{hook_fs},&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+        f"-1,0,0,0,100,100,0,0,1,6,3,5,{hook_margin_l},{hook_margin_r},0,1\n"
         if wrapped_hook
         else ""
     )
     bar_styles = ""
-    if bar is not None:
+    if split is not None and split_style is not None:
+        fg_ass = _ass_color(split_style.fg)
+        handle_ass = _ass_color(split_style.handle_fg)
+        if bar is not None:
+            ol, sh = split_style.text_outline, split_style.text_shadow
+            bar_styles += (
+                f"Style: BarName,DejaVu Sans,{split_style.name_fs},{fg_ass},{fg_ass},&H00000000&,&H80000000&,"
+                f"-1,0,0,0,100,100,0,0,1,{ol},{sh},7,60,60,0,1\n"
+                f"Style: BarHandle,DejaVu Sans,{split_style.handle_fs},{handle_ass},{handle_ass},&H00000000&,&H80000000&,"
+                f"0,0,0,0,100,100,0,0,1,{ol},{sh},7,60,60,0,1\n"
+            )
+        if split_style.title_in_bar and split.bar_h >= MIN_BAR_H:
+            bar_styles += (
+                f"Style: BarTitle,DejaVu Sans,58,{fg_ass},{fg_ass},&H00000000&,&H00000000&,"
+                "-1,0,0,0,100,100,0,0,1,0,0,5,60,60,0,1\n"
+            )
+    elif bar is not None:
         fg_ass = _ass_color(bar.fg)
         handle_ass = _ass_color(bar.handle_fg)
         bar_styles = (
@@ -341,10 +519,9 @@ def build_ass(
         "OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, "
         "ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, "
         "MarginL, MarginR, MarginV, Encoding\n"
-        "Style: Cap,DejaVu Sans,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,5,2,2,{SAFE_MARGIN_L},{SAFE_MARGIN_R},{SAFE_MARGIN_V},1\n"
-        "Style: Credit,DejaVu Sans,38,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,3,1,7,{SAFE_MARGIN_L},{SAFE_MARGIN_R},0,1\n"
+        f"{cap_style_line}"
+        f"Style: Credit,DejaVu Sans,{credit_fs},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
+        f"-1,0,0,0,100,100,0,0,1,3,1,{credit_align},{SAFE_MARGIN_L},{SAFE_MARGIN_R},0,1\n"
         f"{part_style}"
         f"{hook_style}"
         f"{bar_styles}"
@@ -354,47 +531,76 @@ def build_ass(
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     events: list[str] = []
-    if bar is not None and total_dur > 0:
+    if total_dur > 0:
         bar_end = _ass_time(total_dur)
-        text_x = 240 if bar.logo is not None else 60
-        safe_display = _ass_escape(bar.display.strip())
-        safe_handle = _ass_escape(bar.handle.strip())
-        if safe_display:
-            events.append(
-                f"Dialogue: 3,0:00:00.00,{bar_end},BarName,,0,0,0,,"
-                f"{{\\an7\\pos({text_x},56)}}{safe_display}"
+        if split is not None and split_style is not None:
+            if bar is not None:
+                text_x = split_style.text_x_with_logo if bar.logo is not None else split_style.text_x_no_logo
+                safe_display = _ass_escape(bar.display.strip())
+                safe_handle = _ass_escape(bar.handle.strip())
+                if safe_display:
+                    events.append(
+                        f"Dialogue: 3,0:00:00.00,{bar_end},BarName,,0,0,0,,"
+                        f"{{\\an7\\pos({text_x},{split_style.name_y})}}{safe_display}"
+                    )
+                if safe_handle:
+                    handle_y = split_style.handle_y if safe_display else split_style.handle_only_y
+                    events.append(
+                        f"Dialogue: 3,0:00:00.00,{bar_end},BarHandle,,0,0,0,,"
+                        f"{{\\an7\\pos({text_x},{handle_y})}}{safe_handle}"
+                    )
+            if split_style.title_in_bar and split.bar_h >= MIN_BAR_H:
+                bar_title_src = hook_top.strip() or title.strip()
+                wrapped_title = (
+                    wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
+                    if bar_title_src
+                    else ""
+                )
+                if wrapped_title:
+                    title_y = (195 + max(220, split.bar_h - 15)) // 2
+                    events.append(
+                        f"Dialogue: 3,0:00:00.00,{bar_end},BarTitle,,0,0,0,,"
+                        f"{{\\an5\\pos({width // 2},{title_y})}}{wrapped_title}"
+                    )
+        elif bar is not None:
+            text_x = 240 if bar.logo is not None else 60
+            safe_display = _ass_escape(bar.display.strip())
+            safe_handle = _ass_escape(bar.handle.strip())
+            if safe_display:
+                events.append(
+                    f"Dialogue: 3,0:00:00.00,{bar_end},BarName,,0,0,0,,"
+                    f"{{\\an7\\pos({text_x},56)}}{safe_display}"
+                )
+            if safe_handle:
+                handle_y = 122 if safe_display else 93
+                events.append(
+                    f"Dialogue: 3,0:00:00.00,{bar_end},BarHandle,,0,0,0,,"
+                    f"{{\\an7\\pos({text_x},{handle_y})}}{safe_handle}"
+                )
+            bar_title_src = hook_top.strip() or title.strip()
+            wrapped_title = (
+                wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
+                if bar_title_src
+                else ""
             )
-        if safe_handle:
-            handle_y = 122 if safe_display else 93
-            events.append(
-                f"Dialogue: 3,0:00:00.00,{bar_end},BarHandle,,0,0,0,,"
-                f"{{\\an7\\pos({text_x},{handle_y})}}{safe_handle}"
-            )
-        bar_title_src = hook_top.strip() or title.strip()
-        wrapped_title = (
-            wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
-            if bar_title_src
-            else ""
-        )
-        if wrapped_title:
-            title_y = (210 + (bar.h - 20)) // 2
-            events.append(
-                f"Dialogue: 3,0:00:00.00,{bar_end},BarTitle,,0,0,0,,"
-                f"{{\\an5\\pos({width // 2},{title_y})}}{wrapped_title}"
-            )
+            if wrapped_title:
+                title_y = (210 + (bar.h - 20)) // 2
+                events.append(
+                    f"Dialogue: 3,0:00:00.00,{bar_end},BarTitle,,0,0,0,,"
+                    f"{{\\an5\\pos({width // 2},{title_y})}}{wrapped_title}"
+                )
     if wrapped_hook:
-        hook_end = _ass_time(min(5.0, content_dur))
+        hook_end = _ass_time(hook_dur)
         events.append(
             f"Dialogue: 3,0:00:00.00,{hook_end},TopHook,,0,0,0,,"
-            f"{{\\an5\\pos({width // 2},365)\\fad(120,350)"
-            f"\\fscx75\\fscy75\\t(0,220,\\fscx106\\fscy106)\\t(220,320,\\fscx100\\fscy100)}}"
+            f"{{\\an5\\pos({width // 2},{hook_y})\\fad(120,350){hook_pop}}}"
             f"{wrapped_hook}"
         )
     if part_total > 1:
         badge_end = _ass_time(max(0.1, content_dur))
         events.append(
             f"Dialogue: 1,0:00:00.00,{badge_end},PartBadge,,0,0,0,,"
-            f"{{\\an8\\pos({width // 2},{part_y})}}Parte {part_index}/{part_total}"
+            f"{part_pos}Parte {part_index}/{part_total}"
         )
 
     safe_credit = _ass_escape(channel_credit.strip())
@@ -402,12 +608,12 @@ def build_ass(
         strong_end = min(4.0, content_dur)
         events.append(
             f"Dialogue: 1,0:00:00.00,{_ass_time(strong_end)},Credit,,0,0,0,,"
-            f"{{\\pos(120,{credit_y})\\fad(300,400)}}{safe_credit}"
+            f"{{{credit_pos}\\fad(300,400)}}{safe_credit}"
         )
         if content_dur > 4.0:
             events.append(
                 f"Dialogue: 1,{_ass_time(4.0)},{_ass_time(content_dur)},Credit,,0,0,0,,"
-                f"{{\\pos(120,{credit_y})\\alpha&H99&}}{safe_credit}"
+                f"{{{credit_pos}\\alpha&H99&}}{safe_credit}"
             )
 
     if outro_duration > 0:
@@ -456,7 +662,7 @@ def build_ass(
                 col = highlight if j == i else white
                 parts.append(f"{{\\c{col}}}{tok}")
             events.append(
-                f"Dialogue: 0,{_ass_time(s0)},{_ass_time(en)},Cap,,0,0,0,,{' '.join(parts)}"
+                f"Dialogue: 0,{_ass_time(s0)},{_ass_time(en)},Cap,,0,0,0,,{cap_prefix}{' '.join(parts)}"
             )
 
     ass_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
@@ -534,6 +740,44 @@ def is_blur_bg_enabled() -> bool:
     return val in ("1", "true", "yes", "on")
 
 
+def _circular_logo_filter(size: int = 150) -> str:
+    r = size // 2
+    return (
+        f"[1:v]crop='min(iw,ih)':'min(iw,ih)',scale={size}:{size},setsar=1,format=rgba,"
+        f"geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-{r},Y-{r}),{r}),255,0)'[logo]"
+    )
+
+
+def _build_split_video_parts(
+    split: Any,
+    bar: BarConfig | None,
+    variante: str,
+    has_hook: bool,
+) -> tuple[list[str], str]:
+    style = _SPLIT_STYLES[variante]
+    cam = split.cam
+    game = split.game
+    cam_darken = (
+        f",drawbox=x=0:y=0:w=1080:h={split.cam_h}:color=black@0.5:t=fill:enable='lt(t,5.4)'"
+        if (style.hook_on_cam and has_hook)
+        else ""
+    )
+    bar_bg = style.bar_bg or "black"
+    pad_bar = f",pad=1080:1920:0:{split.bar_h}:{bar_bg}" if split.bar_h > 0 else ""
+    vf_parts = [
+        "[0:v]split=2[c0][g0]",
+        f"[c0]crop={cam.w}:{cam.h}:{cam.x}:{cam.y},scale=1080:{split.cam_h},setsar=1{cam_darken}[cam]",
+        f"[g0]crop={game.w}:{game.h}:{game.x}:{game.y},scale=1080:{split.game_h},setsar=1[game]",
+        f"[cam][game]vstack=inputs=2{pad_bar}[v_base]",
+    ]
+    cur = "[v_base]"
+    if bar is not None and bar.logo is not None:
+        vf_parts.append(_circular_logo_filter(style.logo_size))
+        vf_parts.append(f"{cur}[logo]overlay={style.logo_x}:{style.logo_y}[v_logo]")
+        cur = "[v_logo]"
+    return vf_parts, cur
+
+
 def build_video_filter(
     ass_path: Path | None,
     n_subs: int,
@@ -542,12 +786,18 @@ def build_video_filter(
     crop: tuple[int, int, int, int] | None = None,
     bar: BarConfig | None = None,
     downscale_720: bool = False,
+    split: Any | None = None,
+    variante: str | None = None,
+    has_hook: bool = False,
 ) -> tuple[str, str]:
     """Build ffmpeg -filter_complex string and mapped video pad label."""
     if blur_bg is None:
         blur_bg = is_blur_bg_enabled()
 
-    if bar is None:
+    if split is not None:
+        resolved_var = _resolve_split_variante(split, variante)
+        vf_parts, cur = _build_split_video_parts(split, bar, resolved_var, has_hook)
+    elif bar is None:
         if crop is not None:
             cx, cy, cw, ch = crop
             vf_parts = [f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:1920,setsar=1[v_base]"]
@@ -590,10 +840,7 @@ def build_video_filter(
             ]
         cur = "[v_base]"
         if bar.logo is not None:
-            vf_parts.append(
-                "[1:v]crop='min(iw,ih)':'min(iw,ih)',scale=150:150,setsar=1,format=rgba,"
-                "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-75,Y-75),75),255,0)'[logo]"
-            )
+            vf_parts.append(_circular_logo_filter(150))
             vf_parts.append(f"{cur}[logo]overlay=60:40[v_logo]")
             cur = "[v_logo]"
 
@@ -666,6 +913,114 @@ def _build_render_cmd(
     ]
 
 
+def _normalize_rect_list(rect: Any) -> list[float] | None:
+    if rect is None:
+        return None
+    if isinstance(rect, (tuple, list)) and len(rect) == 4:
+        return [round(float(v), 4) for v in rect]
+    if all(hasattr(rect, attr) for attr in ("x", "y", "w", "h")):
+        return [round(float(getattr(rect, attr)), 4) for attr in ("x", "y", "w", "h")]
+    return None
+
+
+def _sanitize_layout_key(key: str) -> str:
+    cleaned = re.sub(r"[^\w.-]", "_", (key or "").strip())
+    cleaned = re.sub(r"\.{2,}", "_", cleaned).strip(".-")
+    if not cleaned or not cleaned.strip("_"):
+        return "default"
+    return cleaned
+
+
+def _resolve_layout_key(layout_key: str, channel_credit: str, out_dir: Path) -> str:
+    if layout_key.strip():
+        raw = layout_key.strip()
+    else:
+        cred = channel_credit.strip()
+        if cred:
+            raw = cred.removeprefix("twitch.tv/").lstrip("@").strip("/")
+        else:
+            raw = out_dir.name or "default"
+    return _sanitize_layout_key(raw)
+
+
+def _validate_split_layout(split: Any) -> None:
+    """Validate split Layout attributes and 1920px even-height budget."""
+    for attr in ("cam", "game", "bar_h", "cam_h", "game_h", "emenda_y"):
+        if not hasattr(split, attr):
+            raise AttributeError(f"split layout sem atributo {attr!r}")
+    cam = split.cam
+    game = split.game
+    if cam is None or game is None:
+        raise ValueError("split.cam ou split.game nulo")
+    for rect_name, rect in (("cam", cam), ("game", game)):
+        for attr in ("x", "y", "w", "h"):
+            if not hasattr(rect, attr):
+                raise AttributeError(f"split.{rect_name} sem atributo {attr!r}")
+        if int(rect.w) <= 0 or int(rect.h) <= 0:
+            raise ValueError(f"split.{rect_name} com dimensoes invalidas: {rect.w}x{rect.h}")
+    bar_h, cam_h, game_h, emenda_y = split.bar_h, split.cam_h, split.game_h, split.emenda_y
+    for name, val in (("bar_h", bar_h), ("cam_h", cam_h), ("game_h", game_h), ("emenda_y", emenda_y)):
+        if isinstance(val, bool) or not isinstance(val, int):
+            raise ValueError(f"split.{name} deve ser int, recebido {val!r}")
+    if bar_h < 0 or cam_h <= 0 or game_h <= 0:
+        raise ValueError(f"alturas invalidas: bar={bar_h} cam={cam_h} game={game_h}")
+    if bar_h % 2 != 0 or cam_h % 2 != 0 or game_h % 2 != 0:
+        raise ValueError(f"alturas devem ser pares: bar={bar_h} cam={cam_h} game={game_h}")
+    if bar_h + cam_h + game_h != 1920:
+        raise ValueError(f"soma das alturas != 1920: {bar_h}+{cam_h}+{game_h}={bar_h + cam_h + game_h}")
+    if emenda_y != bar_h + cam_h:
+        raise ValueError(f"emenda_y ({emenda_y}) != bar_h+cam_h ({bar_h + cam_h})")
+
+
+def _resolve_split_for_clip(
+    *,
+    layout_mode: str,
+    layout_key: str,
+    src_path: Path,
+    probe_start: float,
+    duration: float,
+    out_root: Path,
+) -> tuple[Any | None, str | None, dict[str, Any] | None, str | None]:
+    """Resolve split Layout via facecam.obter + layout.split_layout; returns (split, var, fc_info, tipo)."""
+    if layout_mode == "full":
+        return None, None, None, None
+    try:
+        from .reframe import _probe_video_size
+        size = _probe_video_size(src_path)
+    except Exception as exc:
+        print(f"[facecam] deteccao falhou: {exc}", flush=True)
+        return None, None, None, None
+    if size is None:
+        return None, None, None, None
+    src_w, src_h = size
+    if src_w <= 0 or src_h <= 0 or src_h > src_w:
+        return None, None, None, None
+    try:
+        from . import facecam as facecam_mod
+        from . import layout as layout_mod
+
+        fc = facecam_mod.obter(layout_key, src_path, probe_start, duration, out_root)
+        if fc is None:
+            return None, None, None, "nenhuma"
+        tipo = str(getattr(fc, "tipo", "nenhuma") or "nenhuma")
+        metodo = str(getattr(fc, "metodo", "") or "")
+        rect_raw = getattr(fc, "rect", None)
+        fc_info: dict[str, Any] | None = (
+            {"rect": _normalize_rect_list(rect_raw), "metodo": metodo}
+            if (metodo or rect_raw is not None)
+            else None
+        )
+        if tipo == "overlay" and rect_raw is not None:
+            split_obj = layout_mod.split_layout(src_w, src_h, rect_raw, layout_mode)
+            if split_obj is not None and getattr(split_obj, "cam", None) is not None:
+                return split_obj, layout_mode, fc_info, tipo
+            return None, None, fc_info, "nenhuma"
+        return None, None, fc_info, tipo
+    except Exception as exc:
+        print(f"[facecam] deteccao falhou: {exc}", flush=True)
+        return None, None, None, None
+
+
 def render_clip(
     clip: SnappedClip,
     idx: int,
@@ -676,25 +1031,13 @@ def render_clip(
     live_video_path: Path | None = None,
     channel_credit: str = "",
     reframe: bool = False,
+    layout_key: str = "",
 ) -> Path:
     """Download window (or slice live recording) and render 1080x1920 (or 720x1280) MP4 with ASS captions."""
     bar = bar_config()
     stem = clip_stem(idx, clip)
     out_file = out_dir / f"{stem}.mp4"
     ass_path = cache_dir / f"{stem}.ass"
-    n_subs = build_ass(
-        words,
-        clip.start,
-        clip.end,
-        ass_path,
-        channel_credit=channel_credit,
-        part_index=clip.part_index,
-        part_total=clip.part_total,
-        outro_duration=OUTRO_DURATION,
-        hook_top=clip.hook_top,
-        title=clip.title,
-        bar=bar,
-    )
 
     temp_seg: Path | None = None
     if live_video_path is not None:
@@ -707,83 +1050,150 @@ def render_clip(
         pre_args = ["-t", f"{clip.duration:.3f}"]
         probe_start = 0.0
 
-    crop: tuple[int, int, int, int] | None = None
-    if reframe:
-        from .reframe import detect_speaker_crop
-        if bar is not None:
-            crop = detect_speaker_crop(src_path, start=probe_start, duration=clip.duration, out_h=1920 - bar.h)
-        else:
-            crop = detect_speaker_crop(src_path, start=probe_start, duration=clip.duration)
-
-    blur_bg = is_blur_bg_enabled()
-    clip.layout = (  # type: ignore[attr-defined]
-        "reframed_face" if crop is not None else ("blurred_16x9" if blur_bg else "black_bars_16x9")
-    )
-    af_chain = build_audio_filter(clip.duration, outro_duration=OUTRO_DURATION)
-    total_dur = clip.duration + OUTRO_DURATION
-    logo_args = ["-i", str(bar.logo)] if (bar is not None and bar.logo is not None) else []
     tmp_out = out_dir / f".tmp_clip_{idx:02d}.mp4"
-
-    mode = _master_mode()
-    rate_kbps: int | None = None
-    accept_bytes: int | None = None
-    if mode == "livre":
-        clip.cabe_discord = False
-    else:
-        from .previa import _resolve_limit_mb, bitrate_alvo
-
-        limit_mb = _resolve_limit_mb(None)
-        accept_bytes = int(limit_mb * 1024 * 1024 * 0.98)
-        v_kbps = bitrate_alvo(total_dur, limit_mb, teto=6000, audio_kbps=160)
-        if v_kbps < 400:
-            clip.cabe_discord = False
-        else:
-            rate_kbps = v_kbps
-            clip.cabe_discord = True
-
     tmp_retry = out_dir / f".tmp_clip_{idx:02d}.retry.mp4"
 
-    def _run_encode(maxrate: int | None, target: Path = tmp_out) -> None:
-        downscale = maxrate is not None and maxrate < 1500
-        filter_complex, v_map = build_video_filter(
-            ass_path=ass_path,
-            n_subs=n_subs,
-            outro_duration=OUTRO_DURATION,
-            blur_bg=blur_bg,
-            crop=crop,
-            bar=bar,
-            downscale_720=downscale,
-        )
-        cmd = _build_render_cmd(
-            pre_args=pre_args,
-            src_path=src_path,
-            logo_args=logo_args,
-            filter_complex=filter_complex,
-            v_map=v_map,
-            af_chain=af_chain,
-            total_dur=total_dur,
-            tmp_out=target,
-            maxrate_kbps=maxrate,
-        )
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
-        if res.returncode != 0:
-            raise RuntimeError(f"ffmpeg render failed: {(res.stderr or res.stdout)[-500:]}")
-
     try:
-        _run_encode(rate_kbps, tmp_out)
-        if rate_kbps is not None and accept_bytes is not None and tmp_out.is_file():
-            if tmp_out.stat().st_size > accept_bytes:
-                retry_kbps = max(1, round(rate_kbps * 0.85))
-                try:
-                    _run_encode(retry_kbps, tmp_retry)
-                except Exception as exc:
-                    print(f"[render] re-encode falhou; mantendo master: {exc}", flush=True)
-                    clip.cabe_discord = False
-                else:
-                    if tmp_retry.is_file():
-                        if tmp_retry.stat().st_size > accept_bytes:
-                            clip.cabe_discord = False
-                        tmp_retry.replace(tmp_out)
+        layout_mode = resolve_layout_mode()
+        resolved_key = _resolve_layout_key(layout_key, channel_credit, out_dir)
+        out_root = out_dir.parent if out_dir.parent != out_dir else out_dir
+        split_obj, split_variante, fc_info, fc_tipo = _resolve_split_for_clip(
+            layout_mode=layout_mode,
+            layout_key=resolved_key,
+            src_path=src_path,
+            probe_start=probe_start,
+            duration=clip.duration,
+            out_root=out_root,
+        )
+
+        clip.facecam = fc_info  # type: ignore[attr-defined]
+        clip.layout_fallback = False  # type: ignore[attr-defined]
+
+        crop: tuple[int, int, int, int] | None = None
+        if split_obj is None and reframe and fc_tipo != "nenhuma":
+            from .reframe import detect_speaker_crop
+            if bar is not None:
+                crop = detect_speaker_crop(src_path, start=probe_start, duration=clip.duration, out_h=1920 - bar.h)
+            else:
+                crop = detect_speaker_crop(src_path, start=probe_start, duration=clip.duration)
+
+        blur_bg = is_blur_bg_enabled()
+        full_layout_name = "reframed_face" if crop is not None else ("blurred_16x9" if blur_bg else "black_bars_16x9")
+        clip.layout = "split_webcam" if split_obj is not None else full_layout_name  # type: ignore[attr-defined]
+
+        has_hook = bool(clip.hook_top.strip() and clip.duration > 0 and is_hook_top_enabled())
+        af_chain = build_audio_filter(clip.duration, outro_duration=OUTRO_DURATION)
+        total_dur = clip.duration + OUTRO_DURATION
+        logo_args = ["-i", str(bar.logo)] if (bar is not None and bar.logo is not None) else []
+
+        mode = _master_mode()
+        rate_kbps: int | None = None
+        accept_bytes: int | None = None
+        if mode == "livre":
+            clip.cabe_discord = False
+        else:
+            from .previa import _resolve_limit_mb, bitrate_alvo
+
+            limit_mb = _resolve_limit_mb(None)
+            accept_bytes = int(limit_mb * 1024 * 1024 * 0.98)
+            v_kbps = bitrate_alvo(total_dur, limit_mb, teto=6000, audio_kbps=160)
+            if v_kbps < 400:
+                clip.cabe_discord = False
+            else:
+                rate_kbps = v_kbps
+                clip.cabe_discord = True
+
+        def _build_ass_for(active_split: Any | None, active_var: str | None) -> int:
+            return build_ass(
+                words,
+                clip.start,
+                clip.end,
+                ass_path,
+                channel_credit=channel_credit,
+                part_index=clip.part_index,
+                part_total=clip.part_total,
+                outro_duration=OUTRO_DURATION,
+                hook_top=clip.hook_top,
+                title=clip.title,
+                bar=bar,
+                split=active_split,
+                variante=active_var,
+            )
+
+        def _run_encode(
+            maxrate: int | None,
+            target: Path,
+            active_split: Any | None,
+            active_var: str | None,
+            active_hook: bool,
+            n_subs: int,
+        ) -> None:
+            downscale = maxrate is not None and maxrate < 1500
+            filter_complex, v_map = build_video_filter(
+                ass_path=ass_path,
+                n_subs=n_subs,
+                outro_duration=OUTRO_DURATION,
+                blur_bg=blur_bg,
+                crop=crop,
+                bar=bar,
+                downscale_720=downscale,
+                split=active_split,
+                variante=active_var,
+                has_hook=active_hook,
+            )
+            cmd = _build_render_cmd(
+                pre_args=pre_args,
+                src_path=src_path,
+                logo_args=logo_args,
+                filter_complex=filter_complex,
+                v_map=v_map,
+                af_chain=af_chain,
+                total_dur=total_dur,
+                tmp_out=target,
+                maxrate_kbps=maxrate,
+            )
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+            if res.returncode != 0:
+                raise RuntimeError(f"ffmpeg render failed: {(res.stderr or res.stdout)[-500:]}")
+
+        def _encode_with_master_retry(
+            active_split: Any | None,
+            active_var: str | None,
+            active_hook: bool,
+            n_subs: int,
+        ) -> None:
+            _run_encode(rate_kbps, tmp_out, active_split, active_var, active_hook, n_subs)
+            if rate_kbps is not None and accept_bytes is not None and tmp_out.is_file():
+                if tmp_out.stat().st_size > accept_bytes:
+                    retry_kbps = max(1, round(rate_kbps * 0.85))
+                    try:
+                        _run_encode(retry_kbps, tmp_retry, active_split, active_var, active_hook, n_subs)
+                    except Exception as exc:
+                        print(f"[render] re-encode falhou; mantendo master: {exc}", flush=True)
+                        clip.cabe_discord = False
+                    else:
+                        if tmp_retry.is_file():
+                            if tmp_retry.stat().st_size > accept_bytes:
+                                clip.cabe_discord = False
+                            tmp_retry.replace(tmp_out)
+
+        if split_obj is not None:
+            try:
+                _validate_split_layout(split_obj)
+                n_subs = _build_ass_for(split_obj, split_variante)
+                _encode_with_master_retry(split_obj, split_variante, has_hook, n_subs)
+            except Exception as exc:
+                print(f"[layout] ffmpeg split falhou; caindo para full: {exc}", flush=True)
+                clip.layout_fallback = True  # type: ignore[attr-defined]
+                tmp_out.unlink(missing_ok=True)
+                tmp_retry.unlink(missing_ok=True)
+                clip.layout = full_layout_name  # type: ignore[attr-defined]
+                n_subs = _build_ass_for(None, None)
+                _encode_with_master_retry(None, None, False, n_subs)
+        else:
+            n_subs = _build_ass_for(None, None)
+            _encode_with_master_retry(None, None, False, n_subs)
+
         tmp_out.replace(out_file)
     finally:
         tmp_out.unlink(missing_ok=True)

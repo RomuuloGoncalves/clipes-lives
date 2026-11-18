@@ -294,6 +294,7 @@ def test_build_video_filter_and_render_clip_with_bar(tmp_path: Path, monkeypatch
 
     # render_clip integration: passes -i logo and out_h=1500 to detect_speaker_crop
     _clear_bar_env(monkeypatch)
+    monkeypatch.setenv("CLIPES_LAYOUT", "full")
     monkeypatch.setenv("CLIPES_BRAND_NAME", "@cortes_lr1")
     monkeypatch.setenv("CLIPES_BRAND_DISPLAY", "CortesLR")
     monkeypatch.setenv("CLIPES_BRAND_LOGO", str(logo))

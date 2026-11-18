@@ -55,34 +55,61 @@ def _sample_frames_bgr(src_path: Path, start: float, duration: float) -> list[np
     return [buf[i * frame_bytes : (i + 1) * frame_bytes].reshape((SAMPLE_H, SAMPLE_W, 3)) for i in range(n_frames)]
 
 
-def _detect_best_face(
+def _nms_boxes(
+    boxes: list[tuple[float, float, float, float, float]],
+    iou_threshold: float = 0.45,
+) -> list[tuple[float, float, float, float, float]]:
+    """Non-maximum suppression over (cx, cy, w, h, score) sorted descending by score."""
+    if not boxes:
+        return []
+    ordered = sorted(boxes, key=lambda b: b[4], reverse=True)
+    kept: list[tuple[float, float, float, float, float]] = []
+    for box in ordered:
+        cx, cy, w, h, _ = box
+        x1, y1, x2, y2 = cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0
+        area = max(0.0, w) * max(0.0, h)
+        suppress = False
+        for kcx, kcy, kw, kh, _ in kept:
+            kx1, ky1, kx2, ky2 = kcx - kw / 2.0, kcy - kh / 2.0, kcx + kw / 2.0, kcy + kh / 2.0
+            iw = max(0.0, min(x2, kx2) - max(x1, kx1))
+            ih = max(0.0, min(y2, ky2) - max(y1, ky1))
+            inter = iw * ih
+            if inter > 0.0:
+                union = area + max(0.0, kw) * max(0.0, kh) - inter
+                if union > 0.0 and inter / union > iou_threshold:
+                    suppress = True
+                    break
+        if not suppress:
+            kept.append(box)
+    return kept
+
+
+def _detect_faces(
     session,
     input_name: str,
     frame_bgr: np.ndarray,
     score_threshold: float = SCORE_THRESHOLD,
-) -> tuple[float, float, float, float] | None:
-    """Run YuNet ONNX on a 640x360 BGR frame and return best (cx, cy, w, h) or None."""
+    iou_threshold: float = 0.45,
+) -> list[tuple[float, float, float, float, float]]:
+    """Run YuNet ONNX on a 640x360 BGR frame and return deduplicated (cx, cy, w, h, score) list."""
     padded = np.zeros((NET_SIZE, NET_SIZE, 3), dtype=np.float32)
     h, w = frame_bgr.shape[:2]
     padded[: min(h, NET_SIZE), : min(w, NET_SIZE)] = frame_bgr[: min(h, NET_SIZE), : min(w, NET_SIZE)]
     inp = np.transpose(padded, (2, 0, 1))[None, ...]
     outs = session.run(None, {input_name: inp})
 
-    best_score = score_threshold
-    best_box: tuple[float, float, float, float] | None = None
+    raw: list[tuple[float, float, float, float, float]] = []
     for idx, stride in enumerate((8, 16, 32)):
         cls_v = outs[idx][0, :, 0]
         obj_v = outs[idx + 3][0, :, 0]
         bbox_v = outs[idx + 6][0]
         scores = np.sqrt(np.clip(cls_v, 0.0, 1.0) * np.clip(obj_v, 0.0, 1.0))
-        valid = np.where(scores >= best_score)[0]
+        valid = np.where(scores >= score_threshold)[0]
         if valid.size == 0:
             continue
         cols = NET_SIZE // stride
         for k in valid:
             sc = float(scores[k])
-            if sc < best_score:
-                continue
             r, c = divmod(int(k), cols)
             dx, dy, dw, dh = bbox_v[k]
             cx = float((c + dx) * stride)
@@ -91,9 +118,24 @@ def _detect_best_face(
                 continue
             bw = float(np.exp(dw) * stride)
             bh = float(np.exp(dh) * stride)
-            best_score = sc
-            best_box = (cx, cy, bw, bh)
-    return best_box
+            if bw <= 0.0 or bh <= 0.0:
+                continue
+            raw.append((cx, cy, bw, bh, sc))
+    return _nms_boxes(raw, iou_threshold=iou_threshold)
+
+
+def _detect_best_face(
+    session,
+    input_name: str,
+    frame_bgr: np.ndarray,
+    score_threshold: float = SCORE_THRESHOLD,
+) -> tuple[float, float, float, float] | None:
+    """Run YuNet ONNX on a 640x360 BGR frame and return best (cx, cy, w, h) or None."""
+    faces = _detect_faces(session, input_name, frame_bgr, score_threshold=score_threshold)
+    if not faces:
+        return None
+    cx, cy, bw, bh, _ = faces[0]
+    return (cx, cy, bw, bh)
 
 
 def compute_vertical_crop(

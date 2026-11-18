@@ -7,6 +7,7 @@ import inspect
 import json
 import math
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -171,6 +172,18 @@ def _write_clips_manifest(out_dir: Path, manifest: dict[str, Any]) -> None:
 def _timing_total(timings: dict[str, float]) -> float:
     skip = {"topics_s", "asr_pass1_s", "asr_pass2_s", "total_s"}
     return round(sum(v for k, v in timings.items() if k not in skip), 2)
+
+
+def _resolve_layout_key(channel: str, video_id: str) -> str:
+    """Derive a filesystem-safe facecam cache/override key from channel or video_id."""
+    raw = (channel or "").strip()
+    for prefix in ("https://", "http://", "www.twitch.tv/", "twitch.tv/"):
+        if raw.lower().startswith(prefix):
+            raw = raw[len(prefix):]
+    raw = raw.lstrip("@").strip("/ ")
+    if re.search(r"[A-Za-z0-9-]", raw):
+        return sanitize_id(raw)
+    return sanitize_id(video_id)
 
 
 def _topics_from_pass1(segments: list[Word]) -> list[TopicSegment]:
@@ -412,6 +425,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
     default_layout = "blurred_16x9" if is_blur_bg_enabled() else "black_bars_16x9"
     safe_video_id = sanitize_id(ing.video_id)
     effective_channel = channel_credit or getattr(ing, "channel", "") or ing.title
+    layout_key = _resolve_layout_key(
+        channel_credit or str(getattr(ing, "channel", "") or "").strip(),
+        ing.video_id,
+    )
     group_totals: dict[str, float] = {}
     for c in clips:
         if c.group_id:
@@ -458,6 +475,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
         if args.skip_render:
             clip.output_file = f"{clip_stem(idx, clip)}.mp4"
             clip_layout = default_layout
+            clip_layout_fallback = False
+            clip_facecam = None
         else:
             print(
                 f"[render] Clip {idx}/{len(clips)}: {clip.start:.1f}s-{clip.end:.1f}s "
@@ -471,6 +490,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 render_kwargs["channel_credit"] = channel_credit
             if has_varkw or "reframe" in sig_params:
                 render_kwargs["reframe"] = reframe
+            if has_varkw or "layout_key" in sig_params:
+                render_kwargs["layout_key"] = layout_key
             out_path = render_clip(
                 clip=clip,
                 idx=idx,
@@ -483,6 +504,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             )
             clip.output_file = out_path.name
             clip_layout = str(getattr(clip, "layout", default_layout))
+            clip_layout_fallback = bool(getattr(clip, "layout_fallback", False))
+            clip_facecam = getattr(clip, "facecam", None)
 
         if clip.caption:
             txt_path = ing.out_dir / Path(clip.output_file).with_suffix(".txt")
@@ -513,6 +536,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "rendered_duration": round(clip.duration + OUTRO_DURATION, 3),
             "channel_credit": channel_credit,
             "layout": clip_layout,
+            "layout_fallback": clip_layout_fallback,
+            "facecam": clip_facecam,
             "peak": clip.peak,
             "peak_ratio": round(clip.peak_ratio, 3),
             "edge_mode": clip.edge_mode,
