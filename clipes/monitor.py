@@ -12,6 +12,7 @@ import re
 import shutil
 import ssl
 import subprocess
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -743,11 +744,105 @@ def run_local_pipeline(job_dir: Path, out_root: Path) -> dict[str, Any]:
     return {**json.loads((out_dir / "clips.json").read_text(encoding="utf-8")), "output_dir": str(out_dir)}
 
 
+MONGO_RECONNECT_S = 60.0
+_MONGO_ERR_NAMES = frozenset({
+    "ServerSelectionTimeoutError", "PyMongoError", "ConnectionFailure",
+    "NetworkTimeout", "AutoReconnect", "ExecutionTimeout",
+})
+
+
+def _mask_uri(uri: str) -> str:
+    if "clipes.coord" in sys.modules:
+        return sys.modules["clipes.coord"].mask_uri(uri)
+    return uri.split("://", 1)[0] + "://***@***" if "://" in uri else "***"
+
+
+def _sanitize_error(exc: BaseException, uri: str | None = None) -> str:
+    msg = f"{type(exc).__name__}: {exc}"
+    if uri:
+        msg = msg.replace(uri, _mask_uri(uri))
+        parsed = urllib.parse.urlsplit(uri)
+        for secret in (parsed.password, parsed.username, parsed.hostname, parsed.netloc):
+            if secret and len(secret) >= 3:
+                msg = msg.replace(secret, "***")
+    return re.sub(r"mongodb(?:\+srv)?://[^\s,;'\"]+", lambda m: _mask_uri(m.group(0)), msg)
+
+
+def _is_mongo_error(exc: BaseException) -> bool:
+    pymongo_errors = sys.modules.get("pymongo.errors")
+    if pymongo_errors is not None and isinstance(exc, pymongo_errors.PyMongoError):
+        return True
+    return type(exc).__name__ in _MONGO_ERR_NAMES
+
+
+def _rel_output_dir(output_dir: str | Path | None, out_root: Path) -> str | None:
+    if output_dir is None:
+        return None
+    try:
+        return str(Path(output_dir).resolve().relative_to(out_root.resolve()))
+    except ValueError:
+        return str(output_dir)
+
+
+class _CoordSession:
+    """Optional MongoDB coordination wrapper with lazy import and 60s fallback retry."""
+
+    def __init__(self, out_root: Path, *, coord: Any | None = None, now: Callable[[], float] = time.time):
+        self.out_root = out_root
+        self.uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
+        self.coord = coord
+        self.now = now
+        self.configured = coord is not None or self.uri is not None
+        self.online = False
+        self.next_retry = 0.0
+
+    @property
+    def active(self) -> Any | None:
+        return self.coord if self.online else None
+
+    def connect(self) -> bool:
+        if not self.configured:
+            return False
+        try:
+            if self.coord is None:
+                import pymongo
+                from .capacidade import worker_id as get_worker_id
+                from .coord import Coord
+
+                client = pymongo.MongoClient(self.uri, maxPoolSize=5, serverSelectionTimeoutMS=5000)
+                db = client.get_default_database(default="clipes_lives")
+                lease_s = float(os.environ.get("CLIPES_LEASE_S", "90"))
+                self.coord = Coord(db, get_worker_id(self.out_root), now=self.now, lease_s=lease_s)
+            self.coord.ensure_indexes()
+        except Exception as exc:
+            if _is_mongo_error(exc) or isinstance(exc, OSError):
+                self.mark_offline(exc)
+                return False
+            raise
+        self.online = True
+        self.next_retry = 0.0
+        return True
+
+    def mark_offline(self, exc: BaseException) -> None:
+        self.online = False
+        self.next_retry = self.now() + MONGO_RECONNECT_S
+        print(f"[fila] Mongo indisponivel ({_sanitize_error(exc, self.uri)}); seguindo local", flush=True)
+
+    def maybe_reconnect(self) -> bool:
+        if self.configured and not self.online and self.now() >= self.next_retry:
+            return self.connect()
+        return self.online
+
+
 def run_worker_step(
     queue: DiskQueue,
     out_root: Path,
     policy: ChannelPolicy,
     pipeline: Callable[[Path, Path], dict[str, Any]] = run_local_pipeline,
+    *,
+    coord: Any | None = None,
+    on_mongo_error: Callable[[BaseException], None] | None = None,
+    lost_lives: set[str] | None = None,
 ) -> bool:
     """Process one pending job end to end (never publishes). False when the queue is empty."""
     job_dir = queue.claim_next()
@@ -755,9 +850,41 @@ def run_worker_step(
         return False
     job = _read_job(job_dir)
     channel = job["channel"]
+    mongo_job_id = job.get("mongo_job_id") or job["job_id"]
+    live_id = job.get("live_id")
+    use_coord = coord if (coord is not None and job.get("coord_synced") is not False) else None
+
+    def report_mongo_error(exc: BaseException) -> None:
+        if on_mongo_error is not None:
+            on_mongo_error(exc)
+        else:
+            uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
+            print(f"[fila] erro Mongo ({_sanitize_error(exc, uri)}); seguindo local", flush=True)
+
     if not policy.permits(channel):
+        if use_coord is not None:
+            try:
+                if use_coord.start_job(mongo_job_id):
+                    use_coord.finish_job(mongo_job_id, "rejected", {"reject_reason": "blocked_by_policy"})
+            except Exception as exc:
+                if not _is_mongo_error(exc):
+                    raise
+                report_mongo_error(exc)
         queue.complete(job_dir, "rejected", {"reject_reason": "blocked_by_policy"})
         return True
+
+    if use_coord is not None:
+        try:
+            started_ok = use_coord.start_job(mongo_job_id)
+        except Exception as exc:
+            if not _is_mongo_error(exc):
+                raise
+            report_mongo_error(exc)
+            use_coord = None
+        else:
+            if not started_ok:
+                queue.complete(job_dir, "rejected", {"reject_reason": "coord_denied"})
+                return True
 
     started = time.perf_counter()
     try:
@@ -768,16 +895,33 @@ def run_worker_step(
             "error": f"{type(exc).__name__}: {exc}"[-500:],
             "worker_s": round(time.perf_counter() - started, 2),
         })
+        if use_coord is not None and not (lost_lives and live_id in lost_lives):
+            try:
+                use_coord.finish_job(mongo_job_id, "rejected", {"reject_reason": "pipeline_error"})
+            except Exception as mexc:
+                if not _is_mongo_error(mexc):
+                    raise
+                report_mongo_error(mexc)
         return True
 
     clips = result.get("clips") or []
-    queue.complete(job_dir, "done" if clips else "rejected", {
+    final_status = "done" if clips else "rejected"
+    score = max((float(c["score"]) for c in clips), default=0.0)
+    queue.complete(job_dir, final_status, {
         "ready_at": job["created_at"] + policy.delay_h.get(channel, 0.0) * 3600,
-        "score": max((float(c["score"]) for c in clips), default=0.0),
+        "score": score,
         "clips": len(clips),
         "output_dir": result.get("output_dir"),
         "timings": {**result.get("timings", {}), "worker_s": round(time.perf_counter() - started, 2)},
     })
+    if use_coord is not None and not (lost_lives and live_id in lost_lives):
+        mongo_res = {"clips": len(clips), "score": score, "output_dir": _rel_output_dir(result.get("output_dir"), out_root)}
+        try:
+            use_coord.finish_job(mongo_job_id, final_status, mongo_res)
+        except Exception as mexc:
+            if not _is_mongo_error(mexc):
+                raise
+            report_mongo_error(mexc)
     return True
 
 
@@ -966,6 +1110,7 @@ async def run_monitor(
     now=time.time,
     sleep=asyncio.sleep,
     stop: asyncio.Event | None = None,
+    coord: Any | None = None,
 ) -> None:
     """IRC -> ChannelSpikeDetector -> rolling recorder -> capture_job -> DiskQueue, plus 1 sequential worker.
 
@@ -993,7 +1138,7 @@ async def run_monitor(
         if detector is not None:
             detector.record_message(t, author, text)
 
-    queue = pool = lock = None
+    queue = pool = lock = coord_session = None
     if not dry_run:
         queue_root = queue_root or out_root / "queue"
         queue = DiskQueue(queue_root)
@@ -1003,6 +1148,9 @@ async def run_monitor(
         staging.mkdir(exist_ok=True)
         shutil.rmtree(queue_root / ".buffer", ignore_errors=True)  # segments of a previous run are stale
         pool = RollingRecorderPool(queue_root / ".buffer", max_hot=max(0, min(max_recorders, 3)), popen=popen)
+        coord_session = _CoordSession(out_root, coord=coord, now=now)
+        if coord_session.configured:
+            coord_session.connect()
 
     async def capture_and_enqueue(event: SpikeEvent) -> None:
         try:
@@ -1010,6 +1158,34 @@ async def run_monitor(
             if job_dir is None:
                 print(f"[monitor] no free recorder for {event.channel}; spike dropped", flush=True)
             else:
+                if coord_session is not None and coord_session.configured:
+                    job = _read_job(job_dir)
+                    active_coord = coord_session.active
+                    if active_coord is not None and job.get("status") != "rejected":
+                        channel = job["channel"]
+                        live_id = job.get("live_id") or f"twitch:{channel}"
+                        w_end = int(job.get("window_end") or job.get("created_at") or now())
+                        w_start = int(job.get("window_start") or (w_end - PRE_ROLL_S))
+                        mongo_job_id = job.get("mongo_job_id") or f"{live_id}:{w_end}"
+                        try:
+                            await asyncio.to_thread(
+                                active_coord.add_job,
+                                mongo_job_id,
+                                live_id,
+                                (w_start, w_end),
+                                float(job.get("z_score") or 0.0),
+                            )
+                        except Exception as exc:
+                            if not _is_mongo_error(exc):
+                                raise
+                            coord_session.mark_offline(exc)
+                            job["coord_synced"] = False
+                        else:
+                            job.update(live_id=live_id, mongo_job_id=mongo_job_id, coord_synced=True)
+                        _write_job(job_dir, job)
+                    elif job.get("status") != "rejected":
+                        job["coord_synced"] = False
+                        _write_job(job_dir, job)
                 print(f"[monitor] queued {queue.enqueue(job_dir)}", flush=True)
         except Exception as exc:  # one failed capture must not stop the monitor
             print(f"[monitor] capture failed for {event.channel}: {type(exc).__name__}: {exc}", flush=True)
@@ -1020,6 +1196,8 @@ async def run_monitor(
         last_rank = float("-inf")
         while not stop.is_set():
             t = now()
+            if coord_session is not None and coord_session.configured and not coord_session.online and t >= coord_session.next_retry:
+                await asyncio.to_thread(coord_session.maybe_reconnect)
             for detector in detectors.values():
                 event = detector.check_spike(t)
                 if event is None:
@@ -1043,7 +1221,12 @@ async def run_monitor(
 
     async def worker_loop() -> None:
         while not stop.is_set():
-            if not await asyncio.to_thread(run_worker_step, queue, out_root, policy, pipeline):
+            active_coord = coord_session.active if coord_session is not None else None
+            on_err = coord_session.mark_offline if coord_session is not None else None
+            if not await asyncio.to_thread(
+                run_worker_step, queue, out_root, policy, pipeline,
+                coord=active_coord, on_mongo_error=on_err,
+            ):
                 await sleep(WORKER_IDLE_S)
 
     irc_call = irc(channels, on_message, stop=stop, on_join=on_join) if real_irc else irc(channels, on_message, stop=stop)
