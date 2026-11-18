@@ -382,7 +382,7 @@ def test_falha_em_um_clipe_registra_discord_error_sem_token_e_continua_proximos(
 
 
 def test_sem_discord_bot_token_pula_previa_e_run_pending(tmp_path, monkeypatch):
-    """DISC-01 AC 7: without DISCORD_BOT_TOKEN, skips preview and skips run_pending without error."""
+    """Sem DISCORD_BOT_TOKEN, pula previa mas executa run_pending no heartbeat sem erro."""
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL_ID)
 
@@ -404,7 +404,7 @@ def test_sem_discord_bot_token_pula_previa_e_run_pending(tmp_path, monkeypatch):
     assert "discord_error" not in done_job
     assert "discord" not in done_job
 
-    # Heartbeat with Coord and no DISCORD_BOT_TOKEN skips run_pending
+    # Heartbeat with Coord and no DISCORD_BOT_TOKEN runs run_pending without error
     clock = Clock()
     db = mongomock.MongoClient().db
     coord = Coord(db, "w-notok", now=clock)
@@ -421,7 +421,9 @@ def test_sem_discord_bot_token_pula_previa_e_run_pending(tmp_path, monkeypatch):
     called: list[bool] = []
 
     async def irc(channels, on_message, stop):
-        while len(list(db.workers.find())) == 0:
+        for _ in range(50):
+            if called:
+                break
             await clock.sleep(1)
         stop.set()
 
@@ -438,7 +440,7 @@ def test_sem_discord_bot_token_pula_previa_e_run_pending(tmp_path, monkeypatch):
         capacity_fn=lambda _: {"cpus": 2, "score": 2},
         run_pending_fn=lambda *a, **kw: called.append(True) or [],
     ))
-    assert called == []
+    assert len(called) >= 1
     assert db.publish_requests.find_one({"_id": "vnt_c01:youtube"})["status"] == "pending"
 
 

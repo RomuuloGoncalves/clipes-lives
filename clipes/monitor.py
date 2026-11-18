@@ -1847,33 +1847,32 @@ async def run_monitor(
                         await asyncio.to_thread(active_coord.mark_command, cmd["_id"], "feito")
                         print("[comando] liberar recursos", flush=True)
                         raise SystemExit(75)
-                    if os.environ.get("DISCORD_BOT_TOKEN", "").strip():
-                        runner = run_pending_fn
-                        if runner is None:
-                            from . import publicacao
+                    runner = run_pending_fn
+                    if runner is None:
+                        from . import publicacao
 
-                            runner = publicacao.run_pending
-                        discord_post = (
-                            (lambda tid, msg: discord_client.post(tid, msg))
-                            if discord_client is not None
-                            else None
+                        runner = publicacao.run_pending
+                    discord_post = (
+                        (lambda tid, msg: discord_client.post(tid, msg))
+                        if discord_client is not None
+                        else None
+                    )
+                    try:
+                        await asyncio.to_thread(
+                            runner,
+                            active_coord,
+                            active_coord.worker_id,
+                            out_root=out_root,
+                            now=now,
+                            policy=policy,
+                            discord_post=discord_post,
                         )
-                        try:
-                            await asyncio.to_thread(
-                                runner,
-                                active_coord,
-                                active_coord.worker_id,
-                                out_root=out_root,
-                                now=now,
-                                policy=policy,
-                                discord_post=discord_post,
-                            )
-                        except Exception as exc:
-                            if _is_mongo_error(exc):
-                                coord_session.mark_offline(exc)
-                            else:
-                                uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
-                                print(f"[publicar] erro no heartbeat ({_sanitize_error(exc, uri)})", flush=True)
+                    except Exception as exc:
+                        if _is_mongo_error(exc):
+                            coord_session.mark_offline(exc)
+                        else:
+                            uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
+                            print(f"[publicar] erro no heartbeat ({_sanitize_error(exc, uri)})", flush=True)
             wait_rem = beat_interval if active_coord is None else max(1.0, beat_interval - (now() - last_beat))
             await sleep(max(1.0, wait_rem))
 
