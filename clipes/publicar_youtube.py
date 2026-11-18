@@ -38,7 +38,7 @@ def _sanitize_title(title: str) -> str:
 
 
 def _format_description(description: str) -> str:
-    base = (description or "").strip()
+    base = (description or "").replace("<", "").replace(">", "").strip()
     if "#shorts" in base.lower():
         return base[:5000]
     if not base:

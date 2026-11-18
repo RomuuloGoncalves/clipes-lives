@@ -261,3 +261,30 @@ def test_publish_youtube_refreshes_once_on_401_and_returns_erro_auth_on_failure(
     assert res_fail["status"] == "erro_auth"
     assert "refaca clipes auth youtube" in res_fail["erro"]
     assert fresh_token not in json.dumps(res_fail)
+
+
+def test_publish_youtube_strips_angle_brackets_from_description(tmp_path: Path):
+    """M6: YouTube description must also strip '<' and '>' while keeping multiline text."""
+    mp4 = tmp_path / "clip.mp4"
+    mp4.write_bytes(b"MP4DATA")
+    captured_json: list[dict[str, Any]] = []
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float = 30) -> FakeResponse:
+        if req.get_method() == "POST":
+            captured_json.append(json.loads(req.data.decode("utf-8")))
+            return FakeResponse(200, headers={"Location": "https://upload.example/u-desc"})
+        return FakeResponse(200, body={"id": "yt_desc"})
+
+    res = publish(
+        mp4,
+        "Titulo",
+        "Linha <um>\n\nLinha >dois<",
+        "tok",
+        fake_urlopen,
+        probe_duration_fn=lambda _: 25.0,
+    )
+
+    assert res["status"] == "ok"
+    sent_desc = captured_json[0]["snippet"]["description"]
+    assert "<" not in sent_desc and ">" not in sent_desc
+    assert sent_desc == "Linha um\n\nLinha dois\n\n#Shorts"
