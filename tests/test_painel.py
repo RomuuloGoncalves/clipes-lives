@@ -118,3 +118,62 @@ def test_comando_405_401_202_409(db, env):
     assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 202
     assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 409
     assert db.commands.count_documents({}) == 1
+
+
+# ---- T20: pagina do painel
+def test_index_html_sem_innerhtml_e_sem_segredo():
+    from pathlib import Path
+    import re
+
+    html = Path(__file__).resolve().parents[1] / "painel" / "index.html"
+    assert html.is_file()
+    txt = html.read_text(encoding="utf-8")
+    low = txt.lower()
+    assert "innerhtml" not in low
+    assert "outerhtml" not in low
+    assert "insertadjacenthtml" not in low
+    assert "document.write" not in low
+    assert "textContent" in txt
+    assert not re.search(r"mongodb(\+srv)?://", txt, re.I)
+    assert "http://" not in low and "https://" not in low  # sem CDN ou URL externa
+
+
+def test_index_html_estrutura_e_fluxos():
+    from html.parser import HTMLParser
+    from pathlib import Path
+
+    class Checker(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.tags = []
+            self.scripts = []
+            self._in_script = False
+
+        def handle_starttag(self, tag, attrs):
+            self.tags.append(tag)
+            if tag == "script":
+                self._in_script = True
+
+        def handle_endtag(self, tag):
+            if tag == "script":
+                self._in_script = False
+
+        def handle_data(self, data):
+            if self._in_script:
+                self.scripts.append(data)
+
+    txt = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
+    p = Checker()
+    p.feed(txt)
+    p.close()
+    assert "table" in p.tags
+    js = "\n".join(p.scripts)
+    assert "/api/status" in js
+    assert "/api/comando" in js
+    assert "10000" in js
+    assert "confirm(" in js
+    assert "LIBERAR" in js
+    assert "liberar recursos" in txt.lower()
+    assert "n/d" in js
+    for campo in ("alias", "online", "cpus", "ram_gb", "disco_livre_gb", "temp_c", "gpu", "job_atual", "max_lives"):
+        assert campo in js
