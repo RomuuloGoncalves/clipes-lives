@@ -2,6 +2,15 @@
 # Uso: ./clipar <url> [opcoes]   (ou ./clipar monitor ...)
 # Cria a pasta de saida como seu usuario antes do Docker (senao ele a cria como root, com cadeado).
 # Limita a CPU (CLIPES_CPUS, padrao 3), baixa a prioridade e liga o vigia termico durante a execucao.
+SECRETS="${CLIPES_SECRETS:-$HOME/.config/clipes-lives/segredos.env}"
+if [ -f "$SECRETS" ]; then
+  MODE=$(stat -L -c '%a' "$SECRETS" 2>/dev/null)
+  [ "$MODE" != "600" ] && echo "aviso: $SECRETS tem modo $MODE (esperado 600)" >&2
+  case "$SECRETS" in */*) ;; *) SECRETS="./$SECRETS" ;; esac
+  set -a
+  . "$SECRETS"
+  set +a
+fi
 OUT_DIR="${OUT_DIR:-$HOME/Downloads/clipes-lives}"
 mkdir -p "$OUT_DIR" && export OUT_DIR
 D="$(dirname "$0")"
