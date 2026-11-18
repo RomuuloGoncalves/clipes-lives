@@ -177,3 +177,30 @@ def test_index_html_estrutura_e_fluxos():
     assert "n/d" in js
     for campo in ("alias", "online", "cpus", "ram_gb", "disco_livre_gb", "temp_c", "gpu", "job_atual", "max_lives"):
         assert campo in js
+
+
+# ---- T21: configuracao da Vercel
+def test_vercel_json_valido_e_sem_segredos():
+    from pathlib import Path
+    import re
+
+    p = Path(__file__).resolve().parents[1] / "painel" / "vercel.json"
+    assert p.is_file()
+    txt = p.read_text(encoding="utf-8")
+    dados = json.loads(txt)
+    assert isinstance(dados, dict)
+    assert not re.search(r"mongodb(\+srv)?://", txt, re.I)
+    assert "PAINEL_SENHA" not in str(dados.get("env", {}))
+    assert "PAINEL_MONGO_URI" not in str(dados.get("env", {}))
+
+
+def test_painel_requirements_pymongo_sem_segredos():
+    from pathlib import Path
+    import re
+
+    p = Path(__file__).resolve().parents[1] / "painel" / "requirements.txt"
+    assert p.is_file()
+    txt = p.read_text(encoding="utf-8")
+    linhas = [ln.strip() for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
+    assert "pymongo" in linhas
+    assert not re.search(r"mongodb(\+srv)?://", txt, re.I)
