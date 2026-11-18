@@ -66,6 +66,7 @@ urllib.request.urlretrieve('https://github.com/opencv/opencv_zoo/raw/main/models
 # Dependencias das novas features (depois dos modelos para preservar o cache de camadas)
 RUN pip install "onnxruntime>=1.18" "tokenizers>=0.19" "opencv-python-headless>=4.9" "streamlink>=7.0"
 RUN pip install "pymongo>=4.8" "mongomock>=4.3"
+RUN pip install "discord.py>=2.4,<3"
 
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
