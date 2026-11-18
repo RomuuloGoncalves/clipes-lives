@@ -647,18 +647,24 @@ def _default_refresh(
     raise ValueError(f"unknown platform: {plataforma}")
 
 
-def _default_publish(plataforma: str, mp4_path: Path, clip: dict[str, Any], access_token: str) -> dict[str, Any]:
+def _default_publish(
+    plataforma: str,
+    mp4_path: Path,
+    clip: dict[str, Any],
+    access_token: str,
+    refresh: Callable[[], str] | None = None,
+) -> dict[str, Any]:
     if plataforma == "youtube":
         from . import publicar_youtube  # lazy: module from T5
 
         title = str(clip.get("title") or clip.get("clip_id") or mp4_path.stem)
         desc = str(clip.get("description_long") or clip.get("caption") or title)
-        return publicar_youtube.publish(mp4_path, title, desc, access_token)
+        return publicar_youtube.publish(mp4_path, title, desc, access_token, refresh=refresh)
     if plataforma == "tiktok":
         from . import publicar_tiktok  # lazy: module from T6
 
         caption = str(clip.get("caption") or clip.get("title") or mp4_path.stem)
-        return publicar_tiktok.publish(mp4_path, caption, access_token)
+        return publicar_tiktok.publish(mp4_path, caption, access_token, refresh=refresh)
     raise ValueError(f"unknown platform: {plataforma}")
 
 
@@ -879,7 +885,7 @@ def run_pending(
         def invoke(tok: str) -> dict[str, Any]:
             if pub_fn is not None:
                 return _call_publisher(pub_fn, plat, Path(mp4_path), clip_entry, tok)
-            return _default_publish(plat, Path(mp4_path), clip_entry, tok)
+            return _default_publish(plat, Path(mp4_path), clip_entry, tok, refresh=do_refresh)
 
         try:
             res = invoke(str(access_token))
