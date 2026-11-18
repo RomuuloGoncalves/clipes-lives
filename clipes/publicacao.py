@@ -23,6 +23,7 @@ QUOTA_ENV_KEYS: dict[str, str] = {"youtube": "CLIPES_YT_MAX_DIA", "tiktok": "CLI
 DEFAULT_TOKENS_PATH = Path("/config/tokens.json")
 WORKER_STALE_S = 180.0
 _UPLOAD_URL_RE = re.compile(r"https?://[^\s'\"<>]*upload[^\s'\"<>]*", re.IGNORECASE)
+_HTTP_401_RE = re.compile(r"(?:^|\b(?:http(?:/[\d.]+)?|status|code|erro|error)\s*[:=]?\s*|\()401(?:\b|\))")
 _ACTIVE_REQUEST_STATUSES: tuple[str, ...] = ("ok", "pending", "running")
 _PATH_LOCKS_GUARD = threading.Lock()
 _PATH_LOCKS: dict[Path, threading.Lock] = {}
@@ -682,7 +683,7 @@ def _is_401_error(exc: BaseException) -> bool:
     if getattr(exc, "kind", None) == "erro_auth":
         return True
     text = str(exc).lower()
-    return "401" in text or "unauthorized" in text or "invalid_token" in text
+    return bool(_HTTP_401_RE.search(text)) or "unauthorized" in text or "invalid_token" in text
 
 
 def _is_account_error(exc: BaseException) -> bool:

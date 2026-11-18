@@ -867,4 +867,37 @@ def _dt_iso(ts: float) -> str:
     return datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None).isoformat()
 
 
+def test_is_401_error_ignores_401_inside_clip_id_or_other_numbers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """M4: substring '401' inside clip_id or arbitrary numbers must not trigger 401 refresh/erro_auth."""
+    _make_clip_fixture(tmp_path, clip_id="clip-401-c01", owner="w-pc1")
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"access_token": SECRET_ACCESS, "refresh_token": SECRET_REFRESH}})
+
+    refresh_calls = 0
+
+    def fail_if_refresh(*args):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return {"access_token": SECRET_ACCESS}
+
+    request(store, "clip-401-c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": lambda *a: (_ for _ in ()).throw(RuntimeError("falha no clipe clip-401-c01"))},
+        refreshers={"youtube": fail_if_refresh},
+    )
+
+    assert refresh_calls == 0
+    assert outcomes[0]["status"] == "erro"
+    assert "clip-401-c01" in outcomes[0]["resultado"]["erro"]
+
+
 
