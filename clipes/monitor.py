@@ -23,7 +23,8 @@ from typing import Any
 
 import numpy as np
 
-from .ingest import BOT_AUTHORS, _compact_chat_rows, probe_duration, sanitize_id
+from .ingest import BOT_AUTHORS, _compact_chat_rows, probe_duration, probe_metadata, sanitize_id
+from .janelas import filter_emitted, owns, window_end
 
 MAX_CHANNELS = 80
 HELIX_MIN_INTERVAL_S = 60.0
@@ -778,6 +779,157 @@ def run_worker_step(
         "timings": {**result.get("timings", {}), "worker_s": round(time.perf_counter() - started, 2)},
     })
     return True
+
+
+# --- follow_live: one live clipped in aligned windows until it ends ------------------------------
+
+LIVE_STEP_S = 300
+LIVE_WINDOW_S = 600
+LIVE_NO_SEGMENT_S = 90.0
+LIVE_END_PERSIST_S = 300.0
+LIVE_MAX_BACKLOG = 2
+LIVE_IS_LIVE_EVERY_S = 60.0
+
+
+def _live_channel(url_or_channel: str) -> str:
+    m = re.search(r"twitch\.tv/([A-Za-z0-9_]+)", url_or_channel)
+    return (m.group(1) if m else url_or_channel).strip().lower().lstrip("@")
+
+
+def follow_live(
+    url_or_channel: str,
+    out_root: Path,
+    *,
+    queue_root: Path | None = None,
+    pool: RollingRecorderPool | None = None,
+    pipeline: Callable[[Path, Path], dict[str, Any]] = run_local_pipeline,
+    is_live: Callable[[str], bool] | None = None,
+    now: Callable[[], float] = time.time,
+    sleep: Callable[[float], Any] = time.sleep,
+    disk_usage: Callable[[Any], Any] = shutil.disk_usage,
+    step: int = LIVE_STEP_S,
+    max_dur: float = 60.0,
+    min_free_gb: float | None = None,
+) -> dict[str, Any]:
+    """Clip one live in `step`-aligned windows [e-600, e] until it ends; returns {"status", "jobs"}.
+
+    Each window becomes a job; only clips whose center lies in the window's owned region and that
+    were not already emitted (absolute time, emitted file) survive. `source.mkv` is deleted after
+    each window. More than LIVE_MAX_BACKLOG pending windows: the oldest is marked `lost`.
+    """
+    channel = _live_channel(url_or_channel)
+    url = f"https://www.twitch.tv/{channel}"
+    min_free = float(os.environ.get("CLIPES_MIN_FREE_GB", "5") if min_free_gb is None else min_free_gb)
+    pad = max_dur / 2
+    queue = DiskQueue(queue_root or out_root / "queue")
+    pool = pool or RollingRecorderPool(queue.root / ".buffer", max_hot=0, max_on_demand=1,
+                                       buffer_seconds=LIVE_WINDOW_S + 2 * step)
+    is_live = is_live or (lambda u: bool(probe_metadata(u).get("is_live")))
+    emitted_path = out_root / f".emitted_{sanitize_id(channel)}.json"
+    jobs: list[str] = []
+
+    def pending() -> list[Path]:
+        found = []
+        for d in (queue.root / "pending").iterdir():
+            try:
+                if _read_job(d).get("channel") == channel:
+                    found.append(d)
+            except (OSError, ValueError):
+                continue
+        return sorted(found, key=lambda d: d.name)
+
+    def live_pipeline(job_dir: Path, root: Path) -> dict[str, Any]:
+        job = _read_job(job_dir)
+        result = pipeline(job_dir, root)
+        vs = job["video_start"]
+        mine = [c for c in result.get("clips") or []
+                if owns(vs + (c["start"] + c["end"]) / 2, job["window_start"], job["window_end"], step, pad, job["last"])]
+        keep = filter_emitted([(vs + c["start"], vs + c["end"]) for c in mine], emitted_path)
+        return {**result, "clips": [c for c, ok in zip(mine, keep) if ok]}
+
+    def close_window(e: float, last: bool) -> None:
+        start_ts = e - LIVE_WINDOW_S
+        job_id = sanitize_id(f"{channel}_{int(e)}")
+        job_dir = queue.root / ".staging" / job_id
+        job_dir.mkdir(parents=True, exist_ok=True)
+        job = {"job_id": job_id, "channel": channel, "url": url, "peak_ts": e, "z_score": 0.0,
+               "created_at": now(), "ready_at": None, "score": None, "status": "pending",
+               "window_start": start_ts, "window_end": e, "last": last, "video_start": start_ts}
+        duration = 0.0
+        try:
+            job["video_start"] = pool.video_start_ts(channel, start_ts, e)
+            pool.freeze_and_concat(channel, start_ts, e, job_dir / "source.mkv")
+            duration = probe_duration(job_dir / "source.mkv")
+        except ValueError:
+            job.update(status="rejected", reject_reason="no_segments")
+        else:
+            if duration < MIN_CLIP_SOURCE_S:
+                job.update(status="rejected", reject_reason="too_short")
+        if job["status"] == "rejected":
+            (job_dir / "source.mkv").unlink(missing_ok=True)
+        (job_dir / "meta.json").write_text(json.dumps(
+            {"id": job_id, "title": f"{channel} - live", "url": url, "extractor": "twitch",
+             "channel": channel, "is_live": False, "duration": duration}, ensure_ascii=False), encoding="utf-8")
+        _write_job(job_dir, job)
+        queue.enqueue(job_dir)
+        jobs.append(job_id)
+        pool.hold(channel, e + step - LIVE_WINDOW_S)
+        backlog = pending()
+        if len(backlog) > LIVE_MAX_BACKLOG:
+            print(f"[live] backlog {len(backlog)} > {LIVE_MAX_BACKLOG}: {backlog[0].name} lost", flush=True)
+            queue.complete(backlog[0], "rejected", {"reject_reason": "lost", "lost": True})
+
+    def process_one() -> bool:
+        return run_worker_step(queue, out_root, ChannelPolicy(), live_pipeline)
+
+    if not pool.start_on_demand(channel):
+        raise RuntimeError(f"nao foi possivel gravar {channel}")
+    t0 = now()
+    next_e = window_end(t0, step) + step
+    last_check = t0 - LIVE_IS_LIVE_EVERY_S
+    live_ok = True
+    since: dict[str, float] = {}
+    try:
+        while True:
+            t = now()
+            if t - last_check >= LIVE_IS_LIVE_EVERY_S:
+                last_check = t
+                try:
+                    live_ok = is_live(url)
+                except Exception:  # unknown is not an end signal
+                    live_ok = True
+            segs = pool.segments(channel)
+            newest = segs[-1][0] + SEGMENT_S if segs else t0
+            signals = {"exited": not pool.is_recording(channel), "silent": t - newest >= LIVE_NO_SEGMENT_S,
+                       "offline": not live_ok}
+            for k, v in signals.items():
+                if v:
+                    since.setdefault(k, t)
+                else:
+                    since.pop(k, None)
+            if len(since) >= 2 or any(t - v >= LIVE_END_PERSIST_S for v in since.values()):
+                break
+            if t >= next_e:
+                if disk_usage(out_root).free < min_free * 1e9:
+                    print("[live] janela pulada: disco", flush=True)
+                else:
+                    close_window(float(next_e), last=False)
+                next_e += step
+                continue
+            if not (pending() and process_one()):
+                sleep(1.0)
+            pool.cleanup(t)
+        # end: close the tail (>= MIN_CLIP_SOURCE_S past the last boundary), then drain this live's queue
+        segs = pool.segments(channel)
+        e = min(now(), segs[-1][0] + SEGMENT_S) if segs else 0.0
+        if e - (next_e - step) >= MIN_CLIP_SOURCE_S:
+            close_window(e, last=True)
+        while pending():
+            process_one()
+    finally:
+        pool.release_hold(channel)
+        pool.release_on_demand(channel)
+    return {"status": "ended", "jobs": jobs}
 
 
 # --- main loop and `python -m clipes monitor` entrypoint ------------------------------------------
