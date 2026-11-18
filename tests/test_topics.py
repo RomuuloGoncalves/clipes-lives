@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import logging
+import sys
+import types
 
 import numpy as np
+
+import clipes.capacidade as capacidade_mod
+from clipes.capacidade import cpu_threads
 
 from clipes.eval import cuts_mid_word, evaluate_clips
 from clipes.models import CandidatePeak, TopicSegment, Word
@@ -216,3 +221,67 @@ def test_long_transcript_real_segment_topics_split_and_snap_integration():
     metrics = evaluate_clips(parts, words, min_dur=25.0, max_dur=65.0)
     assert metrics["mid_word_cut_rate"] == 0.0
     assert metrics["duration_ok_rate"] == 1.0
+
+
+def test_embed_sentences_uses_cpu_threads_in_onnx_session(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_CPU_THREADS", raising=False)
+    model_file = tmp_path / "model.onnx"
+    model_file.write_bytes(b"fake-onnx")
+    (tmp_path / "tokenizer.json").write_text("{}", encoding="utf-8")
+
+    observed_threads: list[int] = []
+
+    class FakeSessionOptions:
+        intra_op_num_threads = None
+        inter_op_num_threads = None
+
+    class FakeInput:
+        def __init__(self, name: str):
+            self.name = name
+
+    class FakeInferenceSession:
+        def __init__(self, path, sess_options=None, providers=None):
+            observed_threads.append(sess_options.intra_op_num_threads)
+
+        def get_inputs(self):
+            return [FakeInput("input_ids"), FakeInput("attention_mask")]
+
+        def run(self, output_names, feeds):
+            batch = feeds["input_ids"].shape[0]
+            seq = feeds["input_ids"].shape[1]
+            return [np.ones((batch, seq, 4), dtype=np.float32)]
+
+    class FakeEncoding:
+        ids = [1, 2]
+        attention_mask = [1, 1]
+        type_ids = [0, 0]
+
+    class FakeTokenizer:
+        padding = True
+        truncation = True
+
+        @classmethod
+        def from_file(cls, path):
+            return cls()
+
+        def encode_batch(self, texts):
+            return [FakeEncoding() for _ in texts]
+
+    fake_ort = types.ModuleType("onnxruntime")
+    fake_ort.SessionOptions = FakeSessionOptions
+    fake_ort.InferenceSession = FakeInferenceSession
+    fake_tok = types.ModuleType("tokenizers")
+    fake_tok.Tokenizer = FakeTokenizer
+    monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
+    monkeypatch.setitem(sys.modules, "tokenizers", fake_tok)
+
+    expected_real = cpu_threads()
+    embs = embed_sentences(["primeira frase"], onnx_path=str(model_file))
+    assert embs is not None
+    assert observed_threads == [expected_real]
+
+    observed_threads.clear()
+    monkeypatch.setattr(capacidade_mod, "cpu_threads", lambda: 5)
+    embs2 = embed_sentences(["segunda frase"], onnx_path=str(model_file))
+    assert embs2 is not None
+    assert observed_threads == [5]
