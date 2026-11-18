@@ -106,7 +106,15 @@ def test_ensure_indexes_cria_os_indices_do_design(env):
     a.ensure_indexes()
     assert "status_1_lease_until_1" in db.lives.index_information()
     assert "status_1_priority_-1" in db.jobs.index_information()
-    assert "worker_id_1_status_1" in db.commands.index_information()
+    cmd_idx = db.commands.index_information()
+    assert "worker_id_1_status_1" in cmd_idx
+    assert cmd_idx["worker_id_1"]["unique"] is True
+    assert cmd_idx["worker_id_1"]["partialFilterExpression"] == {"status": "pending"}
+    db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "pending"})
+    with pytest.raises(DuplicateKeyError):
+        db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "pending"})
+    db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "feito"})
+    db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "feito"})
 
 
 def test_mask_uri():

@@ -29,6 +29,11 @@ class Coord:
         self.db.jobs.create_index([("status", 1), ("priority", -1)])
         self.db.lives.create_index([("status", 1), ("lease_until", 1)])
         self.db.commands.create_index([("worker_id", 1), ("status", 1)])
+        self.db.commands.create_index(
+            [("worker_id", 1)],
+            unique=True,
+            partialFilterExpression={"status": "pending"},
+        )
 
     def ensure_live(self, live_id: str, **meta) -> None:
         doc = {"status": "live", "owner": None, "lease_until": None, "created_at": self._dt(), "ended_at": None, **meta}

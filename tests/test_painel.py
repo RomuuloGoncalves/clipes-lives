@@ -53,6 +53,40 @@ def test_comando_codigos(db):
     assert _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)[0] == 409
     docs = list(db.commands.find())
     assert len(docs) == 1 and docs[0]["acao"] == "liberar" and docs[0]["status"] == "pending"
+    # Após concluir o comando pendente, outro pode ser criado.
+    db.commands.update_one({"_id": docs[0]["_id"]}, {"$set": {"status": "feito"}})
+    assert _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)[0] == 202
+
+
+def test_comando_409_atomico_em_corrida_e_duplicate_key(db, monkeypatch):
+    from pymongo.errors import DuplicateKeyError
+
+    db.commands.create_index([("worker_id", 1)], unique=True, partialFilterExpression={"status": "pending"})
+    barrier = threading.Barrier(4)
+    codes: list[int] = []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait(timeout=5)
+        code, _ = _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)
+        with lock:
+            codes.append(code)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert sorted(codes) == [202, 409, 409, 409]
+    assert db.commands.count_documents({"worker_id": "w-1", "status": "pending"}) == 1
+
+    # DuplicateKeyError em corrida real no Mongo devolve 409 sem erro 500.
+    def boom(*args, **kwargs):
+        raise DuplicateKeyError("dup pending")
+
+    monkeypatch.setattr(db.commands, "update_one", boom)
+    assert _nucleo.criar_comando(db, "w-2", "LIBERAR", NOW) == (409, {"erro": "comando ja pendente"})
 
 
 def test_autorizado():

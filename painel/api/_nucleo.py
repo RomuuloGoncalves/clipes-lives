@@ -54,14 +54,28 @@ def status(db, now, beat_s=BEAT_S):
 
 def criar_comando(db, worker_id, confirmar, now):
     """Devolve (codigo_http, corpo)."""
+    from pymongo.errors import DuplicateKeyError
+
     if confirmar != "LIBERAR":
         return 400, {"erro": "confirmacao invalida"}
     if not worker_id or not db.workers.find_one({"_id": worker_id}):
         return 404, {"erro": "worker inexistente"}
-    if db.commands.find_one({"worker_id": worker_id, "status": "pending"}):
+    try:
+        res = db.commands.update_one(
+            {"worker_id": worker_id, "status": "pending"},
+            {"$setOnInsert": {
+                "worker_id": worker_id,
+                "acao": "liberar",
+                "status": "pending",
+                "criado_em": now,
+                "executado_em": None,
+            }},
+            upsert=True,
+        )
+    except DuplicateKeyError:
         return 409, {"erro": "comando ja pendente"}
-    db.commands.insert_one({"worker_id": worker_id, "acao": "liberar", "status": "pending",
-                            "criado_em": now, "executado_em": None})
+    if res.upserted_id is None:
+        return 409, {"erro": "comando ja pendente"}
     return 202, {"ok": True}
 
 
