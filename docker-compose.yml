@@ -3,7 +3,7 @@ services:
     build: .
     image: clipes-lives:latest
     user: "${UID:-1000}:${GID:-1000}"
-    mem_limit: 8g
+    mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
     environment:
@@ -18,6 +18,11 @@ services:
       CLIPES_GEMINI_MIN_INTERVAL_S:
       CLIPES_LLM_BACKEND:
       CLIPES_HOOK_TOP:
+      CLIPES_MONGO_URI:
+      CLIPES_ALIAS:
+      CLIPES_LEASE_S:
+      CLIPES_BEAT_S:
+      CLIPES_MIN_FREE_GB:
     volumes:
       - clipes_models:/cache
       - ${OUT_DIR:-${HOME}/Downloads/clipes-lives}:/out
@@ -26,7 +31,7 @@ services:
   test:
     image: clipes-lives:latest
     user: "${UID:-1000}:${GID:-1000}"
-    mem_limit: 8g
+    mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
     environment:
