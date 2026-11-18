@@ -13,6 +13,11 @@ services:
       HF_HOME: /cache/huggingface
       CLIPES_WHISPER_MODEL: ${CLIPES_WHISPER_MODEL:-small}
       CLIPES_CPU_THREADS: ${CLIPES_CPU_THREADS:-3}
+      GEMINI_API_KEYS:
+      CLIPES_GEMINI_MODELS:
+      CLIPES_GEMINI_MIN_INTERVAL_S:
+      CLIPES_LLM_BACKEND:
+      CLIPES_HOOK_TOP:
     volumes:
       - clipes_models:/cache
       - ${OUT_DIR:-${HOME}/Downloads/clipes-lives}:/out
