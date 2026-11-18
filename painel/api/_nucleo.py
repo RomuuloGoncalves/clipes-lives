@@ -134,22 +134,26 @@ def _origem_valida(h):
 def tratar(h, metodo, now=None):
     """Logica comum dos handlers (h = BaseHTTPRequestHandler). Mantida aqui para status/comando."""
     from datetime import datetime, timezone
-    senha, uri = os.environ.get("PAINEL_SENHA"), os.environ.get("PAINEL_MONGO_URI")
-    if not senha or not uri:
+    uri = os.environ.get("PAINEL_MONGO_URI")
+    if not uri:
         return _enviar(h, *SEM_CONFIG)
-    chave = _chave_cliente(h)
-    agora_mono = time.monotonic()
-    if _auth_bloqueada(chave, agora_mono):
-        return _enviar(
-            h,
-            429,
-            {"erro": "muitas tentativas"},
-            {"Retry-After": str(int(JANELA_BLOQUEIO_S))},
-        )
-    if not autorizado(h.headers.get("Authorization"), senha):
-        _registrar_falha_auth(chave, agora_mono)
-        return _enviar(h, 401, {"erro": "nao autorizado"}, {"WWW-Authenticate": 'Basic realm="painel"'})
-    _limpar_falhas_auth(chave)
+    if metodo != "status":
+        senha = os.environ.get("PAINEL_SENHA")
+        if not senha:
+            return _enviar(h, *SEM_CONFIG)
+        chave = _chave_cliente(h)
+        agora_mono = time.monotonic()
+        if _auth_bloqueada(chave, agora_mono):
+            return _enviar(
+                h,
+                429,
+                {"erro": "muitas tentativas"},
+                {"Retry-After": str(int(JANELA_BLOQUEIO_S))},
+            )
+        if not autorizado(h.headers.get("Authorization"), senha):
+            _registrar_falha_auth(chave, agora_mono)
+            return _enviar(h, 401, {"erro": "nao autorizado"}, {"WWW-Authenticate": 'Basic realm="painel"'})
+        _limpar_falhas_auth(chave)
     if metodo == "comando":
         if not _origem_valida(h):
             return _enviar(h, 403, {"erro": "origem nao permitida"})

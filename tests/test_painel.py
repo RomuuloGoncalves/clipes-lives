@@ -139,22 +139,26 @@ def env(monkeypatch):
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
 
 
-def test_status_401_sem_auth(db, env):
-    code, hdr, corpo = chamar(status_fn, db, "GET")
-    assert code == 401 and "Basic" in hdr["WWW-Authenticate"] and b"workers" not in corpo
-
-
-def test_status_500_sem_env(db, monkeypatch):
-    monkeypatch.delenv("PAINEL_SENHA", raising=False)
-    monkeypatch.delenv("PAINEL_MONGO_URI", raising=False)
-    code, _, corpo = chamar(status_fn, db, "GET", basic("s3"))
-    assert code == 500 and json.loads(corpo) == {"erro": "painel nao configurado"}
-
-
-def test_status_200(db, env):
-    code, _, corpo = chamar(status_fn, db, "GET", basic("s3"))
+def test_status_livre_sem_auth(db, env):
+    code, _, corpo = chamar(status_fn, db, "GET")
     assert code == 200 and len(json.loads(corpo)["workers"]) == 2
     assert b"exemplo.invalid" not in corpo
+    # Mesmo com header Authorization invalido, status e livre e nao conta falha.
+    code2, _, _ = chamar(status_fn, db, "GET", basic("errada"), headers={"X-Real-IP": "198.51.100.5"})
+    assert code2 == 200 and not _nucleo._FALHAS_AUTH
+
+
+def test_status_500_sem_uri_e_200_sem_senha(db, monkeypatch):
+    monkeypatch.delenv("PAINEL_SENHA", raising=False)
+    monkeypatch.delenv("PAINEL_MONGO_URI", raising=False)
+    code, _, corpo = chamar(status_fn, db, "GET")
+    assert code == 500 and json.loads(corpo) == {"erro": "painel nao configurado"}
+
+    monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
+    code_s, _, corpo_s = chamar(status_fn, db, "GET")
+    assert code_s == 200 and len(json.loads(corpo_s)["workers"]) == 2
+    code_c, _, corpo_c = chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})
+    assert code_c == 500 and json.loads(corpo_c) == {"erro": "painel nao configurado"}
 
 
 def test_comando_405_401_202_409(db, env):
@@ -197,21 +201,27 @@ def test_comando_exige_content_type_json_e_confere_origin(db, env):
 def test_limite_tentativas_senha_429(db, env, monkeypatch):
     t = [1000.0]
     monkeypatch.setattr(_nucleo.time, "monotonic", lambda: t[0])
+    payload = {"worker_id": "w-1", "confirmar": "LIBERAR"}
 
     for _ in range(_nucleo.MAX_TENTATIVAS_SENHA):
-        code, _, _ = chamar(status_fn, db, "GET", basic("errada"), headers={"X-Real-IP": "198.51.100.10"})
+        code, _, _ = chamar(comando, db, "POST", basic("errada"), payload, headers={"X-Real-IP": "198.51.100.10"})
         assert code == 401
 
-    # Mesmo com a senha certa, o cliente bloqueado recebe 429 até expirar a janela.
-    code, hdr, _ = chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})
+    # Mesmo com a senha certa, o cliente bloqueado recebe 429 ate expirar a janela.
+    code, hdr, _ = chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.10"})
     assert code == 429 and int(hdr["Retry-After"]) > 0
 
+    # GET /api/status continua livre mesmo para IP bloqueado e nao limpa o bloqueio.
+    assert chamar(status_fn, db, "GET", headers={"X-Real-IP": "198.51.100.10"})[0] == 200
+    assert chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.10"})[0] == 429
+
     # Outro IP continua normal.
-    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.11"})[0] == 200
+    assert chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.11"})[0] == 202
 
     # Passada a janela de bloqueio, volta a aceitar.
     t[0] += _nucleo.JANELA_BLOQUEIO_S + 1
-    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})[0] == 200
+    assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-2", "confirmar": "LIBERAR"},
+                  headers={"X-Real-IP": "198.51.100.10"})[0] == 202
 
 
 def test_abrir_reutiliza_client_lazy_com_max_pool_size_1(monkeypatch):
@@ -295,9 +305,13 @@ def test_index_html_estrutura_e_fluxos():
     p.feed(txt)
     p.close()
     assert "table" in p.tags
+    assert "password" in txt
     js = "\n".join(p.scripts)
     assert "/api/status" in js
     assert "/api/comando" in js
+    assert "Basic " in js
+    assert "Authorization" in js
+    assert "pedirSenha" in js
     assert "10000" in js
     assert "confirm(" in js
     assert "LIBERAR" in js
@@ -305,6 +319,9 @@ def test_index_html_estrutura_e_fluxos():
     assert "n/d" in js
     for campo in ("alias", "online", "cpus", "ram_gb", "disco_livre_gb", "temp_c", "gpu", "job_atual", "max_lives"):
         assert campo in js
+    # atualizar() consulta /api/status sem pedir senha nem enviar Authorization
+    atualizar_js = js.split("function atualizar()", 1)[1]
+    assert "Authorization" not in atualizar_js and "pedirSenha" not in atualizar_js
 
 
 # ---- T21: configuracao da Vercel
