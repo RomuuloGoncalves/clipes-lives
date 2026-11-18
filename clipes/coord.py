@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
-
 def mask_uri(uri: str) -> str:
     """Esconde usuário, senha e host: `mongodb+srv://***@***`."""
     return uri.split("://", 1)[0] + "://***@***" if "://" in uri else "***"
@@ -102,4 +101,17 @@ class Coord:
         self.db.jobs.update_many(
             {"live_id": live_id, "owner": old_owner, "status": {"$in": ["pending", "processing"]}},
             {"$set": {"status": "lost", "updated_at": self._dt()}},
+        )
+
+    # ---- heartbeat ----
+
+    def beat(self, alias: str, capacity: dict, job_atual: str | None, max_lives: int, razao: float) -> None:
+        now = self._dt()
+        self.db.workers.update_one(
+            {"_id": self.worker_id},
+            {"$set": {"alias": alias, "capacity": capacity, "job_atual": job_atual,
+                      "max_lives": max_lives, "razao": razao, "heartbeat_at": now},
+             "$push": {"history": {"$each": [{"t": now, "cpu_pct": capacity.get("cpu_pct"),
+                                              "temp_c": capacity.get("temp_c")}], "$slice": -180}}},
+            upsert=True,
         )

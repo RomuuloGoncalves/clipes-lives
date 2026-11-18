@@ -199,3 +199,41 @@ def test_claim_sem_dono_anterior_ou_do_proprio_dono_nao_marca_lost(env):
     clock.t += 91
     assert a.claim_live(LIVE) is True  # o próprio dono volta com a lease vencida
     assert db.jobs.find_one({"_id": JOB})["status"] == "pending"
+
+
+# ---- T8: heartbeat do PC ----
+
+CAP = {"cpus": 3, "ram_gb": 2.6, "disco_livre_gb": 15.1, "temp_c": 78, "gpu": None, "score": 3}
+
+
+def test_181_batidas_deixam_180_no_historico(env):
+    clock, db, a, _ = env
+    for i in range(181):
+        clock.t += 20
+        a.beat("PC-1", {**CAP, "temp_c": i}, None, 1, 0.33)
+    doc = db.workers.find_one({"_id": "w-a"})
+    assert len(doc["history"]) == 180
+    assert doc["history"][0]["temp_c"] == 1 and doc["history"][-1]["temp_c"] == 180  # a mais antiga saiu
+    assert db.workers.count_documents({}) == 1  # upsert por worker_id
+
+
+def test_beat_grava_campos_do_design_e_nada_alem_deles(env):
+    clock, db, a, _ = env
+    a.beat("PC-1", CAP, "job-x", 2, 0.5)
+    doc = db.workers.find_one({"_id": "w-a"})
+    assert set(doc) == {"_id", "alias", "capacity", "job_atual", "max_lives", "razao", "heartbeat_at", "history"}
+    assert (doc["alias"], doc["capacity"], doc["job_atual"], doc["max_lives"], doc["razao"]) == (
+        "PC-1", CAP, "job-x", 2, 0.5)
+    assert doc["heartbeat_at"] == a._dt()
+    assert set(doc["history"][0]) == {"t", "cpu_pct", "temp_c"}
+    assert doc["history"][0]["temp_c"] == 78
+
+
+def test_beat_atualiza_sem_duplicar_e_aceita_job_nulo(env):
+    clock, db, a, _ = env
+    a.beat("PC-1", CAP, "job-x", 1, 0.33)
+    clock.t += 20
+    a.beat("PC-1", CAP, None, 1, 0.33)
+    doc = db.workers.find_one({"_id": "w-a"})
+    assert doc["job_atual"] is None and len(doc["history"]) == 2
+    assert doc["heartbeat_at"] == a._dt()
