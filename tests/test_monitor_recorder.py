@@ -146,13 +146,13 @@ def test_real_ffmpeg_segmenter_writes_epoch_named_copy_segments(tmp_path):
     assert "h264" in probe.stdout  # copied, not re-encoded to something else
 
 
-def test_cleanup_removes_segments_older_than_300s(tmp_path, ts_sample):
+def test_cleanup_removes_segments_older_than_buffer(tmp_path, ts_sample):
     pool = make_pool(tmp_path)
     pool.set_hot(["a"])
     add_segments(pool, "a", ts_sample, [BASE, BASE + 10])
     now = BASE + 1000
-    os.utime(pool.buf_root / "a" / f"{BASE}.ts", (now - 301, now - 301))
-    os.utime(pool.buf_root / "a" / f"{BASE + 10}.ts", (now - 299, now - 299))
+    os.utime(pool.buf_root / "a" / f"{BASE}.ts", (now - monitor.BUFFER_S - 1, now - monitor.BUFFER_S - 1))
+    os.utime(pool.buf_root / "a" / f"{BASE + 10}.ts", (now - monitor.BUFFER_S + 1, now - monitor.BUFFER_S + 1))
     pool.cleanup(now)
     assert [s for s, _ in pool.segments("a")] == [BASE + 10]
 
@@ -163,7 +163,7 @@ def test_cleanup_keeps_held_preroll(tmp_path, ts_sample):
     add_segments(pool, "a", ts_sample, [BASE, BASE + 10, BASE + 20])
     now = BASE + 1000
     for _, path in pool.segments("a"):
-        os.utime(path, (now - 400, now - 400))
+        os.utime(path, (now - monitor.BUFFER_S - 100, now - monitor.BUFFER_S - 100))
     pool.hold("a", BASE + 10)  # job needs everything from BASE+10 on
     pool.cleanup(now)
     assert [s for s, _ in pool.segments("a")] == [BASE + 10, BASE + 20]
@@ -415,3 +415,22 @@ def test_capture_job_without_free_slot_returns_none(tmp_path):
     assert pool.start_on_demand("other") is True
     detector = monitor.ChannelSpikeDetector("gaules", t0=BASE)
     assert run_capture(pool, detector, spike_at(BASE + 25), tmp_path / "staging", Clock(BASE + 25)) is None
+
+
+def test_pool_uses_custom_source_cmd_for_twitch_and_youtube(tmp_path):
+    popen = FakePopen()
+    urls = {"gaules": None, "yt_abc123": "https://www.youtube.com/watch?v=abc123"}
+    pool = monitor.RollingRecorderPool(
+        tmp_path / "buf",
+        max_hot=0,
+        max_on_demand=2,
+        popen=popen,
+        source_cmd=lambda key: monitor.ytdlp_live_cmd(urls[key]) if urls[key] else monitor.streamlink_cmd(key),
+    )
+    assert pool.start_on_demand("gaules") is True
+    assert pool.start_on_demand("yt_abc123") is True
+    sources = [p.cmd for p in popen.procs if p.cmd[0] != "ffmpeg"]
+    assert sources[0][0] == "streamlink" and "twitch.tv/gaules" in sources[0]
+    assert sources[1][0] == "yt-dlp"
+    assert sources[1][-2:] == ["-", "https://www.youtube.com/watch?v=abc123"]
+    assert "--hls-use-mpegts" in sources[1]

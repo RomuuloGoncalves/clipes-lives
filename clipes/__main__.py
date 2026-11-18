@@ -72,6 +72,10 @@ def main(argv: list[str]) -> int:
         from .monitor import main as monitor_main  # keeps ASR/render imports out of the IRC process
 
         return monitor_main(argv[1:])
+    if argv[:1] == ["acompanhar"]:
+        from .acompanhar import main as acompanhar_main
+
+        return acompanhar_main(argv[1:])
     if argv[:1] == ["bench-live"]:
         return _bench_live(argv[1:])
     if argv[:1] == ["bot"]:

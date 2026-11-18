@@ -61,6 +61,14 @@ def test_claim_next_takes_highest_z_score_first(tmp_path):
     assert [queue.claim_next().name.split("_")[0] for _ in range(3)] == ["high", "mid", "low"]
 
 
+def test_claim_next_orders_fifo_by_created_at_when_z_score_ties(tmp_path):
+    queue = monitor.DiskQueue(tmp_path / "queue")
+    queue.enqueue(stage_job(tmp_path, channel="aaa", peak=200, z=0.0, created_at=2.0))
+    queue.enqueue(stage_job(tmp_path, channel="zzz", peak=100, z=0.0, created_at=1.0))
+    queue.enqueue(stage_job(tmp_path, channel="spike", peak=300, z=5.0, created_at=9.0))
+    assert [queue.claim_next().name for _ in range(3)] == ["spike_300", "zzz_100", "aaa_200"]
+
+
 def test_recover_orphans_returns_processing_jobs_to_pending(tmp_path):
     queue = monitor.DiskQueue(tmp_path / "queue")
     queue.enqueue(stage_job(tmp_path))

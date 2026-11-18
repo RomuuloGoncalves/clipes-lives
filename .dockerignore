@@ -5,3 +5,7 @@ __pycache__
 out
 .cache
 docs
+.env
+.env.*
+*.env
+segredos.env

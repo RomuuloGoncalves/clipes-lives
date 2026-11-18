@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import os
 import re
 import subprocess
@@ -16,6 +17,91 @@ SAFE_MARGIN_L = 120
 SAFE_MARGIN_R = 200
 SAFE_MARGIN_V = 560
 OUTRO_DURATION = 1.2
+DEFAULT_BAR_H = 420
+MIN_BAR_H = 300
+MAX_BAR_H = 600
+DEFAULT_BRAND_LOGO = "/app/assets/logo.jpg"
+
+_BAR_STYLES: dict[str, tuple[str, str, str]] = {
+    "claro": ("#FFFFFF", "#000000", "#606060"),
+    "escuro": ("#000000", "#FFFFFF", "#B0B0B0"),
+}
+
+_WARNED_MISSING_LOGOS: set[str] = set()
+
+
+@dataclass(frozen=True)
+class BarConfig:
+    """Configuration for the fixed top brand bar."""
+
+    h: int
+    bg: str
+    fg: str
+    handle_fg: str
+    display: str
+    handle: str
+    logo: Path | None
+
+
+def bar_config() -> BarConfig | None:
+    """Read brand bar configuration from env; returns None when disabled."""
+    raw_bar = os.environ.get("CLIPES_BAR", "").strip().lower()
+    raw_name = os.environ.get("CLIPES_BRAND_NAME", "").strip()
+    if raw_bar in ("0", "false", "no", "off"):
+        return None
+    if not (raw_bar in ("1", "true", "yes", "on") or bool(raw_name)):
+        return None
+
+    handle = f"@{raw_name}" if raw_name and not raw_name.startswith("@") else raw_name
+    display = os.environ.get("CLIPES_BRAND_DISPLAY", "").strip()
+
+    raw_h = os.environ.get("CLIPES_BAR_H", "").strip()
+    h = DEFAULT_BAR_H
+    if raw_h:
+        try:
+            parsed_h = int(raw_h)
+        except ValueError:
+            parsed_h = -1
+        if MIN_BAR_H <= parsed_h <= MAX_BAR_H:
+            h = parsed_h
+        else:
+            print(f"[render] CLIPES_BAR_H invalido ({raw_h!r}); usando {DEFAULT_BAR_H}", flush=True)
+
+    raw_style = os.environ.get("CLIPES_BAR_STYLE", "claro").strip().lower()
+    bg, fg, handle_fg = _BAR_STYLES.get(raw_style, _BAR_STYLES["claro"])
+
+    logo_raw = os.environ.get("CLIPES_BRAND_LOGO", "").strip() or DEFAULT_BRAND_LOGO
+    logo_path = Path(logo_raw)
+    try:
+        has_logo = logo_path.is_file() and os.access(logo_path, os.R_OK) and logo_path.stat().st_size > 0
+    except OSError:
+        has_logo = False
+    if has_logo:
+        logo: Path | None = logo_path
+    else:
+        logo = None
+        if logo_raw not in _WARNED_MISSING_LOGOS:
+            _WARNED_MISSING_LOGOS.add(logo_raw)
+            print(f"[render] logo nao encontrado: {logo_raw}; barra so com texto", flush=True)
+
+    return BarConfig(
+        h=h,
+        bg=bg,
+        fg=fg,
+        handle_fg=handle_fg,
+        display=display,
+        handle=handle,
+        logo=logo,
+    )
+
+
+def _ass_color(hex_rgb: str) -> str:
+    """Convert '#RRGGBB' hex color to ASS '&H00BBGGRR&'."""
+    h = hex_rgb.lstrip("#")
+    if len(h) == 6:
+        r, g, b = h[0:2], h[2:4], h[4:6]
+        return f"&H00{b}{g}{r}&".upper()
+    return "&H00FFFFFF&"
 
 TITLE_KEYWORDS = re.compile(
     r"(?:caralho|carai|meu deus|mds|pqp|olha|mentira|nossa|que isso|"
@@ -137,9 +223,18 @@ def _truncate_ellipsis(text: str, max_chars: int) -> str:
     return text[: max_chars - 1].rstrip(" ,;:-") + "…"
 
 
-def wrap_top_hook(text: str, max_chars: int = 18, max_lines: int = 2) -> str:
-    """Uppercase, ASS-escape, and wrap hook into up to max_lines of <= max_chars with alternating white/yellow."""
-    clean = _ass_escape(" ".join(text.split())).upper()
+def wrap_top_hook(
+    text: str,
+    max_chars: int = 18,
+    max_lines: int = 2,
+    *,
+    uppercase: bool = True,
+    colored: bool = True,
+) -> str:
+    """ASS-escape and wrap hook into up to max_lines of <= max_chars (optionally uppercased and colored)."""
+    clean = _ass_escape(" ".join(text.split()))
+    if uppercase:
+        clean = clean.upper()
     if not clean or max_chars <= 0 or max_lines <= 0:
         return ""
     lines: list[str] = []
@@ -172,6 +267,8 @@ def wrap_top_hook(text: str, max_chars: int = 18, max_lines: int = 2) -> str:
     if truncated and lines and not lines[-1].endswith("…"):
         base = lines[-1].rstrip(" ,;:-")
         lines[-1] = (base + "…") if len(base) < max_chars else _truncate_ellipsis(lines[-1], max_chars)
+    if not colored:
+        return r"\N".join(lines)
     colors = ("&H00FFFFFF&", "&H0000FFFF&")
     return r"\N".join(f"{{\\c{colors[i % 2]}}}{line}" for i, line in enumerate(lines))
 
@@ -189,17 +286,28 @@ def build_ass(
     part_total: int = 1,
     outro_duration: float = OUTRO_DURATION,
     hook_top: str = "",
+    title: str = "",
+    bar: BarConfig | None = None,
 ) -> int:
     """Write word-highlighted ASS subtitles, channel credit, and end card. Returns dialogue count."""
     content_dur = max(0.0, clip_end - clip_start)
+    total_dur = content_dur + max(0.0, outro_duration)
     selected = [
         w for w in words
         if w.end > clip_start and w.start < clip_end and w.clean
     ]
-    wrapped_hook = wrap_top_hook(hook_top) if (hook_top and content_dur > 0 and is_hook_top_enabled()) else ""
+    wrapped_hook = (
+        wrap_top_hook(hook_top)
+        if (bar is None and hook_top and content_dur > 0 and is_hook_top_enabled())
+        else ""
+    )
+    part_y = (bar.h + 70) if bar is not None else 490
+    credit_y = (bar.h + 20) if bar is not None else 600
+    card_y = (bar.h + (height - bar.h) // 2) if bar is not None else (height // 2)
+
     part_style = (
         "Style: PartBadge,DejaVu Sans,52,&H0000FFFF,&H0000FFFF,&H00000000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,4,2,8,{SAFE_MARGIN_L},{SAFE_MARGIN_R},490,1\n"
+        f"-1,0,0,0,100,100,0,0,1,4,2,8,{SAFE_MARGIN_L},{SAFE_MARGIN_R},{part_y},1\n"
         if part_total > 1
         else ""
     )
@@ -209,6 +317,18 @@ def build_ass(
         if wrapped_hook
         else ""
     )
+    bar_styles = ""
+    if bar is not None:
+        fg_ass = _ass_color(bar.fg)
+        handle_ass = _ass_color(bar.handle_fg)
+        bar_styles = (
+            f"Style: BarName,DejaVu Sans,56,{fg_ass},{fg_ass},&H00000000&,&H00000000&,"
+            "-1,0,0,0,100,100,0,0,1,0,0,7,60,60,0,1\n"
+            f"Style: BarHandle,DejaVu Sans,44,{handle_ass},{handle_ass},&H00000000&,&H00000000&,"
+            "0,0,0,0,100,100,0,0,1,0,0,7,60,60,0,1\n"
+            f"Style: BarTitle,DejaVu Sans,60,{fg_ass},{fg_ass},&H00000000&,&H00000000&,"
+            "-1,0,0,0,100,100,0,0,1,0,0,5,60,60,0,1\n"
+        )
     header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -227,12 +347,41 @@ def build_ass(
         f"-1,0,0,0,100,100,0,0,1,3,1,7,{SAFE_MARGIN_L},{SAFE_MARGIN_R},0,1\n"
         f"{part_style}"
         f"{hook_style}"
+        f"{bar_styles}"
         "Style: Card,DejaVu Sans,54,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
         f"-1,0,0,0,100,100,0,0,3,14,0,5,{SAFE_MARGIN_L},{SAFE_MARGIN_R},0,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     events: list[str] = []
+    if bar is not None and total_dur > 0:
+        bar_end = _ass_time(total_dur)
+        text_x = 240 if bar.logo is not None else 60
+        safe_display = _ass_escape(bar.display.strip())
+        safe_handle = _ass_escape(bar.handle.strip())
+        if safe_display:
+            events.append(
+                f"Dialogue: 3,0:00:00.00,{bar_end},BarName,,0,0,0,,"
+                f"{{\\an7\\pos({text_x},56)}}{safe_display}"
+            )
+        if safe_handle:
+            handle_y = 122 if safe_display else 93
+            events.append(
+                f"Dialogue: 3,0:00:00.00,{bar_end},BarHandle,,0,0,0,,"
+                f"{{\\an7\\pos({text_x},{handle_y})}}{safe_handle}"
+            )
+        bar_title_src = hook_top.strip() or title.strip()
+        wrapped_title = (
+            wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
+            if bar_title_src
+            else ""
+        )
+        if wrapped_title:
+            title_y = (210 + (bar.h - 20)) // 2
+            events.append(
+                f"Dialogue: 3,0:00:00.00,{bar_end},BarTitle,,0,0,0,,"
+                f"{{\\an5\\pos({width // 2},{title_y})}}{wrapped_title}"
+            )
     if wrapped_hook:
         hook_end = _ass_time(min(5.0, content_dur))
         events.append(
@@ -245,7 +394,7 @@ def build_ass(
         badge_end = _ass_time(max(0.1, content_dur))
         events.append(
             f"Dialogue: 1,0:00:00.00,{badge_end},PartBadge,,0,0,0,,"
-            f"{{\\an8\\pos({width // 2},490)}}Parte {part_index}/{part_total}"
+            f"{{\\an8\\pos({width // 2},{part_y})}}Parte {part_index}/{part_total}"
         )
 
     safe_credit = _ass_escape(channel_credit.strip())
@@ -253,12 +402,12 @@ def build_ass(
         strong_end = min(4.0, content_dur)
         events.append(
             f"Dialogue: 1,0:00:00.00,{_ass_time(strong_end)},Credit,,0,0,0,,"
-            f"{{\\pos(120,600)\\fad(300,400)}}{safe_credit}"
+            f"{{\\pos(120,{credit_y})\\fad(300,400)}}{safe_credit}"
         )
         if content_dur > 4.0:
             events.append(
                 f"Dialogue: 1,{_ass_time(4.0)},{_ass_time(content_dur)},Credit,,0,0,0,,"
-                f"{{\\pos(120,600)\\alpha&H99&}}{safe_credit}"
+                f"{{\\pos(120,{credit_y})\\alpha&H99&}}{safe_credit}"
             )
 
     if outro_duration > 0:
@@ -270,7 +419,7 @@ def build_ass(
             card_text = "Live completa"
         events.append(
             f"Dialogue: 2,{_ass_time(content_dur)},{_ass_time(content_dur + outro_duration)},Card,,0,0,0,,"
-            f"{{\\pos({width // 2},{height // 2})\\fad(250,0)}}{card_text}"
+            f"{{\\pos({width // 2},{card_y})\\fad(250,0)}}{card_text}"
         )
 
     if not selected:
@@ -391,29 +540,62 @@ def build_video_filter(
     outro_duration: float = OUTRO_DURATION,
     blur_bg: bool | None = None,
     crop: tuple[int, int, int, int] | None = None,
+    bar: BarConfig | None = None,
 ) -> tuple[str, str]:
     """Build ffmpeg -filter_complex string and mapped video pad label."""
     if blur_bg is None:
         blur_bg = is_blur_bg_enabled()
 
-    if crop is not None:
-        cx, cy, cw, ch = crop
-        vf_parts = [f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:1920,setsar=1[v_base]"]
-    elif blur_bg:
-        # Fast 1080x1920 vertical layout: centered gameplay over downscale-blurred copy of itself.
-        vf_parts = [
-            "[0:v]split=2[bg][fg]",
-            "[bg]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,boxblur=10:2,scale=1080:1920,setsar=1[bg_b]",
-            "[fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[fg_s]",
-            "[bg_b][fg_s]overlay=(W-w)/2:(H-h)/2[v_base]",
-        ]
+    if bar is None:
+        if crop is not None:
+            cx, cy, cw, ch = crop
+            vf_parts = [f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:1920,setsar=1[v_base]"]
+        elif blur_bg:
+            # Fast 1080x1920 vertical layout: centered gameplay over downscale-blurred copy of itself.
+            vf_parts = [
+                "[0:v]split=2[bg][fg]",
+                "[bg]scale=270:480:force_original_aspect_ratio=increase,crop=270:480,boxblur=10:2,scale=1080:1920,setsar=1[bg_b]",
+                "[fg]scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1[fg_s]",
+                "[bg_b][fg_s]overlay=(W-w)/2:(H-h)/2[v_base]",
+            ]
+        else:
+            vf_parts = [
+                "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v_base]",
+            ]
+        cur = "[v_base]"
     else:
-        vf_parts = [
-            "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2,"
-            "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v_base]",
-        ]
+        content_h = 1920 - bar.h
+        drawbox = f"drawbox=x=0:y=0:w=1080:h={bar.h}:color={bar.bg}:t=fill"
+        if crop is not None:
+            cx, cy, cw, ch = crop
+            vf_parts = [
+                f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:{content_h},"
+                f"pad=1080:1920:0:{bar.h}:black,setsar=1,{drawbox}[v_base]",
+            ]
+        elif blur_bg:
+            blur_h = max(2, content_h // 4)
+            vf_parts = [
+                "[0:v]split=2[bg][fg]",
+                f"[bg]scale=270:{blur_h}:force_original_aspect_ratio=increase,crop=270:{blur_h},"
+                f"boxblur=10:2,scale=1080:{content_h},pad=1080:1920:0:{bar.h}:black,setsar=1[bg_b]",
+                f"[fg]scale=1080:{content_h}:force_original_aspect_ratio=decrease:force_divisible_by=2,setsar=1[fg_s]",
+                f"[bg_b][fg_s]overlay=(W-w)/2:{bar.h},{drawbox}[v_base]",
+            ]
+        else:
+            vf_parts = [
+                f"[0:v]scale=1080:{content_h}:force_original_aspect_ratio=decrease:force_divisible_by=2,"
+                f"pad=1080:1920:(ow-iw)/2:{bar.h}:black,setsar=1,{drawbox}[v_base]",
+            ]
+        cur = "[v_base]"
+        if bar.logo is not None:
+            vf_parts.append(
+                "[1:v]crop='min(iw,ih)':'min(iw,ih)',scale=150:150,setsar=1,format=rgba,"
+                "geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='if(lte(hypot(X-75,Y-75),75),255,0)'[logo]"
+            )
+            vf_parts.append(f"{cur}[logo]overlay=60:40[v_logo]")
+            cur = "[v_logo]"
 
-    cur = "[v_base]"
     if outro_duration > 0:
         vf_parts.append(f"{cur}tpad=stop_mode=clone:stop_duration={outro_duration:g}[v_pad]")
         cur = "[v_pad]"
@@ -451,6 +633,7 @@ def render_clip(
     reframe: bool = False,
 ) -> Path:
     """Download window (or slice live recording) and render 1080x1920 MP4 with ASS captions."""
+    bar = bar_config()
     stem = clip_stem(idx, clip)
     out_file = out_dir / f"{stem}.mp4"
     ass_path = cache_dir / f"{stem}.ass"
@@ -464,6 +647,8 @@ def render_clip(
         part_total=clip.part_total,
         outro_duration=OUTRO_DURATION,
         hook_top=clip.hook_top,
+        title=clip.title,
+        bar=bar,
     )
 
     temp_seg: Path | None = None
@@ -480,7 +665,10 @@ def render_clip(
     crop: tuple[int, int, int, int] | None = None
     if reframe:
         from .reframe import detect_speaker_crop
-        crop = detect_speaker_crop(src_path, start=probe_start, duration=clip.duration)
+        if bar is not None:
+            crop = detect_speaker_crop(src_path, start=probe_start, duration=clip.duration, out_h=1920 - bar.h)
+        else:
+            crop = detect_speaker_crop(src_path, start=probe_start, duration=clip.duration)
 
     blur_bg = is_blur_bg_enabled()
     clip.layout = (  # type: ignore[attr-defined]
@@ -492,15 +680,18 @@ def render_clip(
         outro_duration=OUTRO_DURATION,
         blur_bg=blur_bg,
         crop=crop,
+        bar=bar,
     )
     af_chain = build_audio_filter(clip.duration, outro_duration=OUTRO_DURATION)
     total_dur = clip.duration + OUTRO_DURATION
 
+    logo_args = ["-i", str(bar.logo)] if (bar is not None and bar.logo is not None) else []
     tmp_out = out_dir / f".tmp_clip_{idx:02d}.mp4"
     cmd = [
         "ffmpeg", "-y", "-v", "error",
         *pre_args,
         "-i", str(src_path),
+        *logo_args,
         "-filter_complex", filter_complex,
         "-map", v_map,
         "-map", "0:a?",

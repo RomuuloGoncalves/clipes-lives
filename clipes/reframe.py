@@ -101,15 +101,16 @@ def compute_vertical_crop(
     total_frames: int,
     src_w: int,
     src_h: int,
+    out_h: int = 1920,
 ) -> tuple[int, int, int, int] | None:
-    """Compute (x, y, w, h) 9:16 crop in source pixels from median face center, or None."""
+    """Compute (x, y, w, h) 1080:out_h crop in source pixels from median face center, or None."""
     if total_frames <= 0 or len(face_boxes) / total_frames < MIN_DETECTION_RATIO:
         return None
-    if src_w <= 0 or src_h <= 0:
+    if src_w <= 0 or src_h <= 0 or out_h <= 0:
         return None
 
     crop_h = src_h - (src_h % 2)
-    crop_w = int(round(crop_h * 9.0 / 16.0))
+    crop_w = int(round(crop_h * 1080.0 / out_h))
     crop_w -= crop_w % 2
     if crop_w <= 0 or src_w <= crop_w:
         return None
@@ -127,8 +128,9 @@ def detect_speaker_crop(
     start: float,
     duration: float,
     yunet_onnx: str | None = None,
+    out_h: int = 1920,
 ) -> tuple[int, int, int, int] | None:
-    """Sample 1 fps at 640x360, detect faces with YuNet ONNX, return 9:16 crop or None."""
+    """Sample 1 fps at 640x360, detect faces with YuNet ONNX, return 1080:out_h crop or None."""
     model_path = Path(yunet_onnx or os.environ.get("CLIPES_YUNET_ONNX", DEFAULT_YUNET_ONNX))
     if not model_path.is_file():
         print(f"[reframe] YuNet model not found at {model_path}; using fallback layout.", flush=True)
@@ -151,7 +153,7 @@ def detect_speaker_crop(
             box = _detect_best_face(session, input_name, frame)
             if box is not None:
                 boxes.append(box)
-        return compute_vertical_crop(boxes, len(frames), size[0], size[1])
+        return compute_vertical_crop(boxes, len(frames), size[0], size[1], out_h=out_h)
     except Exception as exc:
         print(f"[reframe] Detector fallback: {exc}", flush=True)
         return None

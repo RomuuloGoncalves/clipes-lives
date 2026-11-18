@@ -29,6 +29,7 @@ from .llm import (
 )
 from .models import CandidatePeak, SignalBundle, TopicSegment, Word
 from .monitor import follow_live
+from .notificar import _write_json_atomic, notify_discord
 from .render import OUTRO_DURATION, clip_stem, generate_title, is_blur_bg_enabled, render_clip
 from .signals import compute_rms_db, compute_signals, triage_audio_blocks
 from .snap import select_clips
@@ -67,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Desativa o LLM local e usa apenas título, legenda e hashtags determinísticos")
     p.add_argument("--skip-render", action="store_true",
                    help="Executar análise e snapping sem baixar/renderizar MP4s")
+    p.add_argument("--discord", action=argparse.BooleanOptionalAction, default=True,
+                   help="Enviar prévias dos clipes no Discord ao concluir (padrão: --discord)")
     return p
 
 
@@ -131,6 +134,38 @@ def _write_run_readme(
                 lines.append("```")
             lines.append("")
     (out_dir / "README.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def _merge_discord(old_path: Path, manifest: dict[str, Any]) -> dict[str, Any]:
+    """Preserve manifest and per-clip Discord IDs when rewriting clips.json."""
+    if not old_path.is_file():
+        return manifest
+    try:
+        old = json.loads(old_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        print("[discord] clips.json antigo ilegivel; ids nao preservados", flush=True)
+        return manifest
+    if not isinstance(old, dict):
+        print("[discord] clips.json antigo ilegivel; ids nao preservados", flush=True)
+        return manifest
+    if isinstance(old.get("discord"), dict) and "discord" not in manifest:
+        manifest["discord"] = dict(old["discord"])
+    old_by_id = {
+        str(c["clip_id"]): dict(c["discord"])
+        for c in (old.get("clips") or [])
+        if isinstance(c, dict) and c.get("clip_id") and isinstance(c.get("discord"), dict)
+    }
+    if old_by_id:
+        for clip in manifest.get("clips") or []:
+            if isinstance(clip, dict) and clip.get("clip_id") in old_by_id and "discord" not in clip:
+                clip["discord"] = dict(old_by_id[str(clip["clip_id"])])
+    return manifest
+
+
+def _write_clips_manifest(out_dir: Path, manifest: dict[str, Any]) -> None:
+    clips_path = out_dir / "clips.json"
+    _merge_discord(clips_path, manifest)
+    _write_json_atomic(clips_path, manifest)
 
 
 def _timing_total(timings: dict[str, float]) -> float:
@@ -231,6 +266,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
                 else:
                     follow_kwargs["coord"] = None
             follow_live(args.url, out_root, **follow_kwargs)
+            args._followed_live = True
             return 0
 
     timings: dict[str, float] = {}
@@ -242,6 +278,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         live_minutes=args.live_minutes,
         enable_chat=bool(args.chat),
     )
+    args.output_dir = ing.out_dir
     timings["ingest_s"] = round(time.perf_counter() - t0, 2)
 
     raw_channel_arg = getattr(args, "channel", None)
@@ -307,9 +344,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "note": note,
             "clips": [],
         }
-        (ing.out_dir / "clips.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _write_clips_manifest(ing.out_dir, manifest)
         _write_run_readme(ing.out_dir, ing.video_id, ing.title, ing.url, [], timings)
         return 0
 
@@ -361,9 +396,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "note": note,
             "clips": [],
         }
-        (ing.out_dir / "clips.json").write_text(
-            json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        _write_clips_manifest(ing.out_dir, manifest)
         _write_run_readme(ing.out_dir, ing.video_id, ing.title, ing.url, [], timings)
         return 0
 
@@ -515,9 +548,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     }
     if quota_note:
         manifest["note"] = quota_note
-    (ing.out_dir / "clips.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_clips_manifest(ing.out_dir, manifest)
     used_providers = [] if getattr(args, "no_llm", False) else cloud_llm.providers_used()
     _write_run_readme(
         ing.out_dir, ing.video_id, ing.title, ing.url, clips_payload, timings,
@@ -527,7 +558,27 @@ def run_pipeline(args: argparse.Namespace) -> int:
     return 0
 
 
+def _notify_cli_discord(args: argparse.Namespace) -> None:
+    from .publicacao import _resolve_policy
+
+    out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
+    policy_file = (os.environ.get("CLIPES_POLICY_FILE") or "").strip() or None
+    policy = _resolve_policy(None, policy_file, out_root)
+    notify_discord(Path(args.output_dir), policy=policy)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    return run_pipeline(args)
+    args.output_dir = None
+    args._followed_live = False
+    rc = run_pipeline(args)
+    if (
+        rc == 0
+        and getattr(args, "discord", True)
+        and not getattr(args, "_followed_live", False)
+        and getattr(args, "output_dir", None) is not None
+        and Path(args.output_dir).is_dir()
+    ):
+        _notify_cli_discord(args)
+    return rc

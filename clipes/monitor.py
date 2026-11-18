@@ -25,8 +25,14 @@ from typing import Any
 
 import numpy as np
 
-from .ingest import BOT_AUTHORS, _compact_chat_rows, probe_duration, probe_metadata, sanitize_id
+from .ingest import BOT_AUTHORS, _compact_chat_rows, js_runtime_args, probe_duration, probe_metadata, sanitize_id
 from .janelas import filter_emitted, owns, window_end
+from .notificar import (
+    _format_clip_discord_message,
+    _policy_status_text,
+    _write_json_atomic,
+    notify_discord,
+)
 
 MAX_CHANNELS = 80
 HELIX_MIN_INTERVAL_S = 60.0
@@ -50,6 +56,7 @@ POST_ROLL_MAX_S = 120
 MIN_CLIP_SOURCE_S = 25.0  # a source shorter than min_dur cannot yield a clip
 STREAMLINK_QUALITY = "720p60,720p,480p,best"
 CHANNEL_RE = re.compile(r"[a-z0-9_]{1,25}")
+_YT_KEY_RE = re.compile(r"yt_[A-Za-z0-9_-]{1,64}")
 
 # (game_id, limit) -> (monotonic timestamp of last Helix attempt, logins it returned); enforces >= 60s polling.
 _helix_cache: dict[tuple[str | None, int], tuple[float, list[str]]] = {}
@@ -360,6 +367,13 @@ def streamlink_cmd(channel: str) -> list[str]:
     return ["streamlink", "--quiet", "--stdout", f"twitch.tv/{channel}", STREAMLINK_QUALITY]
 
 
+def ytdlp_live_cmd(url: str) -> list[str]:
+    return [
+        "yt-dlp", "-q", "--no-part", "-f", "b[height<=1080]/b",
+        "--hls-use-mpegts", *js_runtime_args(), "-o", "-", url,
+    ]
+
+
 def segment_cmd(seg_dir: Path, segment_s: int = SEGMENT_S) -> list[str]:
     """ffmpeg reading mpegts on stdin and writing `<epoch>.ts` segments without re-encoding."""
     return [
@@ -390,22 +404,24 @@ class RollingRecorderPool:
         max_on_demand: int = 1,
         buffer_seconds: int = BUFFER_S,
         popen=subprocess.Popen,
+        source_cmd: Callable[[str], list[str]] = streamlink_cmd,
     ):
         self.buf_root = buf_root
         self.max_hot = max_hot
         self.max_on_demand = max_on_demand
         self.buffer_seconds = buffer_seconds
         self.popen = popen
+        self.source_cmd = source_cmd
         self.recordings: dict[str, _Recording] = {}
         self.holds: dict[str, float] = {}  # channel -> oldest timestamp cleanup must keep
 
     def _start(self, channel: str, on_demand: bool) -> None:
-        if not CHANNEL_RE.fullmatch(channel):
+        if not (CHANNEL_RE.fullmatch(channel) or _YT_KEY_RE.fullmatch(channel)):
             raise ValueError(f"invalid channel name: {channel!r}")
         seg_dir = self.buf_root / channel
         seg_dir.mkdir(parents=True, exist_ok=True)
         # own session: Ctrl+C on the monitor does not hit the recorders, _stop terminates them in order
-        source = self.popen(streamlink_cmd(channel), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        source = self.popen(self.source_cmd(channel), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                             start_new_session=True)
         try:
             sink = self.popen(segment_cmd(seg_dir), stdin=source.stdout, stderr=subprocess.DEVNULL,
@@ -704,11 +720,17 @@ class DiskQueue:
         pending = []
         for job_dir in (self.root / "pending").iterdir():
             try:
-                pending.append((-float(_read_job(job_dir).get("z_score") or 0.0), job_dir.name, job_dir))
+                job = _read_job(job_dir)
+                pending.append((
+                    -float(job.get("z_score") or 0.0),
+                    float(job.get("created_at") or 0.0),
+                    job_dir.name,
+                    job_dir,
+                ))
             except (OSError, ValueError, TypeError, AttributeError) as exc:
                 print(f"[monitor] unreadable job {job_dir.name} rejected: {exc!r}", flush=True)
                 self._move(job_dir, "rejected")
-        for _, _, job_dir in sorted(pending):
+        for *_, job_dir in sorted(pending):
             try:
                 job = _read_job(job_dir)
                 job["status"] = "processing"
@@ -860,56 +882,6 @@ class _CoordSession:
         return self.online
 
 
-def _write_json_atomic(path: Path, data: dict[str, Any]) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
-
-
-def _policy_status_text(policy: ChannelPolicy, channel: str, ready_at: Any) -> str:
-    if channel and not policy.permits(channel):
-        return "bloqueado pela policy"
-    delay_h = policy.delay_h.get(channel, 0.0)
-    if delay_h > 0 and ready_at is not None:
-        ready_str = datetime.fromtimestamp(float(ready_at), timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-        return f"aguardar ate {ready_str} (delay {delay_h:g}h)"
-    return "liberado"
-
-
-def _format_clip_discord_message(
-    clip: dict[str, Any],
-    clip_id: str,
-    policy_status: str,
-    too_large_path: Path | None = None,
-) -> str:
-    title = str(clip.get("title") or clip_id)
-    hook = str(clip.get("hook_top") or "-")
-    score_val = clip.get("llm_score") if clip.get("llm_score") is not None else clip.get("score")
-    score_txt = f"{score_val}" if score_val is not None else "-"
-    ai_src = str(clip.get("title_source") or clip.get("description_source") or clip.get("llm_reason") or "-")
-    caption = str(clip.get("caption") or "-")
-    desc_long = str(clip.get("description_long") or "-")
-
-    head = (
-        f"**{title}** (`{clip_id}`)\n"
-        f"Gancho: {hook}\n"
-        f"Nota/IA: {score_txt} ({ai_src})\n"
-        f"Legenda: {caption}\n"
-    )
-    tail = f"Policy: {policy_status}\nPara publicar: `publicar {clip_id}`"
-    if too_large_path is not None:
-        tail = f"arquivo grande demais para o Discord: `{too_large_path}`\n" + tail
-
-    budget = 2000 - len(head) - len(tail) - len("Descricao: \n")
-    if budget < 20:
-        desc_part = ""
-    elif len(desc_long) > budget:
-        desc_part = f"Descricao: {desc_long[: max(0, budget - 3)]}...\n"
-    else:
-        desc_part = f"Descricao: {desc_long}\n"
-    return (head + desc_part + tail)[:2000]
-
-
 def _notify_discord_job(
     completed_dir: Path,
     job: dict[str, Any],
@@ -920,115 +892,17 @@ def _notify_discord_job(
     discord_channel_id: str | None = None,
     preview_fn: Callable[..., Path | None] | None = None,
 ) -> None:
-    token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
-    if not token:
-        return
-    target_channel = (discord_channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
-    if not target_channel:
-        return
-
-    client = discord_client
-    if client is None:
-        from .discord_rest import DiscordRest
-
-        client = DiscordRest(token)
-
     out_dir_raw = result.get("output_dir")
-    out_dir = Path(out_dir_raw) if out_dir_raw else None
-    clips_json_path = (out_dir / "clips.json") if out_dir is not None else None
-
-    manifest: dict[str, Any] | None = None
-    if clips_json_path is not None and clips_json_path.is_file():
-        manifest = json.loads(clips_json_path.read_text(encoding="utf-8"))
-        clips = list(manifest.get("clips") or [])
-    else:
-        clips = list(result.get("clips") or [])
-
-    if not clips or all(isinstance(c.get("discord"), dict) and c["discord"].get("message_id") for c in clips):
-        return
-
-    completed_job = _read_job(completed_dir) if (completed_dir / "job.json").is_file() else dict(job)
-    channel_name = str(job.get("channel") or (manifest or {}).get("channel") or "")
-    live_title = str((manifest or {}).get("title") or job.get("title") or job.get("job_id") or channel_name)
-    live_url = str((manifest or {}).get("url") or job.get("url") or "")
-    video_id = str((manifest or {}).get("video_id") or result.get("video_id") or job.get("job_id") or "clip")
-    policy_status = _policy_status_text(policy, channel_name, completed_job.get("ready_at"))
-
-    thread_id = (
-        ((manifest or {}).get("discord") or {}).get("thread_id")
-        or ((completed_job.get("discord") or {}).get("thread_id"))
-        or next(
-            (c["discord"]["thread_id"] for c in clips if isinstance(c.get("discord"), dict) and c["discord"].get("thread_id")),
-            None,
-        )
+    notify_discord(
+        Path(out_dir_raw) if out_dir_raw else None,
+        policy=policy,
+        job_dir=completed_dir,
+        job=job,
+        result=result,
+        discord_client=discord_client,
+        discord_channel_id=discord_channel_id,
+        preview_fn=preview_fn,
     )
-
-    try:
-        if not thread_id:
-            header = f"**{channel_name}** — {live_title}\nClipes: {len(clips)}"
-            if live_url:
-                header += f"\n{live_url}"
-            header_resp = client.post(target_channel, header[:2000])
-            header_msg_id = str(header_resp["id"])
-            thread_name = f"{channel_name} · {live_title[:70]}" if channel_name else live_title[:70]
-            thread_id = str(client.thread_from(target_channel, header_msg_id, thread_name, auto_archive_duration=1440))
-
-            if manifest is not None and clips_json_path is not None:
-                manifest_discord = dict(manifest.get("discord") or {})
-                manifest_discord.update(thread_id=thread_id, header_message_id=header_msg_id)
-                manifest["discord"] = manifest_discord
-                _write_json_atomic(clips_json_path, manifest)
-
-            job_discord = dict(completed_job.get("discord") or {})
-            job_discord.update(thread_id=thread_id, header_message_id=header_msg_id)
-            completed_job["discord"] = job_discord
-            _write_job(completed_dir, completed_job)
-
-        for idx, clip in enumerate(clips, start=1):
-            try:
-                if isinstance(clip.get("discord"), dict) and clip["discord"].get("message_id"):
-                    continue
-                clip_id = str(clip.get("clip_id") or f"{video_id}_c{int(clip.get('index', idx)):02d}")
-                file_rel = clip.get("file")
-                mp4_path = (out_dir / file_rel) if (out_dir is not None and file_rel) else None
-
-                attach_path: Path | None = None
-                too_large_path: Path | None = None
-                if mp4_path is not None and mp4_path.is_file():
-                    preview_impl = preview_fn
-                    if preview_impl is None:
-                        from .previa import preview_for_discord as preview_impl
-                    duration = float(clip.get("rendered_duration") or clip.get("duration") or 60.0)
-                    attach_path = preview_impl(mp4_path, duration, out_dir / ".cache")
-                    if attach_path is None:
-                        too_large_path = mp4_path
-
-                msg_text = _format_clip_discord_message(clip, clip_id, policy_status, too_large_path=too_large_path)
-                msg_resp = client.post(thread_id, msg_text, file=attach_path)
-                msg_id = str(msg_resp["id"])
-
-                clip["discord"] = {"thread_id": thread_id, "message_id": msg_id}
-                if manifest is not None and clips_json_path is not None:
-                    manifest["clips"] = clips
-                    _write_json_atomic(clips_json_path, manifest)
-
-                job_discord = dict(completed_job.get("discord") or {})
-                job_clips = dict(job_discord.get("clips") or {})
-                job_clips[clip_id] = msg_id
-                job_discord["thread_id"] = thread_id
-                job_discord["clips"] = job_clips
-                completed_job["discord"] = job_discord
-                _write_job(completed_dir, completed_job)
-            except Exception as exc:
-                err_text = f"{type(exc).__name__}: {exc}".replace(token, "***")
-                completed_job["discord_error"] = err_text[-500:]
-                _write_job(completed_dir, completed_job)
-                print(f"[discord] falha ao enviar previa ({err_text[-200:]})", flush=True)
-    except Exception as exc:
-        err_text = f"{type(exc).__name__}: {exc}".replace(token, "***")
-        completed_job["discord_error"] = err_text[-500:]
-        _write_job(completed_dir, completed_job)
-        print(f"[discord] falha ao enviar previa ({err_text[-200:]})", flush=True)
 
 
 def run_worker_step(
@@ -1225,258 +1099,42 @@ def follow_live(
     were not already emitted (absolute time, emitted file) survive. `source.mkv` is deleted after
     each window. More than LIVE_MAX_BACKLOG pending windows: the oldest is marked `lost`.
     """
-    channel = _live_channel(url_or_channel)
+    from .acompanhar import Supervisor, parse_alvo
+
     active_policy = policy or ChannelPolicy()
-    if not CHANNEL_RE.fullmatch(channel) or not active_policy.permits(channel):
-        return {"status": "blocked", "jobs": []}
-    url = f"https://www.twitch.tv/{channel}"
-    out_root.mkdir(parents=True, exist_ok=True)
-    min_free = float(os.environ.get("CLIPES_MIN_FREE_GB", "5") if min_free_gb is None else min_free_gb)
-    pad = max_dur / 2
-    queue = DiskQueue(queue_root or out_root / "queue")
-    pool = pool or RollingRecorderPool(queue.root / ".buffer", max_hot=0, max_on_demand=1,
-                                       buffer_seconds=LIVE_WINDOW_S + 2 * step)
-    is_live = is_live or (lambda u: bool(probe_metadata(u).get("is_live")))
-    emitted_path = out_root / f".emitted_{sanitize_id(channel)}.json"
-    jobs: list[str] = []
-
-    live_id: str | None = None
-    cap_fn = capacity_fn
-    ml_fn = max_lives_fn
-    worker_alias = os.environ.get("CLIPES_ALIAS", "").strip()
-    beat_interval = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20")))
-    if coord is not None:
-        from .capacidade import capacity as default_cap, worker_id as get_worker_id
-        from .perfil import max_lives as default_max_lives
-
-        cap_fn = cap_fn or default_cap
-        ml_fn = ml_fn or default_max_lives
-        if not worker_alias:
-            worker_alias = get_worker_id(out_root)
-        cap = cap_fn(out_root)
-        allowed = ml_fn(out_root, cap.get("cpus"))
-        if allowed < 1:
-            return {"status": "not_claimed", "jobs": jobs}
-        sid = stream_id or _resolve_stream_id(channel, probe=probe)
-        if not sid:
-            return {"status": "not_claimed", "jobs": jobs}
-        live_id = f"twitch:{channel}:{sid}"
-        if hasattr(coord, "db") and hasattr(coord, "worker_id"):
-            owned_count = coord.db.lives.count_documents({
-                "_id": {"$ne": live_id},
-                "owner": coord.worker_id,
-                "status": "live",
-            })
-            if owned_count >= allowed:
-                return {"status": "not_claimed", "jobs": jobs}
-        coord.ensure_live(live_id, channel=channel, platform="twitch", stream_id=sid)
-        _wait_claim_sync(30.0 / max(1.0, float(cap.get("score") or 1)), now=now, sleep=sleep)
-        if not coord.claim_live(live_id):
-            return {"status": "not_claimed", "jobs": jobs}
-
-    mongo_offline_until = float("-inf")
-    current_job: list[str | None] = [None]
-    lost_lives: set[str] = set()
-
-    def _coord_active() -> Any | None:
-        if coord is None or live_id is None or now() < mongo_offline_until:
-            return None
-        return coord
-
-    def _on_mongo_err(exc: BaseException) -> None:
-        nonlocal mongo_offline_until
-        mongo_offline_until = now() + MONGO_RECONNECT_S
-        uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
-        print(f"[fila] Mongo indisponivel ({_sanitize_error(exc, uri)}); seguindo local", flush=True)
-
-    def pending() -> list[Path]:
-        found = []
-        for d in (queue.root / "pending").iterdir():
-            try:
-                if _read_job(d).get("channel") == channel:
-                    found.append(d)
-            except (OSError, ValueError):
-                continue
-        return sorted(found, key=lambda d: d.name)
-
-    def live_pipeline(job_dir: Path, root: Path) -> dict[str, Any]:
-        job = _read_job(job_dir)
-        result = pipeline(job_dir, root)
-        vs = job["video_start"]
-        mine = [c for c in result.get("clips") or []
-                if owns(vs + (c["start"] + c["end"]) / 2, job["window_start"], job["window_end"], step, pad, job["last"])]
-        keep = filter_emitted([(vs + c["start"], vs + c["end"]) for c in mine], emitted_path)
-        return {**result, "clips": [c for c, ok in zip(mine, keep) if ok]}
-
-    def close_window(e: float, last: bool) -> None:
-        start_ts = e - LIVE_WINDOW_S
-        job_id = sanitize_id(f"{channel}_{int(e)}")
-        job_dir = queue.root / ".staging" / job_id
-        job_dir.mkdir(parents=True, exist_ok=True)
-        job = {"job_id": job_id, "channel": channel, "url": url, "peak_ts": e, "z_score": 0.0,
-               "created_at": now(), "ready_at": None, "score": None, "status": "pending",
-               "window_start": start_ts, "window_end": e, "last": last, "video_start": start_ts}
-        duration = 0.0
-        try:
-            job["video_start"] = pool.video_start_ts(channel, start_ts, e)
-            pool.freeze_and_concat(channel, start_ts, e, job_dir / "source.mkv")
-            duration = probe_duration(job_dir / "source.mkv")
-        except ValueError:
-            job.update(status="rejected", reject_reason="no_segments")
-        else:
-            if duration < MIN_CLIP_SOURCE_S:
-                job.update(status="rejected", reject_reason="too_short")
-        if job["status"] == "rejected":
-            (job_dir / "source.mkv").unlink(missing_ok=True)
-        (job_dir / "meta.json").write_text(json.dumps(
-            {"id": job_id, "title": f"{channel} - live", "url": url, "extractor": "twitch",
-             "channel": channel, "is_live": False, "duration": duration}, ensure_ascii=False), encoding="utf-8")
-
-        c_active = _coord_active()
-        if c_active is not None and job["status"] != "rejected":
-            mongo_job_id = f"{live_id}:{int(e)}"
-            try:
-                added = c_active.add_job(mongo_job_id, live_id, (start_ts, e), 0.0)
-            except Exception as exc:
-                if not _is_mongo_error(exc):
-                    raise
-                _on_mongo_err(exc)
-                job["coord_synced"] = False
-            else:
-                if not added:
-                    shutil.rmtree(job_dir, ignore_errors=True)
-                    return
-                job.update(live_id=live_id, mongo_job_id=mongo_job_id, coord_synced=True)
-        elif coord is not None:
-            job["coord_synced"] = False
-
-        _write_job(job_dir, job)
-        queue.enqueue(job_dir)
-        jobs.append(job_id)
-        pool.hold(channel, e + step - LIVE_WINDOW_S)
-        backlog = pending()
-        if len(backlog) > LIVE_MAX_BACKLOG:
-            print(f"[live] backlog {len(backlog)} > {LIVE_MAX_BACKLOG}: {backlog[0].name} lost", flush=True)
-            lost_dir = backlog[0]
-            try:
-                lost_job = _read_job(lost_dir)
-            except (OSError, ValueError):
-                lost_job = {}
-            queue.complete(lost_dir, "rejected", {"reject_reason": "lost", "lost": True})
-            c_lost = _coord_active()
-            if c_lost is not None and lost_job.get("mongo_job_id"):
-                try:
-                    if hasattr(c_lost, "mark_job_lost"):
-                        c_lost.mark_job_lost(lost_job["mongo_job_id"])
-                    elif hasattr(c_lost, "db"):
-                        c_lost.db.jobs.update_one(
-                            {
-                                "_id": lost_job["mongo_job_id"],
-                                "owner": c_lost.worker_id,
-                                "status": {"$in": ["pending", "processing"]},
-                            },
-                            {"$set": {"status": "lost", "updated_at": c_lost._dt()}},
-                        )
-                except Exception as exc:
-                    if not _is_mongo_error(exc):
-                        raise
-                    _on_mongo_err(exc)
-
-    def process_one() -> bool:
-        return run_worker_step(
-            queue,
-            out_root,
-            active_policy,
-            live_pipeline,
-            coord=_coord_active(),
-            on_mongo_error=_on_mongo_err,
-            lost_lives=lost_lives,
-            on_job_active=lambda jid: current_job.__setitem__(0, jid),
-        )
-
-    live_ended = False
-    lease_lost = False
-    last_beat = float("-inf")
     try:
-        if not pool.start_on_demand(channel):
-            raise RuntimeError(f"nao foi possivel gravar {channel}")
-        t0 = now()
-        next_e = window_end(t0, step) + step
-        last_check = t0 - LIVE_IS_LIVE_EVERY_S
-        live_ok = True
-        since: dict[str, float] = {}
-        while True:
-            t = now()
-            c_active = _coord_active()
-            if c_active is not None and t - last_beat >= beat_interval:
-                last_beat = t
-                cap_now = cap_fn(out_root) if cap_fn is not None else {"cpus": 1, "score": 1}
-                ml_now = max(1, int(ml_fn(out_root, cap_now.get("cpus")) if ml_fn is not None else 1))
-                razao_now = _read_perfil_razao(out_root, cap_now.get("cpus"))
-                try:
-                    c_active.beat(worker_alias, cap_now, current_job[0], ml_now, razao_now)
-                    renewed = c_active.renew(live_id)
-                except Exception as exc:
-                    if not _is_mongo_error(exc):
-                        raise
-                    _on_mongo_err(exc)
-                else:
-                    if not renewed:
-                        print(f"[fila] lease perdida {live_id}", flush=True)
-                        lost_lives.add(live_id)
-                        if hasattr(pool, "stop_channel"):
-                            pool.stop_channel(channel)
-                        else:
-                            pool.release_on_demand(channel)
-                        lease_lost = True
-                        live_ended = False
-                        break
-            if t - last_check >= LIVE_IS_LIVE_EVERY_S:
-                last_check = t
-                try:
-                    live_ok = is_live(url)
-                except Exception:  # unknown is not an end signal
-                    live_ok = True
-            segs = pool.segments(channel)
-            newest = segs[-1][0] + SEGMENT_S if segs else t0
-            signals = {"exited": not pool.is_recording(channel), "silent": t - newest >= LIVE_NO_SEGMENT_S,
-                       "offline": not live_ok}
-            for k, v in signals.items():
-                if v:
-                    since.setdefault(k, t)
-                else:
-                    since.pop(k, None)
-            if len(since) >= 2 or any(t - v >= LIVE_END_PERSIST_S for v in since.values()):
-                live_ended = True
-                break
-            if t >= next_e:
-                if disk_usage(out_root).free < min_free * 1e9:
-                    print("[live] janela pulada: disco", flush=True)
-                else:
-                    close_window(float(next_e), last=False)
-                next_e += step
-                continue
-            if not (pending() and process_one()):
-                sleep(1.0)
-            pool.cleanup(t)
-        if not lease_lost:
-            # end: close the tail (>= MIN_CLIP_SOURCE_S past the last boundary), then drain this live's queue
-            segs = pool.segments(channel)
-            e = min(now(), segs[-1][0] + SEGMENT_S) if segs else 0.0
-            if e - (next_e - step) >= MIN_CLIP_SOURCE_S:
-                close_window(e, last=True)
-            while pending():
-                process_one()
-    finally:
-        pool.release_hold(channel)
-        pool.release_on_demand(channel)
-        if coord is not None and live_id is not None:
-            try:
-                coord.release(live_id, live_ended)
-            except Exception as exc:
-                if not _is_mongo_error(exc):
-                    raise
-    return {"status": "lease_lost" if lease_lost else "ended", "jobs": jobs}
+        alvo = parse_alvo(url_or_channel)
+    except ValueError:
+        return {"status": "blocked", "jobs": []}
+    if alvo.plataforma == "twitch" and not active_policy.permits(alvo.canal):
+        return {"status": "blocked", "jobs": []}
+
+    sup = Supervisor(
+        [alvo],
+        out_root,
+        queue_root=queue_root,
+        pool=pool,
+        pipeline=pipeline,
+        is_live=is_live,
+        probe=None if probe is probe_metadata else probe,
+        coord=coord,
+        now=now,
+        sleep=sleep,
+        disk_usage=disk_usage,
+        step=step,
+        max_dur=max_dur,
+        min_free_gb=min_free_gb,
+        policy=active_policy,
+        stream_id=stream_id,
+        capacity_fn=capacity_fn,
+        max_lives_fn=max_lives_fn,
+        reraise_start_error=True,
+    )
+    res = sup.run()
+    if res["status"] == "not_claimed":
+        motivo = res.get("reason") or "recusada"
+        print(f"[live] nao acompanhada {alvo.canal}: {motivo}", flush=True)
+    return {"status": res["status"], "jobs": res["jobs"]}
 
 
 # --- main loop and `python -m clipes monitor` entrypoint ------------------------------------------
@@ -1653,9 +1311,11 @@ async def run_monitor(
                 return True
             cap, ml = await _current_limits_async()
             if len(owned_lives) >= ml:
+                print(f"[live] nao acompanhada {channel}: limite max_lives={ml}", flush=True)
                 return False
             sid = await asyncio.to_thread(_resolve_stream_id, channel, stream_ids, probe)
             if not sid:
+                print(f"[live] nao acompanhada {channel}: stream_id indisponivel", flush=True)
                 claim_retry_at[channel] = now() + 30.0
                 return False
             live_id = f"twitch:{channel}:{sid}"
@@ -1678,6 +1338,7 @@ async def run_monitor(
             if channel in owned_lives:
                 return True
             if len(owned_lives) >= ml:
+                print(f"[live] nao acompanhada {channel}: limite max_lives={ml}", flush=True)
                 return False
             try:
                 claimed = await asyncio.to_thread(active_coord.claim_live, live_id)
@@ -1690,6 +1351,7 @@ async def run_monitor(
                 owned_lives[channel] = live_id
                 lost_lives.discard(live_id)
                 return True
+            print(f"[live] nao acompanhada {channel}: lease com outro PC", flush=True)
             claim_retry_at[channel] = now() + 30.0
             return False
         finally:

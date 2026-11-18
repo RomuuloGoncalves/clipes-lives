@@ -74,6 +74,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 COPY pyproject.toml /app/pyproject.toml
 COPY clipes /app/clipes
 COPY tests /app/tests
+COPY assets /app/assets
 
 RUN mkdir -p /cache /out && chmod -R 0777 /cache /out
 

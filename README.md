@@ -84,6 +84,13 @@ Detecção (`--mode`): `peaks` usa só os picos de áudio/chat/heatmap; `quota` 
 Variáveis de ambiente de renderização:
 
 - `CLIPES_BLUR_BG` (padrão `0`): por padrão o vídeo 16:9 fica centralizado sobre barras pretas; `1` liga o fundo borrado (`split`/`boxblur`/`overlay`), que consome mais CPU.
+- Barra fixa de marca no topo (`1080xH`):
+  - `CLIPES_BAR`: liga automaticamente quando `CLIPES_BRAND_NAME` está definido; use `0` para desligar ou `1` para ligar só com o título (sem nome/handle).
+  - `CLIPES_BRAND_NAME`: `@handle` do canal (ex.: `@cortes_lr1`; o `@` é adicionado se faltar).
+  - `CLIPES_BRAND_DISPLAY`: nome de exibição em negrito ao lado do avatar (ex.: `CortesLR`); se vazio, mostra só o handle.
+  - `CLIPES_BRAND_LOGO`: caminho do logo **dentro do contêiner** (padrão `/app/assets/logo.jpg`; para usar outro arquivo, coloque em `~/.config/clipes-lives/` e aponte para `/config/<arquivo>`). Se o arquivo não existir, a barra renderiza apenas o texto.
+  - `CLIPES_BAR_STYLE`: `claro` (padrão; fundo branco, texto preto, handle cinza) ou `escuro` (fundo preto, texto branco, handle cinza-claro).
+  - `CLIPES_BAR_H`: altura da barra em pixels (padrão `420`, aceito de `300` a `600`).
 
 Se um vídeo ou live contínua (ex.: só música) não gerar picos/clipes válidos, o pipeline encerra normalmente (código `0`), grava `clips.json` vazio com o motivo e imprime aviso claro.
 
@@ -171,10 +178,13 @@ processors=12
 
 ### 4. Calibração (`bench-live`) e live contínua (`--ate-acabar`)
 
-Antes de permitir mais de 1 live simultânea (`max_lives`) em um PC, meça a razão de processamento em uma pasta de job já gravada com `source.mkv` de pelo menos 300 s:
+Antes de permitir mais de 1 live simultânea (`max_lives`) em um PC, grave uma amostra de live de 6 minutos (mínimo 300 s) e rode o `bench-live`:
 
 ```sh
-docker compose run --rm clipes bench-live /out/queue/done/<job_id>
+./clipar "https://www.twitch.tv/<canal>" --live-minutes 6
+mkdir -p out/_bench
+cp "out/<pasta_da_live>/.cache/live_source.mkv" out/_bench/source.mkv
+./clipar bench-live /out/_bench
 ```
 
 O comando grava `OUT_DIR/.perfil.json` (`razao`, `cpus`) e calcula `max_lives = max(1, floor(0.6 / razao))`. Sem o arquivo (ou se `cpus` mudar), o limite permanece `1`.
@@ -185,6 +195,22 @@ Para clipar uma live em janelas alinhadas de 10 min a cada 5 min até ela acabar
 ./clipar "https://www.twitch.tv/<canal>" --ate-acabar
 ./clipar monitor --follow <canal>
 ```
+
+#### Multi-live (`acompanhar`)
+
+Para acompanhar duas ou mais lives (Twitch e YouTube) no mesmo processo, com uma fila única e um worker sequencial:
+
+```sh
+./clipar acompanhar gaules "https://www.youtube.com/@canal/live"
+```
+
+Formatos aceitos: `<canal>`, `twitch.tv/<canal>`, `youtube.com/@<handle>/live`, `youtube.com/watch?v=<id>` e `youtu.be/<id>`. Alvos repetidos são unificados e alvos offline no início são ignorados.
+
+- **Limite simultâneo (`CLIPES_MAX_LIVES`)**: se `CLIPES_MAX_LIVES` for um inteiro `>= 1`, ele define o máximo de lives gravando ao mesmo tempo; caso contrário vale o resultado de `bench-live` em `OUT_DIR/.perfil.json` (ou `1` sem medição).
+- **Recusa visível e fila de espera**: lives acima do limite (ou com lease ocupada por outro PC no Mongo) ficam em `aguardando` na ordem dos argumentos e começam assim que uma vaga abre. Cada recusa aparece no log (`[acompanhar] recusada ...`) e é enviada uma vez para o `DISCORD_CHANNEL_ID`. Janelas descartadas por backlog também avisam no Discord.
+- **Disco por live**: cada gravador mantém cerca de 20 minutos de buffer em `queue/.buffer/` (~900 MB por live a 6 Mb/s). `CLIPES_MIN_FREE_GB` evita fechar novas janelas quando o disco aperta, mas não limita o buffer em andamento.
+- **YouTube (experimental)**: a gravação de lives do YouTube usa `yt-dlp -f "b[height<=1080]/b" --hls-use-mpegts -o -` sem chat. Se alguma live não entregar formato muxado via `yt-dlp`, o plano B é testar `streamlink <url> best`.
+- **Smoke manual**: rode 1 live da Twitch + 1 live do YouTube com `CLIPES_MAX_LIVES=2` por ~15 minutos (`./clipar acompanhar <twitch> <youtube>`) e confira nos logs e na fila que janelas das duas lives são geradas sem dois jobs simultâneos em `processing/`.
 
 ### 5. Consultas de diagnóstico e purga (MongoDB Compass / `mongosh`)
 
