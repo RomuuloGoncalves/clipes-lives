@@ -65,11 +65,114 @@ Em `${OUT_DIR:-~/Downloads/clipes-lives}/<AAAA-MM-DD - Título [id]>/` (reaprove
 - `clips.json` (score, sinais que dispararam, início/fim, título, transcrição e métricas)
 - `README.md` (resumo da execução)
 
+## Configuração fora do repositório (`segredos.env`)
+
+Credenciais, tokens e URIs **nunca** entram no repositório. Crie `~/.config/clipes-lives/segredos.env` com permissão `600` (o `./clipar` carrega esse arquivo automaticamente e avisa se o modo não for `600`):
+
+```sh
+mkdir -p ~/.config/clipes-lives
+chmod 700 ~/.config/clipes-lives
+touch ~/.config/clipes-lives/segredos.env
+chmod 600 ~/.config/clipes-lives/segredos.env
+```
+
+Exemplo fictício de variáveis aceitas no `segredos.env` (use apenas as que for utilizar):
+
+```sh
+# Fila multi-PC (opcional; sem ela cada PC usa fila local em disco)
+CLIPES_MONGO_URI="mongodb+srv://workers:<SENHA_FORTE>@<CLUSTER_FICTICIO>.mongodb.net/clipes_lives"
+CLIPES_ALIAS="PC-1"
+
+# Discord e publicação privada (opcional)
+DISCORD_BOT_TOKEN="<TOKEN_DO_BOT>"
+DISCORD_GUILD_ID="<ID_DO_SERVIDOR>"
+DISCORD_CHANNEL_ID="<ID_DO_CANAL>"
+DISCORD_ALLOWED_USER_IDS="<ID_USUARIO_1>,<ID_USUARIO_2>"
+YOUTUBE_CLIENT_ID="<GOOGLE_CLIENT_ID>"
+YOUTUBE_CLIENT_SECRET="<GOOGLE_CLIENT_SECRET>"
+TIKTOK_CLIENT_KEY="<TIKTOK_CLIENT_KEY>"
+TIKTOK_CLIENT_SECRET="<TIKTOK_CLIENT_SECRET>"
+```
+
+O arquivo `~/.config/clipes-lives/tokens.json` (modo `600`) é montado em `/config` nos serviços `clipes` e `bot` do `docker-compose.yml` (personalizável via `CLIPES_CONFIG_DIR`).
+
+## Operação Multi-PC, Painel na Vercel e Live Contínua
+
+### 1. MongoDB Atlas M0 (coordenação sem vídeo)
+
+O MongoDB coordena apenas quem grava cada live, o estado dos jobs, o heartbeat dos PCs e comandos do painel — nenhum vídeo passa pelo banco. Sem `CLIPES_MONGO_URI`, cada PC opera localmente com `DiskQueue`.
+
+1. Crie um cluster gratuito **Atlas M0** com o banco `clipes_lives`.
+2. Em **Network Access**, adicione `0.0.0.0/0` (necessário para PCs com IP residencial dinâmico e funções serverless da Vercel), protegendo o acesso com senhas fortes.
+3. Em **Database Access**, crie dois usuários com permissão mínima:
+   - `workers`: permissão `readWrite` apenas nas coleções `lives`, `jobs`, `workers` e `commands`.
+   - `painel`: role customizada com leitura (`find`) em `lives`, `jobs`, `workers` e `insert`/`update` apenas na coleção `commands`.
+4. No `segredos.env` de cada máquina, defina `CLIPES_MONGO_URI` com o usuário `workers` e um apelido distinto em `CLIPES_ALIAS` (ex.: `PC-1`, `PC-2`, `PC-3`).
+
+> O Atlas M0 pausa automaticamente após 30 dias sem conexões; se o Mongo ficar fora do ar, os PCs seguem processando na fila local e tentam reconectar a cada 60 s.
+
+### 2. Painel de monitoramento na Vercel (`painel/`)
+
+1. Importe o repositório na Vercel definindo o **Root Directory** como `painel`.
+2. Configure as variáveis de ambiente do projeto na Vercel:
+   - `PAINEL_SENHA`: senha forte usada no Basic Auth.
+   - `PAINEL_MONGO_URI`: connection string do usuário `painel` (menor privilégio).
+   - Opcionais: `PAINEL_MONGO_DB` (padrão `clipes_lives`) e `CLIPES_BEAT_S` (padrão `20`).
+3. O painel atualiza a cada 10 s mostrando status online/offline, CPU, RAM, disco livre, temperatura (`n/d` sem sensor), GPU, job atual, `max_lives` e o botão **liberar recursos** (exige confirmação e digitar `LIBERAR`, encerrando subprocessos e saindo com código `75` para o `./clipar` reiniciar o ciclo após `CLIPES_RESTART_S=60`).
+
+### 3. Windows (Docker Desktop + WSL2)
+
+Nos PCs com Windows (ex.: `PC-2` e `PC-3`):
+
+1. Instale o **Docker Desktop** usando o backend **WSL2**.
+2. Crie `%UserProfile%\.wslconfig` para limitar RAM e núcleos da VM (ajuste ao hardware da máquina) e reinicie o WSL com `wsl --shutdown`:
+
+```ini
+[wsl2]
+memory=10GB
+processors=12
+```
+
+3. Execute o `./clipar` a partir de uma distro Linux dentro do WSL2, mantendo `OUT_DIR` dentro do sistema de arquivos da distro (evite `/mnt/c` pelo impacto em I/O).
+4. O contêiner no WSL2 não enxerga sensores térmicos do host Windows: o `./clipar` imprime o aviso de `sem-sensor` e continua sem alterar limites, e o painel exibe `n/d` na temperatura.
+
+### 4. Calibração (`bench-live`) e live contínua (`--ate-acabar`)
+
+Antes de permitir mais de 1 live simultânea (`max_lives`) em um PC, meça a razão de processamento em uma pasta de job já gravada com `source.mkv` de pelo menos 300 s:
+
+```sh
+docker compose run --rm clipes bench-live /out/queue/done/<job_id>
+```
+
+O comando grava `OUT_DIR/.perfil.json` (`razao`, `cpus`) e calcula `max_lives = max(1, floor(0.6 / razao))`. Sem o arquivo (ou se `cpus` mudar), o limite permanece `1`.
+
+Para clipar uma live em janelas alinhadas de 10 min a cada 5 min até ela acabar (respeitando `CLIPES_MIN_FREE_GB=5` de disco livre):
+
+```sh
+./clipar "https://www.twitch.tv/<canal>" --ate-acabar
+./clipar monitor --follow <canal>
+```
+
+### 5. Consultas de diagnóstico e purga (MongoDB Compass / `mongosh`)
+
+Para rodar manualmente no `mongosh` do MongoDB Compass (nunca automatize acesso ao banco em scripts ou agentes):
+
+```js
+// Diagnóstico: PCs, lives ativas, contagem de jobs (24 h) e comandos pendentes
+db.workers.find({}, { alias: 1, heartbeat_at: 1, job_atual: 1, max_lives: 1, "capacity.temp_c": 1, "capacity.disco_livre_gb": 1 }).sort({ heartbeat_at: -1 });
+db.lives.find({ status: "live" }).sort({ lease_until: 1 });
+db.jobs.aggregate([{ $match: { updated_at: { $gte: new Date(Date.now() - 86400000) } } }, { $group: { _id: "$status", total: { $sum: 1 } } }]);
+db.commands.find({ status: { $in: ["pending", "executando"] } }).sort({ criado_em: -1 });
+
+// Purga: conferir e remover jobs/comandos finalizados há mais de 30 dias (limite de 0,5 GB do M0)
+db.jobs.countDocuments({ status: { $in: ["done", "rejected", "lost", "failed"] }, updated_at: { $lt: new Date(Date.now() - 30 * 86400000) } });
+db.jobs.deleteMany({ status: { $in: ["done", "rejected", "lost", "failed"] }, updated_at: { $lt: new Date(Date.now() - 30 * 86400000) } });
+db.commands.deleteMany({ status: { $in: ["feito", "rejeitado"] }, criado_em: { $lt: new Date(Date.now() - 30 * 86400000) } });
+```
+
 ## Bot do Discord e Publicação Privada
 
-O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`).
-
-Todos os segredos ficam fora do repositório, em `~/.config/clipes-lives/segredos.env` (permissão `600`, lido automaticamente pelo `./clipar`) e `~/.config/clipes-lives/tokens.json` (montado em `/config` nos serviços `clipes` e `bot`).
+O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`), usando as variáveis definidas em `segredos.env` e os tokens gravados em `/config/tokens.json`.
 
 ### 1. Discord Developer Portal
 
@@ -81,11 +184,9 @@ Todos os segredos ficam fora do repositório, em `~/.config/clipes-lives/segredo
    - **Scopes**: marque `bot` e `applications.commands`.
    - **Bot Permissions**: marque `View Channels`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Attach Files`, `Embed Links`, `Read Message History`, `Add Reactions` e `Use Slash Commands`.
    - Abra a URL gerada e autorize o bot no seu servidor.
-4. No `segredos.env` (nunca no repositório), defina os IDs obtidos no Discord (Modo Desenvolvedor):
-   - `DISCORD_GUILD_ID=<ID_DO_SERVIDOR>`
-   - `DISCORD_CHANNEL_ID=<ID_DO_CANAL>`
-   - `DISCORD_ALLOWED_USER_IDS=<ID_USUARIO_1,ID_USUARIO_2>` (lista vazia bloqueia todas as publicações por segurança)
-   - `CLIPES_DISCORD_MAX_MB=10` (opcional; prévia é recomprimida para 720x1280 se passar de 90% do limite, preservando o original 1080x1920)
+4. No `segredos.env` (obtidos pelo Modo Desenvolvedor do Discord):
+   - `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` e `DISCORD_ALLOWED_USER_IDS` (lista vazia bloqueia todas as publicações por segurança).
+   - `CLIPES_DISCORD_MAX_MB=10` (opcional; prévia é recomprimida para 720x1280 se passar de 90% do limite, preservando o original 1080x1920).
 
 ### 2. Google Cloud (YouTube Data API v3)
 
