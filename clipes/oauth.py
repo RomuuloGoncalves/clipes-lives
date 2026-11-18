@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 DEFAULT_TOKENS_PATH = Path("/config/tokens.json")
+DEFAULT_OAUTH_HOST = "127.0.0.1"
 DEFAULT_OAUTH_PORT = 8765
 
 GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
@@ -147,10 +148,11 @@ def refresh_google(
     client_id: str | None = None,
     client_secret: str | None = None,
     tokens_path: Path | None = None,
-    urlopen: Callable[..., Any] = urllib.request.urlopen,
+    urlopen: Callable[..., Any] | None = None,
     timeout: float = 30.0,
 ) -> str:
     """Exchange Google refresh_token for a new access_token."""
+    opener = urlopen if urlopen is not None else urllib.request.urlopen
     tokens = load_tokens(tokens_path) if refresh_token is None else None
     rtok = (refresh_token or (tokens or {}).get("youtube", {}).get("refresh_token") or "").strip()
     if not rtok:
@@ -165,7 +167,7 @@ def refresh_google(
             "refresh_token": rtok,
             "grant_type": "refresh_token",
         },
-        urlopen=urlopen,
+        urlopen=opener,
         timeout=timeout,
         secrets_to_scrub=[csec, rtok],
     )
@@ -190,10 +192,11 @@ def refresh_tiktok(
     client_key: str | None = None,
     client_secret: str | None = None,
     tokens_path: Path | None = None,
-    urlopen: Callable[..., Any] = urllib.request.urlopen,
+    urlopen: Callable[..., Any] | None = None,
     timeout: float = 30.0,
 ) -> str:
     """Exchange TikTok refresh_token for a new access_token and persist rotated refresh_token."""
+    opener = urlopen if urlopen is not None else urllib.request.urlopen
     tokens = load_tokens(tokens_path) if refresh_token is None else None
     rtok = (refresh_token or (tokens or {}).get("tiktok", {}).get("refresh_token") or "").strip()
     if not rtok:
@@ -208,7 +211,7 @@ def refresh_tiktok(
             "grant_type": "refresh_token",
             "refresh_token": rtok,
         },
-        urlopen=urlopen,
+        urlopen=opener,
         timeout=timeout,
         secrets_to_scrub=[csec, rtok],
     )
@@ -244,7 +247,10 @@ def _parse_callback_result(raw: Any) -> dict[str, str]:
     raise OAuthError("Invalid OAuth callback payload")
 
 
-def _listen_local_callback(port: int) -> tuple[http.server.HTTPServer, dict[str, str], threading.Thread]:
+def _listen_local_callback(
+    port: int,
+    host: str = DEFAULT_OAUTH_HOST,
+) -> tuple[http.server.HTTPServer, dict[str, str], threading.Thread]:
     captured: dict[str, str] = {}
 
     class _Handler(http.server.BaseHTTPRequestHandler):
@@ -262,7 +268,7 @@ def _listen_local_callback(port: int) -> tuple[http.server.HTTPServer, dict[str,
         def log_message(self, format: str, *args: Any) -> None:
             return
 
-    server = http.server.HTTPServer(("127.0.0.1", port), _Handler)
+    server = http.server.HTTPServer((host, port), _Handler)
     thread = threading.Thread(target=server.handle_request, daemon=True)
     thread.start()
     return server, captured, thread
@@ -296,14 +302,16 @@ def auth_flow(
     serve: Callable[..., Any] | None = None,
     *,
     port: int | None = None,
+    bind_host: str | None = None,
     client_id: str | None = None,
     client_secret: str | None = None,
     tokens_path: Path | None = None,
-    urlopen: Callable[..., Any] = urllib.request.urlopen,
+    urlopen: Callable[..., Any] | None = None,
     printer: Callable[[str], Any] = print,
     timeout: float = 180.0,
 ) -> Path:
     """Run local OAuth authorization flow and persist refresh token atomically with mode 0600."""
+    opener = urlopen if urlopen is not None else urllib.request.urlopen
     plat = (plataforma or "").strip().lower()
     if plat not in ("youtube", "tiktok"):
         raise ValueError(f"Unsupported OAuth platform: {plataforma}")
@@ -328,7 +336,8 @@ def auth_flow(
     else:
         raw_port = os.environ.get("CLIPES_OAUTH_PORT", "").strip()
         eff_port = port if port is not None else (int(raw_port) if raw_port else DEFAULT_OAUTH_PORT)
-        server, captured, thread = _listen_local_callback(eff_port)
+        eff_host = (bind_host or os.environ.get("CLIPES_OAUTH_BIND") or DEFAULT_OAUTH_HOST).strip() or DEFAULT_OAUTH_HOST
+        server, captured, thread = _listen_local_callback(eff_port, host=eff_host)
         try:
             redirect_uri = f"http://127.0.0.1:{server.server_port}/callback"
             auth_url = _build_auth_url(plat, cid, redirect_uri, state)
@@ -363,7 +372,7 @@ def auth_flow(
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
             },
-            urlopen=urlopen,
+            urlopen=opener,
             timeout=30.0,
             secrets_to_scrub=[csec, code],
         )
@@ -381,7 +390,7 @@ def auth_flow(
                 "redirect_uri": redirect_uri,
                 "grant_type": "authorization_code",
             },
-            urlopen=urlopen,
+            urlopen=opener,
             timeout=30.0,
             secrets_to_scrub=[csec, code],
         )

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
+import tempfile
+import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -19,6 +23,10 @@ QUOTA_ENV_KEYS: dict[str, str] = {"youtube": "CLIPES_YT_MAX_DIA", "tiktok": "CLI
 DEFAULT_TOKENS_PATH = Path("/config/tokens.json")
 WORKER_STALE_S = 180.0
 _UPLOAD_URL_RE = re.compile(r"https?://[^\s'\"<>]*upload[^\s'\"<>]*", re.IGNORECASE)
+_HTTP_401_RE = re.compile(r"(?:^|\b(?:http(?:/[\d.]+)?|status|code|erro|error)\s*[:=]?\s*|\()401(?:\b|\))")
+_ACTIVE_REQUEST_STATUSES: tuple[str, ...] = ("ok", "pending", "running")
+_PATH_LOCKS_GUARD = threading.Lock()
+_PATH_LOCKS: dict[Path, threading.Lock] = {}
 
 
 def _now_ts(now: Callable[[], float] | float | None) -> float:
@@ -37,13 +45,40 @@ def _json_default(obj: Any) -> str:
     raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
 
+@contextmanager
+def _locked_path(path: Path) -> Iterator[None]:
+    """Serialize read-modify-write across threads and processes for `path`."""
+    resolved = path.resolve()
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.setdefault(resolved, threading.Lock())
+    with lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = path.with_name(f".{path.name}.lock")
+        with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+            fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+
+
 def _atomic_write_json(path: Path, payload: Any, mode: int | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.tmp.{os.getpid()}")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default), encoding="utf-8")
-    if mode is not None:
-        os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    text = json.dumps(payload, ensure_ascii=False, indent=2, default=_json_default)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.tmp.", suffix=".json", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        if mode is not None:
+            os.fchmod(fd, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if mode is not None:
+            os.chmod(tmp_path, mode)
+        tmp_path.replace(path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
 
 def _read_json(path: Path, default: Any) -> Any:
@@ -150,13 +185,14 @@ def _record_quota(
 ) -> None:
     day = _dt(now_ts).strftime("%Y-%m-%d")
     path = _resolve_quota_path(quota_path, out_root)
-    data = _read_json(path, {})
-    if not isinstance(data, dict):
-        data = {}
-    day_counts = dict(data.get(day) or {})
-    day_counts[plataforma] = int(day_counts.get(plataforma, 0)) + 1
-    data[day] = day_counts
-    _atomic_write_json(path, data)
+    with _locked_path(path):
+        data = _read_json(path, {})
+        if not isinstance(data, dict):
+            data = {}
+        day_counts = dict(data.get(day) or {})
+        day_counts[plataforma] = int(day_counts.get(plataforma, 0)) + 1
+        data[day] = day_counts
+        _atomic_write_json(path, data)
 
 
 def _extract_channel(manifest: dict[str, Any], clip: dict[str, Any], job: dict[str, Any] | None) -> str:
@@ -252,15 +288,16 @@ class LocalStore:
         return self._load()["requests"].get(req_id)
 
     def enqueue_request(self, doc: dict[str, Any]) -> tuple[dict[str, Any], bool]:
-        data = self._load()
         req_id = doc["_id"]
-        existing = data["requests"].get(req_id)
-        if existing is not None and existing.get("status") in ("ok", "pending"):
-            return existing, False
-        stored = dict(doc)
-        data["requests"][req_id] = stored
-        self._save(data)
-        return stored, True
+        with _locked_path(self.path):
+            data = self._load()
+            existing = data["requests"].get(req_id)
+            if existing is not None and existing.get("status") in _ACTIVE_REQUEST_STATUSES:
+                return existing, False
+            stored = dict(doc)
+            data["requests"][req_id] = stored
+            self._save(data)
+            return stored, True
 
     def find_pending(self, worker_id: str | None = None) -> list[dict[str, Any]]:
         reqs = self._load()["requests"].values()
@@ -271,13 +308,27 @@ class LocalStore:
         ]
         return sorted(out, key=lambda r: str(r.get("criado_em") or ""))
 
+    def claim_request(self, req_id: str, worker_id: str | None = None) -> dict[str, Any] | None:
+        """Atomically transition a `pending` request to `running`, returning it or None."""
+        with _locked_path(self.path):
+            data = self._load()
+            existing = data["requests"].get(req_id)
+            if existing is None or existing.get("status") != "pending":
+                return None
+            if worker_id is not None and existing.get("owner") != worker_id:
+                return None
+            existing["status"] = "running"
+            self._save(data)
+            return dict(existing)
+
     def update_request(self, req_id: str, fields: dict[str, Any]) -> None:
-        data = self._load()
-        existing = data["requests"].get(req_id)
-        if existing is None:
-            return
-        existing.update(fields)
-        self._save(data)
+        with _locked_path(self.path):
+            data = self._load()
+            existing = data["requests"].get(req_id)
+            if existing is None:
+                return
+            existing.update(fields)
+            self._save(data)
 
     def worker_status(self, owner: str | None, now_ts: float, stale_s: float = WORKER_STALE_S) -> tuple[bool, str]:
         return True, (owner or "local")
@@ -299,13 +350,22 @@ class MongoStore:
         return self.db.publish_requests.find_one({"_id": f"{clip_id}:{plataforma}"})
 
     def enqueue_request(self, doc: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+        from pymongo import ReturnDocument
+
         req_id = doc["_id"]
         existing = self.db.publish_requests.find_one({"_id": req_id})
-        if existing is not None and existing.get("status") in ("ok", "pending"):
+        if existing is not None and existing.get("status") in _ACTIVE_REQUEST_STATUSES:
             return existing, False
         if existing is not None:
-            self.db.publish_requests.update_one({"_id": req_id}, {"$set": doc})
-            return dict(doc), True
+            updated = self.db.publish_requests.find_one_and_update(
+                {"_id": req_id, "status": {"$nin": list(_ACTIVE_REQUEST_STATUSES)}},
+                {"$set": doc},
+                return_document=ReturnDocument.AFTER,
+            )
+            if updated is not None:
+                return updated, True
+            found = self.db.publish_requests.find_one({"_id": req_id})
+            return (found or dict(doc)), False
         try:
             self.db.publish_requests.insert_one(dict(doc))
             return dict(doc), True
@@ -320,6 +380,19 @@ class MongoStore:
         if worker_id is not None:
             query["owner"] = worker_id
         return list(self.db.publish_requests.find(query).sort("criado_em", 1))
+
+    def claim_request(self, req_id: str, worker_id: str | None = None) -> dict[str, Any] | None:
+        """Atomically transition a `pending` request to `running`, returning it or None."""
+        from pymongo import ReturnDocument
+
+        query: dict[str, Any] = {"_id": req_id, "status": "pending"}
+        if worker_id is not None:
+            query["owner"] = worker_id
+        return self.db.publish_requests.find_one_and_update(
+            query,
+            {"$set": {"status": "running"}},
+            return_document=ReturnDocument.AFTER,
+        )
 
     def update_request(self, req_id: str, fields: dict[str, Any]) -> None:
         self.db.publish_requests.update_one({"_id": req_id}, {"$set": fields})
@@ -492,7 +565,7 @@ def request(
     now_ts = _now_ts(now)
     pol = _resolve_policy(policy, policy_path, root)
     channel = found.get("channel") or ""
-    if channel and not pol.permits(channel):
+    if not pol.permits(channel):
         return "bloqueado pela politica"
 
     ready_at = _effective_ready_at(found, pol)
@@ -553,16 +626,24 @@ def request(
     return "\n".join(messages) if messages else "nenhuma plataforma configurada"
 
 
-def _default_refresh(plataforma: str, plat_tokens: dict[str, Any]) -> dict[str, Any]:
+def _default_refresh(
+    plataforma: str,
+    plat_tokens: dict[str, Any],
+    *,
+    tokens_path: Path | str | None = None,
+) -> dict[str, Any]:
     refresh_tok = plat_tokens.get("refresh_token")
     if not refresh_tok:
         raise RuntimeError(f"missing refresh_token for {plataforma}")
     from . import oauth  # lazy: module from T4
 
+    resolved_tokens = Path(tokens_path) if tokens_path is not None else None
     if plataforma == "youtube":
-        return oauth.refresh_google(refresh_tok)
+        access_token = oauth.refresh_google(refresh_tok, tokens_path=resolved_tokens)
+        return {"access_token": access_token}
     if plataforma == "tiktok":
-        return oauth.refresh_tiktok(refresh_tok)
+        access_token = oauth.refresh_tiktok(refresh_tok, tokens_path=resolved_tokens)
+        return {"access_token": access_token}
     raise ValueError(f"unknown platform: {plataforma}")
 
 
@@ -602,7 +683,7 @@ def _is_401_error(exc: BaseException) -> bool:
     if getattr(exc, "kind", None) == "erro_auth":
         return True
     text = str(exc).lower()
-    return "401" in text or "unauthorized" in text or "invalid_token" in text
+    return bool(_HTTP_401_RE.search(text)) or "unauthorized" in text or "invalid_token" in text
 
 
 def _is_account_error(exc: BaseException) -> bool:
@@ -615,28 +696,29 @@ def _is_account_error(exc: BaseException) -> bool:
 def _record_clip_publication(clips_json_path: Path | None, clip_id: str, pub_entry: dict[str, Any]) -> None:
     if clips_json_path is None or not clips_json_path.is_file():
         return
-    manifest = _read_json(clips_json_path, None)
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("clips"), list):
-        return
-    updated = False
-    for entry in manifest["clips"]:
-        if not isinstance(entry, dict):
-            continue
-        eid = entry.get("clip_id") or (
-            f"{manifest.get('video_id')}_c{int(entry['index']):02d}"
-            if manifest.get("video_id") and entry.get("index") is not None
-            else None
-        )
-        if eid != clip_id:
-            continue
-        pubs = list(entry.get("publicacoes") or [])
-        pubs = [p for p in pubs if p.get("plataforma") != pub_entry["plataforma"]]
-        pubs.append(pub_entry)
-        entry["publicacoes"] = pubs
-        updated = True
-        break
-    if updated:
-        _atomic_write_json(clips_json_path, manifest)
+    with _locked_path(clips_json_path):
+        manifest = _read_json(clips_json_path, None)
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("clips"), list):
+            return
+        updated = False
+        for entry in manifest["clips"]:
+            if not isinstance(entry, dict):
+                continue
+            eid = entry.get("clip_id") or (
+                f"{manifest.get('video_id')}_c{int(entry['index']):02d}"
+                if manifest.get("video_id") and entry.get("index") is not None
+                else None
+            )
+            if eid != clip_id:
+                continue
+            pubs = list(entry.get("publicacoes") or [])
+            pubs = [p for p in pubs if p.get("plataforma") != pub_entry["plataforma"]]
+            pubs.append(pub_entry)
+            entry["publicacoes"] = pubs
+            updated = True
+            break
+        if updated:
+            _atomic_write_json(clips_json_path, manifest)
 
 
 def _send_thread_reply(
@@ -678,7 +760,7 @@ def _secret_values(tokens_map: dict[str, Any], extra: Iterable[str] = ()) -> lis
 
 def run_pending(
     store: Any,
-    worker_id: str,
+    worker_id: str | None,
     *,
     out_root: Path | str | None = None,
     now: Callable[[], float] | float | None = None,
@@ -705,6 +787,11 @@ def run_pending(
         clip_id = req["clip_id"]
         plat = req["plataforma"]
         thread_id = req.get("thread_id")
+
+        claim_fn = getattr(adapted, "claim_request", None)
+        if callable(claim_fn):
+            if claim_fn(req_id, worker_id=worker_id) is None:
+                continue
 
         def finish(status: str, resultado: dict[str, Any], reply: str) -> None:
             adapted.update_request(req_id, {
@@ -735,12 +822,13 @@ def run_pending(
             continue
 
         channel = found.get("channel") or ""
-        if channel and not pol.permits(channel):
+        if not pol.permits(channel):
             finish("erro", {"erro": "bloqueado pela politica"}, f"[{plat}] erro: bloqueado pela politica")
             continue
 
         ready_at = _effective_ready_at(found, pol)
         if ready_at is not None and now_ts < ready_at:
+            adapted.update_request(req_id, {"status": "pending"})
             continue
 
         tok_map = _load_tokens(tokens, tokens_path)
@@ -748,14 +836,24 @@ def run_pending(
         secrets = _secret_values(tok_map)
 
         def do_refresh() -> str:
-            ref_fn = (refreshers or {}).get(plat) or (lambda p, t: _default_refresh(p, t))
+            ref_fn = (refreshers or {}).get(plat) or (
+                lambda p, t: _default_refresh(p, t, tokens_path=tokens_path)
+            )
             refreshed = ref_fn(plat, plat_tok)
-            new_access = refreshed.get("access_token")
+            if isinstance(refreshed, str):
+                new_access = refreshed
+                new_refresh = ""
+            elif isinstance(refreshed, dict):
+                new_access = str(refreshed.get("access_token") or "")
+                new_refresh = str(refreshed.get("refresh_token") or "")
+            else:
+                new_access = ""
+                new_refresh = ""
             if not new_access:
                 raise RuntimeError("refresh returned no access_token")
             plat_tok["access_token"] = new_access
-            if refreshed.get("refresh_token"):
-                plat_tok["refresh_token"] = refreshed["refresh_token"]
+            if new_refresh:
+                plat_tok["refresh_token"] = new_refresh
                 tok_map[plat] = plat_tok
                 save_fn(tok_map, tokens_path)
             else:

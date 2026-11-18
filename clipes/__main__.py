@@ -14,6 +14,11 @@ def _auth(argv: list[str]) -> int:
         description="Autoriza o YouTube ou TikTok via OAuth local e salva o token em /config/tokens.json.",
     )
     p.add_argument("plataforma", help="Plataforma OAuth (youtube ou tiktok)")
+    p.add_argument(
+        "--bind",
+        default=None,
+        help="Endereco de bind do callback local (padrao: 127.0.0.1; use 0.0.0.0 dentro do Docker)",
+    )
     args = p.parse_args(argv)
 
     plat = args.plataforma.strip().lower()
@@ -26,7 +31,10 @@ def _auth(argv: list[str]) -> int:
         return 2
 
     try:
-        oauth.auth_flow(plat)
+        if args.bind is not None:
+            oauth.auth_flow(plat, bind_host=args.bind)
+        else:
+            oauth.auth_flow(plat)
     except (oauth.OAuthError, ValueError) as exc:
         print(f"[auth] erro: {exc}", file=sys.stderr, flush=True)
         return 2
