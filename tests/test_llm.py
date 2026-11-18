@@ -666,3 +666,89 @@ def test_long_description_validation_fallback_and_format():
         "Live completa: https://x/v · Parte 2/3\n\n#a #b #c"
     )
     assert "Parte" not in format_long_description("T?", "P.", "c", "u", ["#a"])
+
+
+def _cascade_setup(tmp_path: Path, monkeypatch, cloud, local):
+    """Fakes: cloud/local são callables(prompt) -> dict | None | raise; devolve contadores."""
+    from contextlib import contextmanager
+    from clipes import cloud_llm, llm
+
+    n = {"sessions": 0, "cloud": 0, "local": 0}
+
+    @contextmanager
+    def fake_session(*a, **k):
+        n["sessions"] += 1
+        yield "http://127.0.0.1:19999"
+
+    def fake_cloud(prompt, schema, system_prompt, **k):
+        n["cloud"] += 1
+        r = cloud(prompt)
+        return None if r is None else (r, "cloud:gemini:m1")
+
+    def fake_local(prompt, schema=None, server_url=None, timeout=None, **k):
+        n["local"] += 1
+        return local(prompt)
+
+    monkeypatch.setattr(llm, "llama_server_session", fake_session)
+    monkeypatch.setattr(llm, "complete", fake_local)
+    monkeypatch.setattr(cloud_llm, "complete_cloud", fake_cloud)
+    return n, _make_ing(tmp_path)
+
+
+_GOOD = {
+    "titulo": "Olha isso aqui!",
+    "gancho": "Momento tenso!",
+    "hashtags": ["#cortes", "#livesbr", "#gaming"],
+    "nota": 7,
+    "motivo": "ok",
+    "gancho_topo": "Viu isso?",
+    "descricao_longa": "Olha isso aqui, foi um momento muito engraçado de ver na live. " * 3,
+}
+
+
+def test_enrich_cloud_ok_never_opens_local_session(tmp_path: Path, monkeypatch):
+    from clipes import llm
+    from clipes.models import SnappedClip
+
+    n, ing = _cascade_setup(tmp_path, monkeypatch, lambda p: dict(_GOOD), lambda p: 1 / 0)
+    clips = [SnappedClip(peak=1, start=0, end=30, score=0.9, text="Olha isso aqui, foi um momento muito engraçado de ver na live.") for _ in range(2)]
+    llm.enrich_clips_with_llm(clips, [], ing, enabled=True)
+    assert n == {"sessions": 0, "cloud": 2, "local": 0}
+    c = clips[0]
+    assert c.title_source == "cloud:gemini:m1"
+    assert c.hook_top == "Viu isso?"
+    assert c.description_source == "llm"
+    assert c.description_long.startswith("Olha isso aqui!\n\nOlha isso aqui,")
+    assert c.description_long.endswith(" ".join(c.hashtags))
+
+
+def test_enrich_cascade_cloud_none_to_local_then_heuristic(tmp_path: Path, monkeypatch):
+    from clipes import llm
+    from clipes.models import SnappedClip
+
+    def local(prompt):
+        if "boom" in prompt:
+            raise RuntimeError("falhou")
+        return dict(_GOOD)
+
+    n, ing = _cascade_setup(tmp_path, monkeypatch, lambda p: None, local)
+    ok = SnappedClip(peak=1, start=0, end=30, score=0.9, text="Olha isso aqui, foi um momento muito engraçado de ver na live.")
+    bad = SnappedClip(peak=2, start=40, end=70, score=0.8, text="boom boom")
+    llm.enrich_clips_with_llm([ok, bad], [], ing, enabled=True)
+    assert n["sessions"] == 1 and n["local"] == 2  # sessão lazy única
+    assert ok.title_source == "llm"
+    assert bad.title_source == "heuristic_fallback"
+    assert bad.description_source == "fallback"
+
+
+def test_enrich_cloud_title_echoing_live_is_rejected(tmp_path: Path, monkeypatch):
+    from clipes import llm
+    from clipes.models import SnappedClip
+
+    echo = dict(_GOOD, titulo="Live de GTA RP!")
+    n, ing = _cascade_setup(tmp_path, monkeypatch, lambda p: echo, lambda p: 1 / 0)
+    clip = SnappedClip(peak=1, start=0, end=30, score=0.9, text="Live de GTA RP hoje")
+    llm.enrich_clips_with_llm([clip], [], ing, enabled=True)
+    assert clip.title != "Live de GTA RP!"
+    assert clip.title_source == "heuristic_fallback"
+    assert n["sessions"] == 0
