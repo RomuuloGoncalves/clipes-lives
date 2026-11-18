@@ -16,9 +16,11 @@ class Fake:
     def __init__(self, *outcomes):
         self.outcomes = list(outcomes)
         self.calls = []
+        self.timeouts = []
 
     def __call__(self, req, timeout=None):
         self.calls.append((req.full_url, dict(req.header_items()), req.data))
+        self.timeouts.append(timeout)
         o = self.outcomes.pop(0)
         if isinstance(o, int):
             raise urllib.error.HTTPError(req.full_url, o, "err", {}, io.BytesIO(b""))
@@ -211,3 +213,38 @@ def test_intervalo_minimo_por_chave(cota, monkeypatch):
     cloud_llm.complete_cloud("p", SCHEMA, "s", **kw)
     cloud_llm.complete_cloud("p", SCHEMA, "s", **kw)
     assert esperas == [4.0]
+
+
+def test_timeout_usa_clipes_cloud_timeout_padrao_20s(monkeypatch):
+    monkeypatch.delenv("CLIPES_CLOUD_TIMEOUT", raising=False)
+    monkeypatch.setenv("CLIPES_LLM_TIMEOUT", "60")
+    f_default = Fake({"titulo": "x"})
+    run(f_default)
+    assert f_default.timeouts == [20.0]
+
+    monkeypatch.setenv("CLIPES_CLOUD_TIMEOUT", "12.5")
+    f_custom = Fake({"titulo": "x"})
+    run(f_custom)
+    assert f_custom.timeouts == [12.5]
+
+    for bad in ("invalido", "0", "-5"):
+        monkeypatch.setenv("CLIPES_CLOUD_TIMEOUT", bad)
+        f_bad = Fake({"titulo": "x"})
+        run(f_bad)
+        assert f_bad.timeouts == [20.0]
+
+
+def test_cota_path_usa_set_out_dir_antes_de_out_dir_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_GEMINI_COTA_FILE", raising=False)
+    monkeypatch.setenv("OUT_DIR", str(tmp_path / "env_out"))
+    monkeypatch.setattr(cloud_llm, "_out_dir", None)
+    assert cloud_llm._cota_path() == tmp_path / "env_out" / ".gemini_cota.json"
+
+    custom_dir = tmp_path / "cli_out"
+    cloud_llm.set_out_dir(custom_dir)
+    assert cloud_llm._cota_path() == custom_dir / ".gemini_cota.json"
+
+    # CLIPES_GEMINI_COTA_FILE explícito continua prevalecendo
+    explicit = tmp_path / "explicit.json"
+    monkeypatch.setenv("CLIPES_GEMINI_COTA_FILE", str(explicit))
+    assert cloud_llm._cota_path() == explicit

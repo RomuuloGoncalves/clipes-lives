@@ -808,3 +808,16 @@ def test_enrich_cloud_title_echoing_live_is_rejected(tmp_path: Path, monkeypatch
     assert clip.title != "Live de GTA RP!"
     assert clip.title_source == "heuristic_fallback"
     assert n["sessions"] == 0
+
+
+def test_empty_transcript_does_not_mark_description_source_fallback(tmp_path: Path):
+    from clipes import llm
+    from clipes.models import SnappedClip
+
+    ing = _make_ing(tmp_path)
+    empty_clip = SnappedClip(peak=1, start=0, end=30, score=0.9, text="   ")
+    assert llm.pick_long_description("curta", empty_clip) == ("", "")
+
+    llm.enrich_clips_with_llm([empty_clip], [], ing, enabled=True)
+    assert empty_clip.description_long == ""
+    assert empty_clip.description_source == ""

@@ -250,7 +250,7 @@ def test_cli_skip_render_writes_part_metadata_in_manifest_and_readme(tmp_path: P
     assert manifest["clips"][0]["part_total"] == 2
     assert manifest["clips"][1]["part_index"] == 2
     assert manifest["clips"][0]["group_id"] == manifest["clips"][1]["group_id"] != ""
-    assert manifest["clips"][0]["file"] == "clip_01_part1of2.mp4"
+    assert manifest["clips"][0]["file"] == "clip_01_part1of2_parte-da-historia-completa-aqui0.mp4"
     readme = (vid_dir / "README.md").read_text(encoding="utf-8")
     assert "1/2" in readme and "2/2" in readme
     assert manifest["clips"][0]["group_id"] in readme
@@ -716,9 +716,28 @@ def test_wrap_top_hook():
     escaped = wrap_top_hook(r"O {cara} \sumiu!")
     assert escaped == r"{\c&H00FFFFFF&}O (CARA) SUMIU!"
 
-    # Single word longer than max_chars is clamped <= 18
+    # Single word longer than max_chars is clamped <= 18 with ellipsis
     long_word = wrap_top_hook("INCONSTITUCIONALISSIMAMENTE")
-    assert len(long_word.removeprefix(r"{\c&H00FFFFFF&}")) <= 18
+    long_clean = long_word.removeprefix(r"{\c&H00FFFFFF&}")
+    assert len(long_clean) <= 18
+    assert long_clean.endswith("…")
+
+    # 35-char hook with long words that overflow 2x18 marks truncation with ellipsis instead of silently dropping
+    hook_35 = "Ele descobriu verdade inacreditavel"
+    assert len(hook_35) == 35
+    wrapped_35 = wrap_top_hook(hook_35)
+    assert wrapped_35 == r"{\c&H00FFFFFF&}ELE DESCOBRIU\N{\c&H0000FFFF&}VERDADE…"
+    w1, w2 = wrapped_35.split(r"\N")
+    assert len(w1.removeprefix(r"{\c&H00FFFFFF&}")) <= 18
+    assert len(w2.removeprefix(r"{\c&H0000FFFF&}")) <= 18
+
+    # Overflow when line 2 is already at max_chars (18) still fits <= 18 with ellipsis
+    exact_18_overflow = wrap_top_hook("UM DOIS TRES QUATRO CINCO SEIS SETE OITO")
+    o1, o2 = exact_18_overflow.split(r"\N")
+    assert len(o1.removeprefix(r"{\c&H00FFFFFF&}")) <= 18
+    o2_clean = o2.removeprefix(r"{\c&H0000FFFF&}")
+    assert len(o2_clean) <= 18
+    assert o2_clean.endswith("…")
 
 
 def test_build_ass_top_hook_and_opt_out(tmp_path: Path, monkeypatch):
