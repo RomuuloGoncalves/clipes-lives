@@ -1310,14 +1310,15 @@ def follow_live(
     def process_one() -> bool:
         return run_worker_step(queue, out_root, active_policy, live_pipeline)
 
-    if not pool.start_on_demand(channel):
-        raise RuntimeError(f"nao foi possivel gravar {channel}")
-    t0 = now()
-    next_e = window_end(t0, step) + step
-    last_check = t0 - LIVE_IS_LIVE_EVERY_S
-    live_ok = True
-    since: dict[str, float] = {}
+    live_ended = False
     try:
+        if not pool.start_on_demand(channel):
+            raise RuntimeError(f"nao foi possivel gravar {channel}")
+        t0 = now()
+        next_e = window_end(t0, step) + step
+        last_check = t0 - LIVE_IS_LIVE_EVERY_S
+        live_ok = True
+        since: dict[str, float] = {}
         while True:
             t = now()
             if t - last_check >= LIVE_IS_LIVE_EVERY_S:
@@ -1336,6 +1337,7 @@ def follow_live(
                 else:
                     since.pop(k, None)
             if len(since) >= 2 or any(t - v >= LIVE_END_PERSIST_S for v in since.values()):
+                live_ended = True
                 break
             if t >= next_e:
                 if disk_usage(out_root).free < min_free * 1e9:
@@ -1359,7 +1361,7 @@ def follow_live(
         pool.release_on_demand(channel)
         if coord is not None and live_id is not None:
             try:
-                coord.release(live_id, True)
+                coord.release(live_id, live_ended)
             except Exception as exc:
                 if not _is_mongo_error(exc):
                     raise
