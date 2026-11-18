@@ -757,6 +757,24 @@ def test_concurrent_run_pending_mongo_store_claims_atomically(
     assert doc is not None and doc["status"] == "ok"
 
 
+def test_mongo_store_claim_request_recusa_status_nao_pending():
+    """MongoStore.claim_request must only transition documents whose status is `pending`."""
+    _, db = _mongo_with_worker("w-pc1", "pc-mesa", T0)
+    store = MongoStore(db)
+    for st in ("running", "ok", "erro"):
+        req_id = f"clip_{st}:youtube"
+        db.publish_requests.insert_one({
+            "_id": req_id,
+            "clip_id": f"clip_{st}",
+            "plataforma": "youtube",
+            "owner": "w-pc1",
+            "status": st,
+        })
+        assert store.claim_request(req_id, worker_id="w-pc1") is None
+        saved = db.publish_requests.find_one({"_id": req_id})
+        assert saved is not None and saved["status"] == st
+
+
 def test_run_pending_before_ready_at_keeps_pending_for_later_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
