@@ -42,7 +42,7 @@ services:
       CLIPES_TIKTOK_MAX_DIA:
     volumes:
       - clipes_models:/cache
-      - ${OUT_DIR:-${HOME}/Downloads/clipes-lives}:/out
+      - ${OUT_DIR:-./out}:/out
       - ${CLIPES_CONFIG_DIR:-${HOME}/.config/clipes-lives}:/config
 
   bot:
@@ -77,11 +77,11 @@ services:
       CLIPES_TIKTOK_MAX_DIA:
     volumes:
       - clipes_models:/cache
-      - ${OUT_DIR:-${HOME}/Downloads/clipes-lives}:/out
+      - ${OUT_DIR:-./out}:/out
       - ${CLIPES_CONFIG_DIR:-${HOME}/.config/clipes-lives}:/config
     command: ["python", "-m", "clipes", "bot"]
 
-  # Testes: sem montar a pasta de saida (o Docker criaria ~/Downloads/clipes-lives como root).
+  # Testes: sem montar a pasta de saida (o Docker criaria ./out como root).
   test:
     image: clipes-lives:latest
     user: "${UID:-1000}:${GID:-1000}"

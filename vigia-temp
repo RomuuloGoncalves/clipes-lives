@@ -4,7 +4,8 @@
 MAX="${CLIPES_TEMP_MAX:-85}"
 MIN="${CLIPES_TEMP_MIN:-75}"
 SYSFS_ROOT="${SYSFS_ROOT:-/sys}"
-OUT_DIR="${OUT_DIR:-$HOME/Downloads/clipes-lives}"
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+OUT_DIR="${OUT_DIR:-$ROOT/out}"
 LOG="${LOG:-$OUT_DIR/.temp.log}"
 
 ler_temp() {

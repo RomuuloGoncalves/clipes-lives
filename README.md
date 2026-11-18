@@ -50,7 +50,7 @@ Construir a imagem:
 docker compose build
 ```
 
-Processar um VOD ou live ativa. Use o `./clipar` (cria a pasta de saída como seu usuário; sem ele o Docker a cria como root, com cadeado). Saída padrão em `~/Downloads/clipes-lives/<AAAA-MM-DD - Título [id]>/`, personalizável via `OUT_DIR`:
+Processar um VOD ou live ativa. Use o `./clipar` (cria a pasta de saída como seu usuário; sem ele o Docker a cria como root, com cadeado). Saída padrão em `./out/<AAAA-MM-DD - Título [id]>/`, personalizável via `OUT_DIR`:
 
 ```sh
 # VOD (YouTube / Twitch)
@@ -95,7 +95,7 @@ docker compose run --rm test
 
 ## Saída
 
-Em `${OUT_DIR:-~/Downloads/clipes-lives}/<AAAA-MM-DD - Título [id]>/` (reaproveita a pasta antiga só com o id, para não perder cache):
+Em `${OUT_DIR:-./out}/<AAAA-MM-DD - Título [id]>/` (reaproveita a pasta antiga só com o id, para não perder cache):
 
 - `clip_01.mp4` ... `clip_NN.mp4` (1080x1920, vídeo centralizado sobre fundo desfocado + legendas `.ass`)
 - `clips.json` (score, sinais que dispararam, início/fim, título, transcrição e métricas)
