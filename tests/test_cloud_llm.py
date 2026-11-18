@@ -44,10 +44,12 @@ class _Resp:
 
 
 @pytest.fixture(autouse=True)
-def env(monkeypatch):
+def env(monkeypatch, tmp_path):
     monkeypatch.setenv("GEMINI_API_KEYS", KEYS)
     monkeypatch.setenv("CLIPES_GEMINI_MODELS", "m1,m2")
     monkeypatch.delenv("CLIPES_LLM_BACKEND", raising=False)
+    monkeypatch.setenv("CLIPES_GEMINI_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("CLIPES_GEMINI_COTA_FILE", str(tmp_path / "cota.json"))
     cloud_llm.reset_round()
 
 
@@ -124,3 +126,88 @@ def test_sem_chave_zero_chamadas(monkeypatch):
 def test_think_e_markdown_removidos():
     f = Fake('<think>hm</think>\n```json\n{"titulo": "x"}\n```')
     assert run(f)[0] == {"titulo": "x"}
+
+
+# ---- T2: cotas ----
+DIA = 1_700_000_000.0  # fixo; dia seguinte = +86400
+
+
+def _daily():
+    body = json.dumps({"error": {"status": "RESOURCE_EXHAUSTED", "message": "quota", "details": [{"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel"}]}]}}).encode()
+    return urllib.error.HTTPError("u", 429, "x", {}, io.BytesIO(body))
+
+
+def _perminute():
+    body = json.dumps({"error": {"status": "RESOURCE_EXHAUSTED", "details": [{"violations": [{"quotaId": "GenerateRequestsPerMinutePerProjectPerModel"}]}]}}).encode()
+    return urllib.error.HTTPError("u", 429, "x", {}, io.BytesIO(body))
+
+
+@pytest.fixture
+def cota(tmp_path, monkeypatch):
+    p = tmp_path / ".gemini_cota.json"
+    monkeypatch.setenv("CLIPES_GEMINI_COTA_FILE", str(p))
+    monkeypatch.setenv("CLIPES_GEMINI_MIN_INTERVAL_S", "0")
+    return p
+
+
+def go(fake, t=DIA):
+    return cloud_llm.complete_cloud("p", SCHEMA, "sys", urlopen=fake, now=lambda: t, sleep=lambda s: None)
+
+
+def test_429_diario_grava_par_e_nova_rodada_nao_chama(cota):
+    assert go(Fake(_daily(), {"titulo": "x"}))[1] == "cloud:gemini:m1"
+    assert json.loads(cota.read_text())["esgotados"] == ["m1#0"]
+    cloud_llm.reset_round()
+    f = Fake({"titulo": "y"})
+    go(f)
+    assert len(f.calls) == 1 and f.calls[0][1]["X-goog-api-key"] == "AIzaKEY-B"
+
+
+def test_virada_do_dia_libera_par(cota):
+    go(Fake(_daily(), {"titulo": "x"}))
+    cloud_llm.reset_round()
+    f = Fake({"titulo": "y"})
+    go(f, DIA + 86400)
+    assert f.calls[0][1]["X-goog-api-key"] == "AIzaKEY-A"
+
+
+def test_429_por_minuto_so_rodada_atual(cota):
+    go(Fake(_perminute(), {"titulo": "x"}))
+    assert not cota.exists()
+    cloud_llm.reset_round()
+    f = Fake({"titulo": "y"})
+    go(f)
+    assert f.calls[0][1]["X-goog-api-key"] == "AIzaKEY-A"
+
+
+def test_todos_esgotados_none_sem_rede_log_uma_vez(cota, capsys):
+    go(Fake(*[_daily() for _ in range(4)]))
+    cloud_llm.reset_round()
+    capsys.readouterr()
+    f = Fake()
+    assert go(f) is None and go(f) is None
+    assert f.calls == []
+    assert capsys.readouterr().out.count("[llm] cota gratuita do Gemini esgotada") == 1
+
+
+def test_arquivo_corrompido_vira_vazio_e_reescrito(cota, capsys):
+    cota.write_text("{lixo")
+    f = Fake({"titulo": "x"})
+    assert go(f)[1] == "cloud:gemini:m1"
+    assert json.loads(cota.read_text())["esgotados"] == []
+    assert "corrompido" in capsys.readouterr().out
+
+
+def test_valor_da_chave_nunca_no_arquivo(cota):
+    go(Fake(_daily(), _daily(), {"titulo": "x"}))
+    assert "AIzaKEY" not in cota.read_text()
+
+
+def test_intervalo_minimo_por_chave(cota, monkeypatch):
+    monkeypatch.setenv("CLIPES_GEMINI_MIN_INTERVAL_S", "4")
+    cloud_llm._last_call.clear()
+    esperas = []
+    kw = dict(urlopen=Fake({"titulo": "a"}, {"titulo": "b"}), now=lambda: DIA, sleep=esperas.append)
+    cloud_llm.complete_cloud("p", SCHEMA, "s", **kw)
+    cloud_llm.complete_cloud("p", SCHEMA, "s", **kw)
+    assert esperas == [4.0]

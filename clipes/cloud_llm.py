@@ -5,8 +5,12 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.request
+from datetime import datetime
+from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from clipes.llm import _THINK_RE
 
@@ -16,6 +20,8 @@ _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
 _failed: set[tuple[str, int]] = set()
 _used: list[str] = []
+_last_call: dict[int, float] = {}
+_logged = False
 
 
 def _keys() -> list[str]:
@@ -40,6 +46,8 @@ def mask(text: str) -> str:
 def reset_round() -> None:
     _failed.clear()
     _used.clear()
+    global _logged
+    _logged = False
 
 
 def providers_used() -> list[str]:
@@ -52,6 +60,57 @@ def _timeout() -> float:
         return v if v > 0 else 60.0
     except ValueError:
         return 60.0
+
+
+def _min_interval() -> float:
+    try:
+        return max(0.0, float(os.environ.get("CLIPES_GEMINI_MIN_INTERVAL_S", "4")))
+    except ValueError:
+        return 4.0
+
+
+def _cota_path() -> Path:
+    env = os.environ.get("CLIPES_GEMINI_COTA_FILE", "").strip()
+    return Path(env) if env else Path(os.environ.get("OUT_DIR") or "out") / ".gemini_cota.json"
+
+
+def _dia(now: Any) -> str:
+    # cota diária do free tier zera à meia-noite do Pacífico
+    return datetime.fromtimestamp(now(), ZoneInfo("America/Los_Angeles")).strftime("%Y-%m-%d")
+
+
+def _load_cota(path: Path, dia: str) -> set[str]:
+    try:
+        d = json.loads(path.read_text())
+        if d["dia"] == dia:
+            return {str(x) for x in d["esgotados"]}
+        return set()  # dia novo: zera
+    except FileNotFoundError:
+        return set()
+    except Exception:
+        print("[llm] aviso: .gemini_cota.json corrompido, recriando")
+        _save_cota(path, dia, set())
+        return set()
+
+
+def _save_cota(path: Path, dia: str, esgotados: set[str]) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        tmp.write_text(json.dumps({"dia": dia, "esgotados": sorted(esgotados)}))
+        tmp.replace(path)
+    except OSError as exc:
+        print(f"[llm] aviso: não gravou cota: {mask(str(exc))}")
+
+
+def _is_daily_quota(exc: Exception) -> bool:
+    if not (isinstance(exc, urllib.error.HTTPError) and exc.code == 429):
+        return False
+    try:
+        body = exc.read().decode("utf-8", "replace")
+    except Exception:
+        return False
+    return "RESOURCE_EXHAUSTED" in body and ("PerDay" in body or "per day" in body.lower())
 
 
 def _parse(text: str, schema: dict) -> dict | None:
@@ -93,25 +152,39 @@ def complete_cloud(
     *,
     urlopen=urllib.request.urlopen,
     now=time.time,
+    sleep=time.sleep,
 ) -> tuple[dict, str] | None:
     """Tenta cada (modelo, chave) na ordem; devolve (resposta, 'cloud:gemini:<modelo>') ou None."""
     if not cloud_enabled():
         return None
+    global _logged
     keys = _keys()
-    for model in _models():
-        for idx, key in enumerate(keys):
-            pair = (model, idx)
-            if pair in _failed:
-                continue
-            try:
-                obj = _call(model, key, prompt, schema, system_prompt, urlopen)
-            except Exception as exc:  # 429/5xx/404/timeout/rede: segue para o próximo par
-                print(f"[llm] gemini {model}#{idx} falhou: {mask(str(exc))}")
-                obj = None
-            if obj is None:
-                _failed.add(pair)
-                continue
-            if "gemini" not in _used:
-                _used.append("gemini")
-            return obj, f"cloud:gemini:{model}"
+    pairs = [(m, i) for m in _models() for i in range(len(keys))]
+    path, dia = _cota_path(), _dia(now)
+    esgotados = _load_cota(path, dia)
+    for model, idx in pairs:
+        pair = (model, idx)
+        if pair in _failed or f"{model}#{idx}" in esgotados:
+            continue
+        wait = _min_interval() - (now() - _last_call.get(idx, float("-inf")))
+        if wait > 0:
+            sleep(wait)
+        _last_call[idx] = now()
+        try:
+            obj = _call(model, keys[idx], prompt, schema, system_prompt, urlopen)
+        except Exception as exc:  # 429/5xx/404/timeout/rede: segue para o próximo par
+            if _is_daily_quota(exc):
+                esgotados.add(f"{model}#{idx}")
+                _save_cota(path, dia, esgotados)
+            print(f"[llm] gemini {model}#{idx} falhou: {mask(str(exc))}")
+            obj = None
+        if obj is None:
+            _failed.add(pair)
+            continue
+        if "gemini" not in _used:
+            _used.append("gemini")
+        return obj, f"cloud:gemini:{model}"
+    if not _logged and all(f"{m}#{i}" in esgotados for m, i in pairs):
+        _logged = True
+        print("[llm] cota gratuita do Gemini esgotada")
     return None
