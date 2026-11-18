@@ -214,6 +214,40 @@ def test_limite_tentativas_senha_429(db, env, monkeypatch):
     assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})[0] == 200
 
 
+def test_abrir_reutiliza_client_lazy_com_max_pool_size_1(monkeypatch):
+    import pymongo
+
+    criados = []
+
+    class FakeClient:
+        def __init__(self, uri, **kwargs):
+            self.uri = uri
+            self.kwargs = kwargs
+            self.closed = False
+            criados.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(pymongo, "MongoClient", FakeClient)
+    monkeypatch.setattr(_nucleo, "_CLIENT", None)
+    monkeypatch.setattr(_nucleo, "_CLIENT_URI", None)
+
+    assert _nucleo._CLIENT is None
+    c1 = _nucleo._abrir("mongodb://um.invalid")
+    c2 = _nucleo._abrir("mongodb://um.invalid")
+    assert c1 is c2
+    assert len(criados) == 1
+    assert c1.kwargs["maxPoolSize"] == 1
+    assert not c1.closed
+
+    c3 = _nucleo._abrir("mongodb://dois.invalid")
+    assert c3 is not c1
+    assert c1.closed is True
+    assert len(criados) == 2
+    assert c3.kwargs["maxPoolSize"] == 1
+
+
 # ---- T20: pagina do painel
 def test_index_html_sem_innerhtml_e_sem_segredo():
     from pathlib import Path

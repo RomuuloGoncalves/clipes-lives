@@ -14,6 +14,9 @@ MAX_TENTATIVAS_SENHA = 5
 JANELA_BLOQUEIO_S = 60.0
 _FALHAS_AUTH: dict[str, list[float]] = {}
 _AUTH_LOCK = threading.Lock()
+_CLIENT = None
+_CLIENT_URI: str | None = None
+_CLIENT_LOCK = threading.Lock()
 
 
 def autorizado(header, senha):
@@ -171,8 +174,19 @@ def tratar(h, metodo, now=None):
 
 
 def _abrir(uri):
-    from pymongo import MongoClient
-    return MongoClient(uri, maxPoolSize=1, serverSelectionTimeoutMS=5000)
+    global _CLIENT, _CLIENT_URI
+    with _CLIENT_LOCK:
+        if _CLIENT is None or _CLIENT_URI != uri:
+            if _CLIENT is not None:
+                try:
+                    _CLIENT.close()
+                except Exception:
+                    pass
+                _CLIENT = None
+            from pymongo import MongoClient
+            _CLIENT = MongoClient(uri, maxPoolSize=1, serverSelectionTimeoutMS=5000)
+            _CLIENT_URI = uri
+        return _CLIENT
 
 
 def _enviar(h, codigo, corpo, extra=None):
