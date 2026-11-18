@@ -1696,8 +1696,7 @@ async def run_monitor(
             return True
         if channel in claiming_tasks:
             return await claiming_tasks[channel]
-        _, ml = await _current_limits_async()
-        if len(owned_lives) >= ml or now() < claim_retry_at.get(channel, 0.0):
+        if now() < claim_retry_at.get(channel, 0.0):
             return False
         task = asyncio.create_task(_claim_live(channel))
         claiming_tasks[channel] = task
