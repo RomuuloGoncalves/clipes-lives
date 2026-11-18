@@ -13,7 +13,9 @@ import discord
 import mongomock
 import pytest
 
+from clipes import __main__ as entry
 from clipes import bot as bot_mod
+from clipes import oauth as oauth_mod
 from clipes.publicacao import LocalStore, MongoStore
 
 T0 = 1_763_400_000.0
@@ -485,3 +487,89 @@ def test_main_missing_token_exits_2_without_secrets(monkeypatch: pytest.MonkeyPa
     assert "DISCORD_BOT_TOKEN" in captured.err
     assert "supersecret" not in captured.err
     assert "supersecret" not in captured.out
+
+
+# --- T9: Entrypoint routing for `bot` and `auth` ---
+
+
+def test_entrypoint_bot_missing_token_exits_2_without_secrets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+    monkeypatch.setenv("CLIPES_MONGO_URI", "mongodb+srv://user:supersecret@cluster.example.net/db")
+    monkeypatch.setenv("YOUTUBE_CLIENT_SECRET", "yt-supersecret")
+
+    code = entry.main(["bot"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert "DISCORD_BOT_TOKEN" in captured.err
+    assert "supersecret" not in captured.err + captured.out
+    assert "yt-supersecret" not in captured.err + captured.out
+
+
+def test_entrypoint_bot_routes_to_bot_main(monkeypatch: pytest.MonkeyPatch):
+    received: list[list[str] | None] = []
+
+    def fake_bot_main(argv: list[str] | None = None) -> int:
+        received.append(argv)
+        return 0
+
+    monkeypatch.setattr(bot_mod, "main", fake_bot_main)
+
+    code = entry.main(["bot", "--extra"])
+    assert code == 0
+    assert received == [["--extra"]]
+
+
+def test_entrypoint_auth_invalid_platform_exits_2(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    called: list[str] = []
+
+    def fail_if_called(plataforma: str, *args: Any, **kwargs: Any) -> Path:
+        called.append(plataforma)
+        raise AssertionError("auth_flow should not be called for invalid platform")
+
+    monkeypatch.setattr(oauth_mod, "auth_flow", fail_if_called)
+
+    code = entry.main(["auth", "foo"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert called == []
+    assert "foo" in captured.err
+    assert "youtube" in captured.err and "tiktok" in captured.err
+
+
+def test_entrypoint_auth_routes_youtube_and_tiktok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    called: list[str] = []
+
+    def fake_auth_flow(plataforma: str, *args: Any, **kwargs: Any) -> Path:
+        called.append(plataforma)
+        return tmp_path / "tokens.json"
+
+    monkeypatch.setattr(oauth_mod, "auth_flow", fake_auth_flow)
+
+    assert entry.main(["auth", "youtube"]) == 0
+    assert entry.main(["auth", "tiktok"]) == 0
+    assert called == ["youtube", "tiktok"]
+
+
+def test_entrypoint_auth_oauth_error_exits_2_without_secrets(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    monkeypatch.setenv("YOUTUBE_CLIENT_SECRET", "yt-secret-xyz")
+
+    def fake_auth_flow(plataforma: str, *args: Any, **kwargs: Any) -> Path:
+        raise oauth_mod.OAuthError("YOUTUBE_CLIENT_ID and YOUTUBE_CLIENT_SECRET are required")
+
+    monkeypatch.setattr(oauth_mod, "auth_flow", fake_auth_flow)
+
+    code = entry.main(["auth", "youtube"])
+    captured = capsys.readouterr()
+
+    assert code == 2
+    assert "YOUTUBE_CLIENT_ID" in captured.err
+    assert "yt-secret-xyz" not in captured.err + captured.out
+
