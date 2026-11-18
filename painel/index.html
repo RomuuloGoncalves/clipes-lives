@@ -271,6 +271,12 @@
         return String(v) + (suf || "");
       }
 
+      function fmtCpu(cap) {
+        var base = fmtNum(cap.cpus);
+        if (cap.cpu_pct === null || cap.cpu_pct === undefined || cap.cpu_pct === "") return base;
+        return (base === "-" ? "" : base + " ") + "(" + String(cap.cpu_pct) + "%)";
+      }
+
       function fmtGpu(gpu) {
         if (!gpu) return "-";
         if (typeof gpu === "string") return gpu;
@@ -355,7 +361,7 @@
           tdOn.appendChild(el("span", "badge " + (w.online ? "on" : "off"), w.online ? "online" : "offline"));
           tr.appendChild(tdOn);
 
-          tr.appendChild(el("td", null, fmtNum(cap.cpus)));
+          tr.appendChild(el("td", null, fmtCpu(cap)));
           tr.appendChild(el("td", null, fmtNum(cap.ram_gb, " GB")));
           tr.appendChild(el("td", null, fmtNum(cap.disco_livre_gb, " GB")));
 

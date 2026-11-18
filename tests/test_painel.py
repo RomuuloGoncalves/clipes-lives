@@ -317,7 +317,7 @@ def test_index_html_estrutura_e_fluxos():
     assert "LIBERAR" in js
     assert "liberar recursos" in txt.lower()
     assert "n/d" in js
-    for campo in ("alias", "online", "cpus", "ram_gb", "disco_livre_gb", "temp_c", "gpu", "job_atual", "max_lives"):
+    for campo in ("alias", "online", "cpus", "cpu_pct", "ram_gb", "disco_livre_gb", "temp_c", "gpu", "job_atual", "max_lives"):
         assert campo in js
     # atualizar() consulta /api/status sem pedir senha nem enviar Authorization
     atualizar_js = js.split("function atualizar()", 1)[1]
