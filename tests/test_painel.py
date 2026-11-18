@@ -69,15 +69,27 @@ def test_status_sem_uri_nem_host(db):
     assert "mongodb" not in txt and "://" not in txt
 
 
+@pytest.fixture(autouse=True)
+def _limpar_falhas_auth():
+    _nucleo._FALHAS_AUTH.clear()
+    yield
+    _nucleo._FALHAS_AUTH.clear()
+
+
 # ---- T18/T19: handlers
-def chamar(mod, db, metodo, path_auth=None, corpo=None):
+def chamar(mod, db, metodo, path_auth=None, corpo=None, headers=None, raw_body=None):
     h = type("H", (mod.handler,), {"client": {"clipes": db}})
     srv = HTTPServer(("127.0.0.1", 0), h)
     threading.Thread(target=srv.handle_request, daemon=True).start()
-    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/", method=metodo,
-                                 data=json.dumps(corpo).encode() if corpo is not None else None)
+    data = raw_body if raw_body is not None else (json.dumps(corpo).encode() if corpo is not None else None)
+    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/", method=metodo, data=data)
     if path_auth:
         req.add_header("Authorization", path_auth)
+    if corpo is not None and (not headers or "Content-Type" not in headers):
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        if v is not None:
+            req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, dict(r.headers), r.read()
@@ -118,6 +130,54 @@ def test_comando_405_401_202_409(db, env):
     assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 202
     assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 409
     assert db.commands.count_documents({}) == 1
+
+
+def test_comando_exige_content_type_json_e_confere_origin(db, env):
+    # Content-Type ausente ou form -> 415
+    assert chamar(comando, db, "POST", basic("s3"), raw_body=b"worker_id=w-1")[0] == 415
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )[0] == 415
+    # charset junto de application/json é aceito
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-2", "confirmar": "LIBERAR"},
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )[0] == 202
+    # Origin cruzado ou null -> 403
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        headers={"Origin": "https://atacante.invalid"},
+    )[0] == 403
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        headers={"Origin": "null"},
+    )[0] == 403
+    # Origin compatível com Host -> 202
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        headers={"Host": "painel.local", "Origin": "https://painel.local"},
+    )[0] == 202
+
+
+def test_limite_tentativas_senha_429(db, env, monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(_nucleo.time, "monotonic", lambda: t[0])
+
+    for _ in range(_nucleo.MAX_TENTATIVAS_SENHA):
+        code, _, _ = chamar(status_fn, db, "GET", basic("errada"), headers={"X-Real-IP": "198.51.100.10"})
+        assert code == 401
+
+    # Mesmo com a senha certa, o cliente bloqueado recebe 429 até expirar a janela.
+    code, hdr, _ = chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})
+    assert code == 429 and int(hdr["Retry-After"]) > 0
+
+    # Outro IP continua normal.
+    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.11"})[0] == 200
+
+    # Passada a janela de bloqueio, volta a aceitar.
+    t[0] += _nucleo.JANELA_BLOQUEIO_S + 1
+    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})[0] == 200
 
 
 # ---- T20: pagina do painel

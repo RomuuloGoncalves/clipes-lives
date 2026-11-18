@@ -3,10 +3,17 @@ import base64
 import json
 import os
 import secrets
+import threading
+import time
 from datetime import timedelta
+from urllib.parse import urlsplit
 
 BEAT_S = int(os.environ.get("CLIPES_BEAT_S", "20"))
 SEM_CONFIG = (500, {"erro": "painel nao configurado"})
+MAX_TENTATIVAS_SENHA = 5
+JANELA_BLOQUEIO_S = 60.0
+_FALHAS_AUTH: dict[str, list[float]] = {}
+_AUTH_LOCK = threading.Lock()
 
 
 def autorizado(header, senha):
@@ -58,14 +65,80 @@ def criar_comando(db, worker_id, confirmar, now):
     return 202, {"ok": True}
 
 
+def _chave_cliente(h):
+    for hdr in ("X-Real-IP", "X-Forwarded-For"):
+        val = (h.headers.get(hdr) or "").split(",")[0].strip()
+        if val:
+            return val
+    addr = getattr(h, "client_address", None)
+    return str(addr[0]) if addr else "global"
+
+
+def _auth_bloqueada(chave, agora_mono):
+    corte = agora_mono - JANELA_BLOQUEIO_S
+    with _AUTH_LOCK:
+        recentes = [t for t in _FALHAS_AUTH.get(chave, ()) if t > corte]
+        if recentes:
+            _FALHAS_AUTH[chave] = recentes
+        else:
+            _FALHAS_AUTH.pop(chave, None)
+        return len(recentes) >= MAX_TENTATIVAS_SENHA
+
+
+def _registrar_falha_auth(chave, agora_mono):
+    corte = agora_mono - JANELA_BLOQUEIO_S
+    with _AUTH_LOCK:
+        recentes = [t for t in _FALHAS_AUTH.get(chave, ()) if t > corte]
+        recentes.append(agora_mono)
+        _FALHAS_AUTH[chave] = recentes
+
+
+def _limpar_falhas_auth(chave):
+    with _AUTH_LOCK:
+        _FALHAS_AUTH.pop(chave, None)
+
+
+def _origem_valida(h):
+    origin = (h.headers.get("Origin") or "").strip()
+    alvo = origin or (h.headers.get("Referer") or "").strip()
+    if not alvo:
+        return True
+    parsed = urlsplit(alvo)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    hosts = {
+        v.strip().lower()
+        for v in (h.headers.get("Host"), h.headers.get("X-Forwarded-Host"))
+        if v and v.strip()
+    }
+    return bool(hosts) and parsed.netloc.lower() in hosts
+
+
 def tratar(h, metodo, now=None):
     """Logica comum dos handlers (h = BaseHTTPRequestHandler). Mantida aqui para status/comando."""
     from datetime import datetime, timezone
     senha, uri = os.environ.get("PAINEL_SENHA"), os.environ.get("PAINEL_MONGO_URI")
     if not senha or not uri:
         return _enviar(h, *SEM_CONFIG)
+    chave = _chave_cliente(h)
+    agora_mono = time.monotonic()
+    if _auth_bloqueada(chave, agora_mono):
+        return _enviar(
+            h,
+            429,
+            {"erro": "muitas tentativas"},
+            {"Retry-After": str(int(JANELA_BLOQUEIO_S))},
+        )
     if not autorizado(h.headers.get("Authorization"), senha):
+        _registrar_falha_auth(chave, agora_mono)
         return _enviar(h, 401, {"erro": "nao autorizado"}, {"WWW-Authenticate": 'Basic realm="painel"'})
+    _limpar_falhas_auth(chave)
+    if metodo == "comando":
+        if not _origem_valida(h):
+            return _enviar(h, 403, {"erro": "origem nao permitida"})
+        ctype = (h.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            return _enviar(h, 415, {"erro": "Content-Type deve ser application/json"})
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         client = h.client or _abrir(uri)
