@@ -32,7 +32,16 @@ def autorizado(header, senha):
 
 
 def _iso(d):
-    return d.isoformat() + "Z" if d else None
+    return d.isoformat() + "Z" if hasattr(d, "isoformat") else (d or None)
+
+
+def _historico(itens):
+    """Ultimos 30 pontos do historico com `t` (datetime do Mongo) em ISO, serializavel em JSON."""
+    out = []
+    for p in (itens or [])[-30:]:
+        if isinstance(p, dict):
+            out.append({k: (_iso(v) if hasattr(v, "isoformat") else v) for k, v in p.items()})
+    return out
 
 
 def status(db, now, beat_s=BEAT_S):
@@ -44,7 +53,7 @@ def status(db, now, beat_s=BEAT_S):
             "online": bool(hb) and (now - hb).total_seconds() <= 3 * beat_s,
             "heartbeat_at": _iso(hb), "capacity": w.get("capacity"),
             "job_atual": w.get("job_atual"), "max_lives": w.get("max_lives"),
-            "razao": w.get("razao"), "history": (w.get("history") or [])[-30:],
+            "razao": w.get("razao"), "history": _historico(w.get("history")),
         })
     lives = [{"id": l["_id"], "channel": l.get("channel"), "owner": l["owner"],
               "lease_until": _iso(l.get("lease_until"))}
@@ -163,7 +172,7 @@ def tratar(h, metodo, now=None):
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         client = h.client or _abrir(uri)
-        db = client[os.environ.get("PAINEL_MONGO_DB", "clipes")]
+        db = client[os.environ.get("PAINEL_MONGO_DB", "clipes_lives")]
         if metodo == "status":
             return _enviar(h, 200, status(db, now))
         n = int(h.headers.get("Content-Length") or 0)

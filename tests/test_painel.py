@@ -21,7 +21,7 @@ def basic(senha, user="x"):
 
 @pytest.fixture
 def db():
-    d = mongomock.MongoClient()["clipes"]
+    d = mongomock.MongoClient()["clipes_lives"]
     d.workers.insert_one({"_id": "w-1", "alias": "PC-1", "heartbeat_at": NOW - timedelta(seconds=61),
                           "capacity": {"cpus": 3}, "max_lives": 1})
     d.workers.insert_one({"_id": "w-2", "alias": "PC-2", "heartbeat_at": NOW - timedelta(seconds=10)})
@@ -349,3 +349,11 @@ def test_painel_requirements_pymongo_sem_segredos():
     linhas = [ln.strip() for ln in txt.splitlines() if ln.strip() and not ln.strip().startswith("#")]
     assert "pymongo" in linhas
     assert not re.search(r"mongodb(\+srv)?://", txt, re.I)
+
+
+def test_status_serializa_history_com_datetime_em_json(db):
+    db.workers.update_one({"_id": "w-2"}, {"$set": {"history": [{"t": NOW, "cpu_pct": 12.5, "temp_c": 55}]}})
+    r = _nucleo.status(db, NOW, beat_s=20)
+    ws = {w["id"]: w for w in r["workers"]}
+    assert ws["w-2"]["history"] == [{"t": NOW.isoformat() + "Z", "cpu_pct": 12.5, "temp_c": 55}]
+    json.dumps(r)  # nao pode levantar TypeError (500 no /api/status)
