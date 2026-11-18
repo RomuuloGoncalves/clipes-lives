@@ -495,3 +495,23 @@ def test_cli_cloud_cota_respects_out_dir(tmp_path: Path, monkeypatch):
     assert cota_file.is_file()
     assert json.loads(cota_file.read_text(encoding="utf-8"))["esgotados"] == ["m1#0"]
     assert not (env_out / ".gemini_cota.json").exists()
+
+
+def test_cli_empty_transcript_leaves_description_source_empty(tmp_path: Path, monkeypatch):
+    ing = _make_ing(tmp_path, "empty_desc")
+    clip = SnappedClip(peak=31.0, start=20.0, end=50.0, score=0.90, text="")
+    _mock_base_stages(monkeypatch, ing, [clip], [])
+
+    rc = cli.main([
+        "https://www.twitch.tv/gaules",
+        "--out-dir", str(tmp_path / "out"),
+        "--no-llm",
+        "--skip-render",
+    ])
+    assert rc == 0
+
+    manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
+    c0 = manifest["clips"][0]
+    assert c0["description_long"] == ""
+    assert c0["description_source"] == ""
+    assert not list(ing.out_dir.glob("*.descricao.txt"))

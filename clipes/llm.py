@@ -570,7 +570,8 @@ def pick_long_description(raw: str, clip: SnappedClip, reference_text: str = "")
         and validate_no_hallucinated_entities(clean, clip.text, reference_text)
     ):
         return clean, "llm"
-    return long_paragraph_fallback(clip), "fallback"
+    paragraph = long_paragraph_fallback(clip)
+    return (paragraph, "fallback") if paragraph else ("", "")
 
 
 def format_long_description(
@@ -667,15 +668,15 @@ def _apply_fallback(
         part_index=part_index, part_total=part_total,
     )
     clip.hook_top = pick_hook_top("", clip.title, clip.text)
-    clip.description_source = "fallback"
     paragraph = long_paragraph_fallback(clip)
-    clip.description_long = (
-        format_long_description(
+    if paragraph:
+        clip.description_source = "fallback"
+        clip.description_long = format_long_description(
             clip.title, paragraph, channel, ing.url, clip.hashtags, part_index, part_total
         )
-        if paragraph
-        else ""
-    )
+    else:
+        clip.description_source = ""
+        clip.description_long = ""
 
 
 def _sort_with_tie_break(clips: list[SnappedClip], tie_delta: float = 0.02) -> None:
@@ -813,8 +814,12 @@ def enrich_clips_with_llm(
             paragraph, clip.description_source = pick_long_description(
                 str(res.get("descricao_longa", "")), clip, reference_text
             )
-            clip.description_long = format_long_description(
-                clip.title, paragraph, channel, ing.url, clip.hashtags, part_index, part_total
+            clip.description_long = (
+                format_long_description(
+                    clip.title, paragraph, channel, ing.url, clip.hashtags, part_index, part_total
+                )
+                if paragraph
+                else ""
             )
     except Exception as exc:
         logger.warning("[llm] enrichment failed (%s); applying deterministic fallback", exc)

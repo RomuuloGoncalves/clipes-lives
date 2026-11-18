@@ -393,8 +393,10 @@ def run_pipeline(args: argparse.Namespace) -> int:
                     part_index=part_index,
                     part_total=part_total,
                 )
-            if not getattr(clip, "description_source", ""):
-                clip.description_source = "fallback"
+                if not getattr(clip, "description_source", ""):
+                    clip.description_source = "fallback"
+            else:
+                clip.description_source = ""
         if args.skip_render:
             clip.output_file = f"{clip_stem(idx, clip)}.mp4"
             clip_layout = default_layout
