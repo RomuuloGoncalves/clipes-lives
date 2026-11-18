@@ -26,8 +26,8 @@ def medir(
     *,
     out_dir: Path | str | None = None,
     cpus: int | None = None,
-    clock: Callable[[], float] = time.perf_counter,
-    now: Callable[[], float] = time.time,
+    clock: Callable[[], float] | None = None,
+    now: Callable[[], float] | None = None,
     probe: Callable[[Path], float] | None = None,
     min_live_s: float = MIN_BENCH_LIVE_S,
 ) -> dict[str, Any]:
@@ -55,17 +55,19 @@ def medir(
         pipeline_fn = pipeline
 
     cpus_count = int(cpus if cpus is not None else cpu_threads())
+    clock_fn = clock or time.perf_counter
+    now_fn = now or time.time
 
-    t0 = clock()
+    t0 = clock_fn()
     pipeline_fn(job_path, out_path)
-    segundos_proc = max(0.0, float(clock() - t0))
+    segundos_proc = max(0.0, float(clock_fn() - t0))
 
     razao = round(segundos_proc / segundos_live, 6)
     payload: dict[str, Any] = {
         "razao": razao,
         "segundos_live": round(segundos_live, 3),
         "segundos_proc": round(segundos_proc, 3),
-        "medido_em": datetime.fromtimestamp(now(), tz=timezone.utc).isoformat(),
+        "medido_em": datetime.fromtimestamp(now_fn(), tz=timezone.utc).isoformat(),
         "cpus": cpus_count,
     }
 

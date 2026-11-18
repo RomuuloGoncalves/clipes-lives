@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from clipes import perfil
+from clipes import __main__ as entry, monitor, perfil
 
 
 def _make_job_dir(tmp_path: Path, name: str = "live_win") -> Path:
@@ -94,3 +94,42 @@ def test_medir_rejects_missing_or_short_source(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="300"):
         perfil.medir(short_dir, lambda *_: {})
     assert not (out_dir / ".perfil.json").exists()
+
+
+def test_bench_live_short_source_exits_2_with_message(tmp_path, monkeypatch, capsys):
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("OUT_DIR", str(out_dir))
+    short_dir = _make_job_dir(tmp_path, "short_cli")
+    monkeypatch.setattr(perfil, "probe_duration", lambda p: 200.0)
+
+    rc = entry.main(["bench-live", str(short_dir)])
+    captured = capsys.readouterr()
+    assert rc == 2
+    assert "300" in (captured.err + captured.out)
+    assert not (out_dir / ".perfil.json").exists()
+
+
+def test_bench_live_routes_to_perfil_medir_and_returns_zero(tmp_path, monkeypatch, capsys):
+    out_dir = tmp_path / "out"
+    monkeypatch.setenv("OUT_DIR", str(out_dir))
+    job_dir = _make_job_dir(tmp_path, "valid_cli")
+
+    clock_t = [0.0]
+
+    def fake_pipeline(jdir: Path, oroot: Path) -> dict:
+        clock_t[0] += 30.0
+        return {"clips": []}
+
+    monkeypatch.setattr(perfil, "probe_duration", lambda p: 300.0)
+    monkeypatch.setattr(perfil, "cpu_threads", lambda: 4)
+    monkeypatch.setattr(monitor, "run_local_pipeline", fake_pipeline)
+    monkeypatch.setattr(perfil.time, "perf_counter", lambda: clock_t[0])
+
+    rc = entry.main(["bench-live", str(job_dir)])
+    captured = capsys.readouterr()
+    assert rc == 0
+    assert "max_lives=6" in captured.out
+    saved = json.loads((out_dir / ".perfil.json").read_text(encoding="utf-8"))
+    assert saved["cpus"] == 4
+    assert saved["razao"] == pytest.approx(0.1, rel=1e-6)
+
