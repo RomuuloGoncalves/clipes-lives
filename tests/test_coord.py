@@ -1,5 +1,7 @@
 """Coordenação entre PCs (mongomock em memória; sem rede nem banco real)."""
 
+import threading
+
 import mongomock
 import pytest
 from pymongo.errors import DuplicateKeyError
@@ -311,3 +313,102 @@ def test_mark_command_nao_mexe_em_comando_de_outro_worker(env):
     i = cmd(db, "w-b")
     a.mark_command(i, "feito")
     assert db.commands.find_one({"_id": i})["status"] == "pending"
+
+
+# ---- #10: corrida concorrente em threads ----
+
+
+def test_corrida_dois_workers_em_threads_so_um_reivindica_cada_live(env):
+    """Corrida com 2 threads sincronizadas por barreira em N lives.
+
+    Nota: mongomock roda em memória e não prova atomicidade de rede/wiredtiger;
+    a atomicidade real vem do `find_one_and_update` único no MongoDB.
+    """
+    _, db, a, b = env
+    live_ids = [f"twitch:canal_{i}:100{i}" for i in range(20)]
+    for lid in live_ids:
+        a.ensure_live(lid, channel="canal", platform="twitch")
+
+    barrier = threading.Barrier(2)
+    wins: dict[str, set[str]] = {"w-a": set(), "w-b": set()}
+    errors: list[BaseException] = []
+
+    def worker(coord: Coord) -> None:
+        try:
+            for lid in live_ids:
+                barrier.wait(timeout=5)
+                if coord.claim_live(lid):
+                    wins[coord.worker_id].add(lid)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(a,)), threading.Thread(target=worker, args=(b,))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors
+    assert wins["w-a"].isdisjoint(wins["w-b"])
+    assert wins["w-a"] | wins["w-b"] == set(live_ids)
+    for lid in live_ids:
+        expected_owner = "w-a" if lid in wins["w-a"] else "w-b"
+        assert db.lives.find_one({"_id": lid})["owner"] == expected_owner
+
+
+def test_corrida_dois_workers_em_threads_so_um_inicia_e_cria_cada_job(env):
+    """Corrida com 2 threads em `add_job` e `start_job`: só um vence cada job."""
+    _, db, a, b = env
+    job_ids = [f"{LIVE}:{1763416800 + i * 300}" for i in range(20)]
+    barrier_add = threading.Barrier(2)
+    barrier_start = threading.Barrier(2)
+    add_wins: dict[str, set[str]] = {"w-a": set(), "w-b": set()}
+    start_wins: dict[str, set[str]] = {"w-a": set(), "w-b": set()}
+    errors: list[BaseException] = []
+
+    def racer_add(coord: Coord) -> None:
+        try:
+            for i, jid in enumerate(job_ids):
+                end = 1763416800 + i * 300
+                barrier_add.wait(timeout=5)
+                if coord.add_job(jid, LIVE, (end - 600, end), 5.0):
+                    add_wins[coord.worker_id].add(jid)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads_add = [threading.Thread(target=racer_add, args=(a,)), threading.Thread(target=racer_add, args=(b,))]
+    for t in threads_add:
+        t.start()
+    for t in threads_add:
+        t.join(timeout=10)
+
+    assert not errors
+    assert add_wins["w-a"].isdisjoint(add_wins["w-b"])
+    assert add_wins["w-a"] | add_wins["w-b"] == set(job_ids)
+    assert db.jobs.count_documents({}) == len(job_ids)
+
+    # Libera owner para que A e B possam disputar start_job em igualdade.
+    db.jobs.update_many({}, {"$set": {"owner": None}})
+
+    def racer_start(coord: Coord) -> None:
+        try:
+            for jid in job_ids:
+                barrier_start.wait(timeout=5)
+                if coord.start_job(jid):
+                    start_wins[coord.worker_id].add(jid)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads_start = [threading.Thread(target=racer_start, args=(a,)), threading.Thread(target=racer_start, args=(b,))]
+    for t in threads_start:
+        t.start()
+    for t in threads_start:
+        t.join(timeout=10)
+
+    assert not errors
+    assert start_wins["w-a"].isdisjoint(start_wins["w-b"])
+    assert start_wins["w-a"] | start_wins["w-b"] == set(job_ids)
+    for jid in job_ids:
+        doc = db.jobs.find_one({"_id": jid})
+        expected_owner = "w-a" if jid in start_wins["w-a"] else "w-b"
+        assert (doc["status"], doc["attempts"], doc["owner"]) == ("processing", 1, expected_owner)
