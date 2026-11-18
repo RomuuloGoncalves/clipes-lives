@@ -18,7 +18,7 @@ from . import cloud_llm
 from .asr import transcribe_candidates, transcribe_fast_blocks
 from .candidates import pick_candidate_peaks, pick_quota_candidates
 from .eval import evaluate_clips
-from .ingest import format_channel_credit, ingest, sanitize_id
+from .ingest import format_channel_credit, ingest, probe_metadata, sanitize_id
 from .llm import (
     enrich_clips_with_llm,
     format_long_description,
@@ -28,6 +28,7 @@ from .llm import (
     sanitize_hashtags,
 )
 from .models import CandidatePeak, SignalBundle, TopicSegment, Word
+from .monitor import follow_live
 from .render import OUTRO_DURATION, clip_stem, generate_title, is_blur_bg_enabled, render_clip
 from .signals import compute_rms_db, compute_signals, triage_audio_blocks
 from .snap import select_clips
@@ -45,6 +46,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-dur", type=float, default=65.0, help="Duração máxima do clipe em s (padrão: 65)")
     p.add_argument("--live-minutes", type=float, default=20.0,
                    help="Minutos a gravar se a URL for uma live ativa (padrão: 20)")
+    p.add_argument("--ate-acabar", action="store_true",
+                   help="Se a URL for uma live ativa, clipa em janelas contínuas até ela acabar")
     p.add_argument("--chat", action=argparse.BooleanOptionalAction, default=True,
                    help="Usar sinal de chat replay quando disponível (padrão: --chat)")
     p.add_argument("--whisper-model", default=None,
@@ -207,6 +210,17 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return 2
 
     out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
+    if getattr(args, "ate_acabar", False) and bool(probe_metadata(args.url).get("is_live")):
+        out_root.mkdir(parents=True, exist_ok=True)
+        print(f"[live] Live ativa detectada; acompanhando até acabar: {args.url}", flush=True)
+        follow_kwargs: dict[str, Any] = {}
+        sig_params = inspect.signature(follow_live).parameters
+        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+        if has_varkw or "max_dur" in sig_params:
+            follow_kwargs["max_dur"] = args.max_dur
+        follow_live(args.url, out_root, **follow_kwargs)
+        return 0
+
     timings: dict[str, float] = {}
 
     t0 = time.perf_counter()
