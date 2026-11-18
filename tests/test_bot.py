@@ -685,3 +685,9 @@ def test_entrypoint_auth_oauth_error_exits_2_without_secrets(
     assert "YOUTUBE_CLIENT_ID" in captured.err
     assert "yt-secret-xyz" not in captured.err + captured.out
 
+
+
+def test_asterisco_libera_qualquer_usuario():
+    assert publicacao.user_allowed("999", ["*"])
+    assert publicacao.user_allowed("999", ["111"]) is False
+    assert publicacao.user_allowed("999", []) is False

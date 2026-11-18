@@ -68,7 +68,7 @@ def _interaction_in_configured_channel(interaction: Any, configured_channel_id: 
 
 def _interaction_user_allowed(interaction: Any, allowed_ids: Iterable[str | int] | None) -> bool:
     user_id = getattr(getattr(interaction, "user", None), "id", "")
-    return str(user_id).strip() in publicacao._allowed_user_set(allowed_ids)
+    return publicacao.user_allowed(user_id, allowed_ids)
 
 
 def _clip_id_from_entry(manifest: dict[str, Any], entry: dict[str, Any]) -> str | None:

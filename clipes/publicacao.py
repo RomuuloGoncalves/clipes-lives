@@ -106,6 +106,12 @@ def _allowed_user_set(allowed_ids: Iterable[str | int] | None) -> set[str]:
     return {tok.strip() for tok in re.split(r"[,\s]+", raw) if tok.strip()}
 
 
+def user_allowed(user_id: str | int, allowed_ids: Iterable[str | int] | None = None) -> bool:
+    """True se o ID esta na lista ou se a lista contem `*` (qualquer usuario que alcance o canal)."""
+    allowed = _allowed_user_set(allowed_ids)
+    return "*" in allowed or str(user_id).strip() in allowed
+
+
 def _resolve_tokens_path(tokens_path: Path | str | None) -> Path:
     if tokens_path is not None:
         return Path(tokens_path)
@@ -553,7 +559,7 @@ def request(
     worker_stale_s: float = WORKER_STALE_S,
 ) -> str:
     """Validate permission, policy, idempotency, and quota, then enqueue `publish_requests`."""
-    if str(user_id).strip() not in _allowed_user_set(allowed_ids):
+    if not user_allowed(user_id, allowed_ids):
         return "sem permissao"
 
     adapted = _adapt_store(store)
