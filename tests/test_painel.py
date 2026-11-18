@@ -10,7 +10,7 @@ from http.server import HTTPServer
 import mongomock
 import pytest
 
-from painel.api import _nucleo
+from painel.api X as status_fn
 
 NOW = datetime(2026, 1, 1, 12, 0, 0)
 
@@ -67,5 +67,47 @@ def test_autorizado():
 def test_status_sem_uri_nem_host(db):
     txt = json.dumps(_nucleo.status(db, NOW))
     assert "mongodb" not in txt and "://" not in txt
+
+
+# ---- T18/T19: handlers
+def chamar(mod, db, metodo, path_auth=None, corpo=None):
+    h = type("H", (mod.handler,), {"client": {"clipes": db}})
+    srv = HTTPServer(("127.0.0.1", 0), h)
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/", method=metodo,
+                                 data=json.dumps(corpo).encode() if corpo is not None else None)
+    if path_auth:
+        req.add_header("Authorization", path_auth)
+    try:
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.status, dict(r.headers), r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, dict(e.headers), e.read()
+    finally:
+        srv.server_close()
+
+
+@pytest.fixture
+def env(monkeypatch):
+    monkeypatch.setenv("PAINEL_SENHA", "s3")
+    monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
+
+
+def test_status_401_sem_auth(db, env):
+    code, hdr, corpo = chamar(status_fn, db, "GET")
+    assert code == 401 and "Basic" in hdr["WWW-Authenticate"] and b"workers" not in corpo
+
+
+def test_status_500_sem_env(db, monkeypatch):
+    monkeypatch.delenv("PAINEL_SENHA", raising=False)
+    monkeypatch.delenv("PAINEL_MONGO_URI", raising=False)
+    code, _, corpo = chamar(status_fn, db, "GET", basic("s3"))
+    assert code == 500 and json.loads(corpo) == {"erro": "painel nao configurado"}
+
+
+def test_status_200(db, env):
+    code, _, corpo = chamar(status_fn, db, "GET", basic("s3"))
+    assert code == 200 and len(json.loads(corpo)["workers"]) == 2
+    assert b"exemplo.invalid" not in corpo
 
 
