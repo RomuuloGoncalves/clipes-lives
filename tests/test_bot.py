@@ -796,7 +796,10 @@ def test_buscar_slash_e_texto_resultado_vazio_curto_permissao_canal_e_limite_190
 
 def test_on_interaction_aprovar_botao_permitido_negado_desconhecido_e_inexistente(tmp_path: Path):
     _make_clip(tmp_path, video_id="btn1", clip_id="btn1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
-    tokens_path = _write_tokens(tmp_path / "tokens.json")
+    tokens_path = _write_tokens(
+        tmp_path / "tokens.json",
+        {"youtube": {"refresh_token": "yt-refresh"}, "tiktok": {"refresh_token": "tt-refresh"}},
+    )
     db, store = _mongo_store("w-pc1", "pc-mesa", T0)
     bot = bot_mod.make_bot(
         store,
@@ -877,7 +880,7 @@ def test_on_interaction_aprovar_botao_permitido_negado_desconhecido_e_inexistent
     assert i_nf.response.messages == [("clipe fantasma_c99 nao encontrado", False)]
     assert msg_nf.edits == []
 
-    # 5. Allowed user after simulated restart (brand new bot instance, no View state)
+    # 5. Legacy `aprovar:` button works as Ambos after simulated restart
     bot_restarted = bot_mod.make_bot(
         store,
         allowed_ids=[ALLOWED_USER],
@@ -892,11 +895,282 @@ def test_on_interaction_aprovar_botao_permitido_negado_desconhecido_e_inexistent
     asyncio.run(bot_restarted.on_interaction(i_ok))
     assert len(i_ok.response.messages) == 1
     assert "youtube: publicacao enfileirada" in i_ok.response.messages[0][0]
+    assert "tiktok: publicacao enfileirada" in i_ok.response.messages[0][0]
     assert i_ok.response.messages[0][1] is False
     assert db.publish_requests.find_one({"_id": "btn1_c01:youtube"})["status"] == "pending"
+    assert db.publish_requests.find_one({"_id": "btn1_c01:tiktok"})["status"] == "pending"
     assert len(msg_ok.edits) == 1
     assert msg_ok.edits[0]["view"] is None
-    assert "aprovado por Romulo" in msg_ok.edits[0]["content"]
+    assert "YouTube por Romulo" in msg_ok.edits[0]["content"]
+    assert "TikTok por Romulo" in msg_ok.edits[0]["content"]
+
+
+def test_on_interaction_publicar_por_destino_yt_tt_ambos_e_sequencia(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _make_clip(tmp_path, video_id="yt1", clip_id="yt1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    _make_clip(tmp_path, video_id="tt1", clip_id="tt1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    _make_clip(tmp_path, video_id="amb1", clip_id="amb1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    _make_clip(tmp_path, video_id="seq1", clip_id="seq1_c01", owner="w-off", thread_id=str(THREAD_ID))
+    tokens_path = _write_tokens(
+        tmp_path / "tokens.json",
+        {"youtube": {"refresh_token": "yt-refresh"}, "tiktok": {"refresh_token": "tt-refresh"}},
+    )
+    db, store = _mongo_store("w-pc1", "pc-mesa", T0)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=T0,
+    )
+
+    class _CompMsg:
+        def __init__(self, content: str):
+            self.content = content
+            self.edits: list[dict[str, Any]] = []
+
+        async def edit(self, *, content: str | None = None, view: Any = "UNSET") -> None:
+            self.edits.append({"content": content, "view": view})
+            if content is not None:
+                self.content = content
+
+    class _CompInteraction:
+        def __init__(self, custom_id: str, msg: _CompMsg, user_name: str = "Romulo"):
+            self.type = discord.InteractionType.component
+            self.data = {"custom_id": custom_id, "component_type": 2}
+            self.user = _FakeUser(ALLOWED_USER, name=user_name)
+            self.channel = _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+            self.channel_id = THREAD_ID
+            self.message = msg
+            self.response = _FakeInteractionResponse()
+
+    recorded_platforms: list[tuple[str, tuple[str, ...]]] = []
+    real_request = publicacao.request
+
+    def spy_request(*args: Any, **kwargs: Any) -> str:
+        recorded_platforms.append((args[1], kwargs.get("platforms", publicacao.PLATFORMS)))
+        return real_request(*args, **kwargs)
+
+    monkeypatch.setattr(publicacao, "request", spy_request)
+
+    # 1. YouTube only -> calls request with ("youtube",), keeps buttons
+    msg_yt = _CompMsg("**Titulo yt1_c01**")
+    i_yt = _CompInteraction("publicar:youtube:yt1_c01", msg_yt)
+    asyncio.run(bot.on_interaction(i_yt))
+    assert recorded_platforms[-1] == ("yt1_c01", ("youtube",))
+    assert "youtube: publicacao enfileirada" in i_yt.response.messages[0][0]
+    assert "tiktok" not in i_yt.response.messages[0][0]
+    assert db.publish_requests.find_one({"_id": "yt1_c01:youtube"})["status"] == "pending"
+    assert db.publish_requests.find_one({"_id": "yt1_c01:tiktok"}) is None
+    assert msg_yt.edits[-1]["view"] == "UNSET"
+    assert msg_yt.content == "**Titulo yt1_c01**\nYouTube por Romulo"
+
+    # 2. TikTok only -> calls request with ("tiktok",), keeps buttons
+    msg_tt = _CompMsg("**Titulo tt1_c01**")
+    i_tt = _CompInteraction("publicar:tiktok:tt1_c01", msg_tt)
+    asyncio.run(bot.on_interaction(i_tt))
+    assert recorded_platforms[-1] == ("tt1_c01", ("tiktok",))
+    assert "tiktok: publicacao enfileirada" in i_tt.response.messages[0][0]
+    assert "youtube" not in i_tt.response.messages[0][0]
+    assert db.publish_requests.find_one({"_id": "tt1_c01:tiktok"})["status"] == "pending"
+    assert db.publish_requests.find_one({"_id": "tt1_c01:youtube"}) is None
+    assert msg_tt.edits[-1]["view"] == "UNSET"
+    assert msg_tt.content == "**Titulo tt1_c01**\nTikTok por Romulo"
+
+    # 3. Ambos -> calls request with PLATFORMS, adds both lines, removes buttons
+    msg_amb = _CompMsg("**Titulo amb1_c01**")
+    i_amb = _CompInteraction("publicar:ambos:amb1_c01", msg_amb)
+    asyncio.run(bot.on_interaction(i_amb))
+    assert recorded_platforms[-1] == ("amb1_c01", publicacao.PLATFORMS)
+    assert "youtube: publicacao enfileirada" in i_amb.response.messages[0][0]
+    assert "tiktok: publicacao enfileirada" in i_amb.response.messages[0][0]
+    assert db.publish_requests.find_one({"_id": "amb1_c01:youtube"})["status"] == "pending"
+    assert db.publish_requests.find_one({"_id": "amb1_c01:tiktok"})["status"] == "pending"
+    assert msg_amb.edits[-1]["view"] is None
+    assert msg_amb.content == "**Titulo amb1_c01**\nYouTube por Romulo\nTikTok por Romulo"
+
+    # 4. Sequential clicks (even with offline worker -> "pedido fica na fila"):
+    #    1st click keeps buttons; 2nd click removes buttons
+    msg_seq = _CompMsg("**Titulo seq1_c01**")
+    i_seq_tt = _CompInteraction("publicar:tiktok:seq1_c01", msg_seq, user_name="Romulo")
+    asyncio.run(bot.on_interaction(i_seq_tt))
+    assert "pedido fica na fila" in i_seq_tt.response.messages[0][0]
+    assert msg_seq.edits[-1]["view"] == "UNSET"
+    assert msg_seq.content == "**Titulo seq1_c01**\nTikTok por Romulo"
+
+    i_seq_yt = _CompInteraction("publicar:youtube:seq1_c01", msg_seq, user_name="Maria")
+    asyncio.run(bot.on_interaction(i_seq_yt))
+    assert "pedido fica na fila" in i_seq_yt.response.messages[0][0]
+    assert msg_seq.edits[-1]["view"] is None
+    assert msg_seq.content == "**Titulo seq1_c01**\nTikTok por Romulo\nYouTube por Maria"
+
+
+def test_on_interaction_publicar_destino_negado_desligada_e_idempotente(tmp_path: Path):
+    _make_clip(tmp_path, video_id="desl1", clip_id="desl1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    _make_clip(tmp_path, video_id="dup1", clip_id="dup1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    _make_clip(tmp_path, video_id="pub1", clip_id="pub1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    # Only YouTube token configured -> TikTok is desligada
+    tokens_path = _write_tokens(tmp_path / "tokens.json", {"youtube": {"refresh_token": "yt-refresh"}})
+    db, store = _mongo_store("w-pc1", "pc-mesa", T0)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=T0,
+    )
+
+    class _CompMsg:
+        def __init__(self, content: str):
+            self.content = content
+            self.edits: list[dict[str, Any]] = []
+
+        async def edit(self, *, content: str | None = None, view: Any = "UNSET") -> None:
+            self.edits.append({"content": content, "view": view})
+            if content is not None:
+                self.content = content
+
+    class _CompInteraction:
+        def __init__(
+            self,
+            custom_id: str,
+            msg: _CompMsg,
+            *,
+            user_id: int | str = ALLOWED_USER,
+            channel: _FakeChannel | None = None,
+        ):
+            self.type = discord.InteractionType.component
+            self.data = {"custom_id": custom_id, "component_type": 2}
+            self.user = _FakeUser(user_id, name="Romulo")
+            self.channel = channel or _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+            self.channel_id = self.channel.id
+            self.message = msg
+            self.response = _FakeInteractionResponse()
+
+    # 1. Channel / user denied on publicar:<dest>:
+    for cid in ("publicar:youtube:desl1_c01", "publicar:tiktok:desl1_c01", "publicar:ambos:desl1_c01"):
+        m_bad_ch = _CompMsg("post")
+        i_bad_ch = _CompInteraction(cid, m_bad_ch, channel=_FakeChannel(OTHER_CHANNEL_ID))
+        asyncio.run(bot.on_interaction(i_bad_ch))
+        assert i_bad_ch.response.messages == [("canal nao permitido", True)]
+        assert m_bad_ch.edits == []
+
+        m_bad_u = _CompMsg("post")
+        i_bad_u = _CompInteraction(cid, m_bad_u, user_id=OTHER_USER)
+        asyncio.run(bot.on_interaction(i_bad_u))
+        assert i_bad_u.response.messages == [("sem permissao", True)]
+        assert m_bad_u.edits == []
+
+    # Invalid destination ignored
+    m_invalid = _CompMsg("post")
+    i_invalid = _CompInteraction("publicar:instagram:desl1_c01", m_invalid)
+    asyncio.run(bot.on_interaction(i_invalid))
+    assert i_invalid.response.messages == []
+    assert db.publish_requests.count_documents({}) == 0
+
+    # 2. TikTok desligada: clicking TikTok does not mark or edit
+    msg_desl = _CompMsg("**Titulo desl1_c01**")
+    i_tt_off = _CompInteraction("publicar:tiktok:desl1_c01", msg_desl)
+    asyncio.run(bot.on_interaction(i_tt_off))
+    assert i_tt_off.response.messages == [("tiktok: desligada", False)]
+    assert msg_desl.edits == []
+    assert db.publish_requests.count_documents({}) == 0
+
+    # 3. TikTok desligada: clicking Ambos marks ONLY YouTube and keeps buttons
+    i_amb_off = _CompInteraction("publicar:ambos:desl1_c01", msg_desl)
+    asyncio.run(bot.on_interaction(i_amb_off))
+    resp_text = i_amb_off.response.messages[0][0]
+    assert "youtube: publicacao enfileirada" in resp_text
+    assert "tiktok: desligada" in resp_text
+    assert db.publish_requests.find_one({"_id": "desl1_c01:youtube"})["status"] == "pending"
+    assert db.publish_requests.find_one({"_id": "desl1_c01:tiktok"}) is None
+    assert len(msg_desl.edits) == 1
+    assert msg_desl.edits[0]["view"] == "UNSET"
+    assert msg_desl.content == "**Titulo desl1_c01**\nYouTube por Romulo"
+    assert "TikTok por" not in msg_desl.content
+
+    # 4. Double-click idempotency: clicking YouTube twice does not duplicate line or DB doc
+    msg_dup = _CompMsg("**Titulo dup1_c01**")
+    asyncio.run(bot.on_interaction(_CompInteraction("publicar:youtube:dup1_c01", msg_dup)))
+    i_dup2 = _CompInteraction("publicar:youtube:dup1_c01", msg_dup)
+    asyncio.run(bot.on_interaction(i_dup2))
+    assert "youtube: publicacao enfileirada" in i_dup2.response.messages[0][0]
+    assert db.publish_requests.count_documents({"clip_id": "dup1_c01"}) == 1
+    assert msg_dup.content.count("YouTube por") == 1
+    assert len(msg_dup.edits) == 1
+
+    # 5. Already published ("ja publicado"): replies without duplicating or editing
+    db.publish_requests.insert_one({
+        "_id": "pub1_c01:youtube",
+        "clip_id": "pub1_c01",
+        "plataforma": "youtube",
+        "status": "ok",
+        "resultado": {"url": "https://youtube.com/shorts/xyz"},
+    })
+    msg_pub = _CompMsg("**Titulo pub1_c01**")
+    i_pub = _CompInteraction("publicar:youtube:pub1_c01", msg_pub)
+    asyncio.run(bot.on_interaction(i_pub))
+    assert "youtube: ja publicado (https://youtube.com/shorts/xyz)" in i_pub.response.messages[0][0]
+    assert msg_pub.edits == []
+    assert db.publish_requests.count_documents({"clip_id": "pub1_c01"}) == 1
+
+
+def test_on_interaction_publicar_destino_mantem_agenda_e_notifica_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from zoneinfo import ZoneInfo
+
+    sp = ZoneInfo("America/Sao_Paulo")
+    t_now = datetime(2026, 11, 18, 10, 0, tzinfo=sp).timestamp()
+    monkeypatch.setenv("CLIPES_AGENDA_HORARIOS", "11:30,19:00")
+    monkeypatch.setenv("CLIPES_TZ", "America/Sao_Paulo")
+
+    _make_clip(tmp_path, video_id="agp1", clip_id="agp1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    tokens_path = _write_tokens(
+        tmp_path / "tokens.json",
+        {"youtube": {"refresh_token": "yt-refresh"}, "tiktok": {"refresh_token": "tt-refresh"}},
+    )
+    db, store = _mongo_store("w-pc1", "pc-mesa", t_now)
+    thread_ch = _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=t_now,
+    )
+    bot.get_channel = lambda cid: thread_ch if int(cid) == THREAD_ID else None  # type: ignore[method-assign]
+
+    class _Msg:
+        def __init__(self, content: str):
+            self.content = content
+
+        async def edit(self, *, content: str | None = None, view: Any = "UNSET") -> None:
+            if content is not None:
+                self.content = content
+
+    class _MainChannelInteraction:
+        def __init__(self, custom_id: str, msg: _Msg):
+            self.type = discord.InteractionType.component
+            self.data = {"custom_id": custom_id, "component_type": 2}
+            self.user = _FakeUser(ALLOWED_USER, name="Romulo")
+            self.channel = _FakeChannel(CHANNEL_ID)
+            self.channel_id = CHANNEL_ID
+            self.message = msg
+            self.response = _FakeInteractionResponse()
+
+    i_yt = _MainChannelInteraction("publicar:youtube:agp1_c01", _Msg("**Titulo agp1_c01**"))
+    asyncio.run(bot.on_interaction(i_yt))
+    assert "agendado para 2026-11-18 11:30 (America/Sao_Paulo)" in i_yt.response.messages[0][0]
+    doc = db.publish_requests.find_one({"_id": "agp1_c01:youtube"})
+    assert doc is not None and doc["agendar_para"].astimezone(sp).hour == 11
+    assert len(thread_ch.sent) == 1
+    assert "youtube: publicacao enfileirada" in thread_ch.sent[0]
 
 
 def test_bot_publicar_com_agenda_e_sufixo_agora(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

@@ -300,6 +300,8 @@ docker compose up -d bot
 
 Comandos disponíveis apenas no canal configurado (`DISCORD_CHANNEL_ID`), suas threads e para IDs em `DISCORD_ALLOWED_USER_IDS`: `publicar <clip_id>` (ou `publicar <clip_id> agora`), `/publicar id:<clip_id>` (opcional `agora:True`), `/listar`, `/buscar texto:<palavras>` e `buscar <palavras>`.
 
+- **Publicar por destino:** cada mensagem de clipe enviada ao Discord traz 3 botões — **YouTube** (`publicar:youtube:<clip_id>`), **TikTok** (`publicar:tiktok:<clip_id>`) e **Ambos** (`publicar:ambos:<clip_id>`). Somente usuários em `DISCORD_ALLOWED_USER_IDS` no canal configurado (`DISCORD_CHANNEL_ID`) ou suas threads podem usá-los. Cada plataforma aceita acrescenta `<Plataforma> por <usuário>` à mensagem; plataformas sem token retornam `<plat>: desligada` e não são marcadas. Os botões permanecem na mensagem até que YouTube e TikTok tenham sido pedidos (via **Ambos** ou pelos dois cliques em sequência); botões legados `aprovar:<clip_id>` continuam funcionando como **Ambos**.
+
 - **Agenda de publicação:** no `docker-compose.yml`, `CLIPES_AGENDA_HORARIOS` vem com padrão `11:30,19:00` no fuso `CLIPES_TZ` (`America/Sao_Paulo`). Cada pedido aprovado recebe o próximo horário livre daquela plataforma com folga mínima de 30 minutos (1 publicação por horário por plataforma); defina `CLIPES_AGENDA_HORARIOS=` (vazio) no `.env` para publicar na hora, ou use `publicar <clip_id> agora` para publicar imediatamente.
 
 > **Workers multi-PC:** todo PC que executa o `monitor` e publica seus próprios clipes também precisa de `DISCORD_BOT_TOKEN` no `.env`; sem ele o worker pula prévias e `run_pending`, deixando pedidos `pending` na fila.

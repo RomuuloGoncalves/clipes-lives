@@ -23,6 +23,57 @@ from .registro import Registro
 _PUBLICAR_RE = re.compile(r"^\s*publicar\s+(\S+)(?:\s+(agora))?\s*$", re.IGNORECASE)
 _BUSCAR_RE = re.compile(r"^\s*buscar(?:\s+(.*))?$", re.IGNORECASE)
 _DISCORD_MAX_CHARS = 1900
+_PLATFORM_LABELS: dict[str, str] = {
+    "youtube": "YouTube",
+    "tiktok": "TikTok",
+}
+_DEST_PLATFORMS: dict[str, tuple[str, ...]] = {
+    "youtube": ("youtube",),
+    "tiktok": ("tiktok",),
+    "ambos": publicacao.PLATFORMS,
+}
+
+
+def _parse_button_custom_id(custom_id: str) -> tuple[tuple[str, ...], str] | None:
+    if custom_id.startswith("aprovar:"):
+        clip_id = custom_id[len("aprovar:") :].strip()
+        return (publicacao.PLATFORMS, clip_id) if clip_id else None
+    if custom_id.startswith("publicar:"):
+        dest, sep, raw_clip_id = custom_id[len("publicar:") :].partition(":")
+        clip_id = raw_clip_id.strip()
+        platforms = _DEST_PLATFORMS.get(dest)
+        if not sep or not clip_id or platforms is None:
+            return None
+        return (platforms, clip_id)
+    return None
+
+
+def _accepted_platforms(result: str) -> list[str]:
+    accepted: list[str] = []
+    for line in result.splitlines():
+        plat, sep, rest = line.partition(":")
+        if not sep or plat not in _PLATFORM_LABELS:
+            continue
+        if "publicacao enfileirada" in rest or "pedido fica na fila" in rest:
+            accepted.append(plat)
+    return accepted
+
+
+def _has_platform_line(content: str, label: str) -> bool:
+    prefix = f"{label} por "
+    return any(line.startswith(prefix) for line in content.splitlines())
+
+
+def _append_message_lines(orig_content: str, lines: list[str]) -> str:
+    if not lines:
+        return orig_content
+    suffix = "\n".join(lines)
+    if not orig_content:
+        return suffix[:2000]
+    if len(orig_content) + 1 + len(suffix) <= 2000:
+        return f"{orig_content}\n{suffix}"
+    max_orig = max(0, 2000 - len(suffix) - 1)
+    return f"{orig_content[:max_orig]}\n{suffix}" if max_orig > 0 else suffix[:2000]
 
 
 def _accepts_kw(fn: Any, kw: str) -> bool:
@@ -308,6 +359,7 @@ class ClipesBot(discord.Client):
         thread_id: str | None,
         *,
         agendar: bool = True,
+        platforms: tuple[str, ...] = publicacao.PLATFORMS,
     ) -> str:
         return publicacao.request(
             self.store,
@@ -320,6 +372,7 @@ class ClipesBot(discord.Client):
             tokens_path=self.tokens_path,
             quota_path=self.quota_path,
             thread_id=thread_id,
+            platforms=platforms,
             agendar=agendar,
         )
 
@@ -375,6 +428,47 @@ class ClipesBot(discord.Client):
         await self._maybe_notify_thread(clip_id, result, getattr(channel, "id", None))
         await self._maybe_run_local(result)
 
+    async def _update_button_message(
+        self,
+        msg: Any,
+        user: Any,
+        user_id: Any,
+        accepted: list[str],
+        result: str,
+        no_mentions: discord.AllowedMentions,
+    ) -> None:
+        if msg is None or not hasattr(msg, "edit"):
+            return
+        raw_name = (
+            getattr(user, "display_name", None)
+            or getattr(user, "name", None)
+            or str(user_id)
+        )
+        user_name = str(raw_name).replace("\n", " ").strip()
+        orig_content = str(getattr(msg, "content", "") or "")
+        lines_to_add: list[str] = []
+        for plat in accepted:
+            label = _PLATFORM_LABELS[plat]
+            if not _has_platform_line(orig_content, label):
+                lines_to_add.append(f"{label} por {user_name}")
+        new_content = _append_message_lines(orig_content, lines_to_add)
+        has_yt = _has_platform_line(new_content, "YouTube") or ("youtube: ja publicado" in result)
+        has_tt = _has_platform_line(new_content, "TikTok") or ("tiktok: ja publicado" in result)
+        remove_buttons = has_yt and has_tt
+        if new_content == orig_content and not remove_buttons:
+            return
+        edit_kw: dict[str, Any] = (
+            {"allowed_mentions": no_mentions}
+            if _accepts_kw(msg.edit, "allowed_mentions")
+            else {}
+        )
+        if remove_buttons:
+            edit_kw["view"] = None
+        try:
+            await msg.edit(content=new_content, **edit_kw)
+        except Exception:
+            pass
+
     async def on_interaction(self, interaction: Any) -> None:
         itype = getattr(interaction, "type", None)
         if itype not in (discord.InteractionType.component, 3):
@@ -382,12 +476,10 @@ class ClipesBot(discord.Client):
         data = getattr(interaction, "data", None)
         if not isinstance(data, dict):
             return
-        custom_id = str(data.get("custom_id") or "")
-        if not custom_id.startswith("aprovar:"):
+        parsed = _parse_button_custom_id(str(data.get("custom_id") or ""))
+        if parsed is None:
             return
-        clip_id = custom_id[len("aprovar:") :].strip()
-        if not clip_id:
-            return
+        platforms, clip_id = parsed
 
         no_mentions = discord.AllowedMentions.none()
         if not _interaction_in_configured_channel(interaction, self.channel_id):
@@ -409,38 +501,23 @@ class ClipesBot(discord.Client):
         thread_id = _extract_thread_id(channel)
         user = getattr(interaction, "user", None)
         user_id = getattr(user, "id", "")
-        result = self._request_publish(clip_id, user_id, thread_id)
+        result = self._request_publish(clip_id, user_id, thread_id, platforms=platforms)
         await interaction.response.send_message(
             result,
             ephemeral=(result == "sem permissao"),
             allowed_mentions=no_mentions,
         )
 
-        accepted = ("publicacao enfileirada" in result) or ("pedido fica na fila" in result)
+        accepted = _accepted_platforms(result)
         if accepted:
-            msg = getattr(interaction, "message", None)
-            if msg is not None and hasattr(msg, "edit"):
-                user_name = (
-                    getattr(user, "display_name", None)
-                    or getattr(user, "name", None)
-                    or str(user_id)
-                )
-                orig_content = str(getattr(msg, "content", "") or "")
-                suffix = f"aprovado por {user_name}"
-                if suffix in orig_content:
-                    new_content = orig_content
-                elif not orig_content:
-                    new_content = suffix[:2000]
-                elif len(orig_content) + 1 + len(suffix) <= 2000:
-                    new_content = f"{orig_content}\n{suffix}"
-                else:
-                    max_orig = max(0, 2000 - len(suffix) - 1)
-                    new_content = f"{orig_content[:max_orig]}\n{suffix}" if max_orig > 0 else suffix[:2000]
-                edit_kw: dict[str, Any] = {"allowed_mentions": no_mentions} if _accepts_kw(msg.edit, "allowed_mentions") else {}
-                try:
-                    await msg.edit(content=new_content, view=None, **edit_kw)
-                except Exception:
-                    pass
+            await self._update_button_message(
+                getattr(interaction, "message", None),
+                user,
+                user_id,
+                accepted,
+                result,
+                no_mentions,
+            )
 
         current_cid = getattr(interaction, "channel_id", getattr(channel, "id", None))
         await self._maybe_notify_thread(clip_id, result, current_cid)

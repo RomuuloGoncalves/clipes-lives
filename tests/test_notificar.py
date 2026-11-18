@@ -488,7 +488,7 @@ def test_notify_ack_ok_divergencias_verificar_0_e_retry_e_liberar(tmp_path, monk
     assert (out_livre / "c1.mp4").is_file()
 
 
-def test_notify_envia_botao_aprovar_com_custom_id_no_post_e_fallback_413(tmp_path, monkeypatch):
+def test_notify_envia_botoes_publicar_com_custom_id_no_post_e_fallback_413(tmp_path, monkeypatch):
     from clipes.discord_rest import DiscordRestError
 
     monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
@@ -519,15 +519,27 @@ def test_notify_envia_botao_aprovar_com_custom_id_no_post_e_fallback_413(tmp_pat
                 "components": [
                     {
                         "type": 2,
+                        "style": 4,
+                        "label": "YouTube",
+                        "custom_id": f"publicar:youtube:{clip_id}",
+                    },
+                    {
+                        "type": 2,
+                        "style": 2,
+                        "label": "TikTok",
+                        "custom_id": f"publicar:tiktok:{clip_id}",
+                    },
+                    {
+                        "type": 2,
                         "style": 3,
-                        "label": "Aprovar",
-                        "custom_id": f"aprovar:{clip_id}",
-                    }
+                        "label": "Ambos",
+                        "custom_id": f"publicar:ambos:{clip_id}",
+                    },
                 ],
             }
         ]
 
-    # 413 fallback text post also keeps Aprovar button
+    # 413 fallback text post also keeps the 3 destination buttons
     class Client413(FakeDiscordClient):
         def post(self, channel_id, content, file=None, components=None):
             if file is not None:
@@ -541,7 +553,14 @@ def test_notify_envia_botao_aprovar_com_custom_id_no_post_e_fallback_413(tmp_pat
     c413 = Client413()
     notify_discord(out_413, policy=ChannelPolicy(), discord_client=c413, preview_fn=lambda s, d, c: s)
     assert c413.posts[-1]["file"] is None
-    assert c413.posts[-1]["components"][0]["components"][0]["custom_id"] == "aprovar:vid413_c01"
+    row_btns = c413.posts[-1]["components"][0]["components"]
+    assert [b["custom_id"] for b in row_btns] == [
+        "publicar:youtube:vid413_c01",
+        "publicar:tiktok:vid413_c01",
+        "publicar:ambos:vid413_c01",
+    ]
+    assert [b["label"] for b in row_btns] == ["YouTube", "TikTok", "Ambos"]
+    assert [b["style"] for b in row_btns] == [4, 2, 3]
 
 
 def test_notify_registro_e_liberar_nao_derrubam_pipeline(tmp_path, monkeypatch, capsys):

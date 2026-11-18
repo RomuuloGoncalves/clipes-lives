@@ -137,10 +137,22 @@ def _approve_components(clip_id: str) -> list[dict[str, Any]]:
             "components": [
                 {
                     "type": 2,
+                    "style": 4,
+                    "label": "YouTube",
+                    "custom_id": f"publicar:youtube:{clip_id}",
+                },
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "TikTok",
+                    "custom_id": f"publicar:tiktok:{clip_id}",
+                },
+                {
+                    "type": 2,
                     "style": 3,
-                    "label": "Aprovar",
-                    "custom_id": f"aprovar:{clip_id}",
-                }
+                    "label": "Ambos",
+                    "custom_id": f"publicar:ambos:{clip_id}",
+                },
             ],
         }
     ]
