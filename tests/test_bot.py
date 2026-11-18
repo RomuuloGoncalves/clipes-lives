@@ -556,6 +556,19 @@ def test_entrypoint_auth_routes_youtube_and_tiktok(tmp_path: Path, monkeypatch: 
     assert called == ["youtube", "tiktok"]
 
 
+def test_entrypoint_auth_passes_explicit_bind_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    calls: list[tuple[str, str | None]] = []
+
+    def fake_auth_flow(plataforma: str, *args: Any, **kwargs: Any) -> Path:
+        calls.append((plataforma, kwargs.get("bind_host")))
+        return tmp_path / "tokens.json"
+
+    monkeypatch.setattr(oauth_mod, "auth_flow", fake_auth_flow)
+
+    assert entry.main(["auth", "youtube", "--bind", "0.0.0.0"]) == 0
+    assert calls == [("youtube", "0.0.0.0")]
+
+
 def test_entrypoint_auth_oauth_error_exits_2_without_secrets(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ):

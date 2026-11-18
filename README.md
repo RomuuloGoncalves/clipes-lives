@@ -204,12 +204,12 @@ O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o s
 
 ### 4. Autorização OAuth e execução do bot
 
-Autorize cada plataforma uma vez (escuta em `127.0.0.1:8765` e grava `~/.config/clipes-lives/tokens.json` com modo `600`; tokens rotacionados do TikTok são regravados automaticamente):
+Autorize cada plataforma uma vez (escuta em `127.0.0.1:8765` por padrão e grava `~/.config/clipes-lives/tokens.json` com modo `600`; tokens rotacionados do TikTok são regravados automaticamente). Dentro do contêiner, passe `--bind 0.0.0.0` (ou `CLIPES_OAUTH_BIND=0.0.0.0`) para o `-p 127.0.0.1:8765:8765` encaminhar o callback do navegador sem expor a porta fora do `127.0.0.1` no host:
 
 ```sh
 set -a && . ~/.config/clipes-lives/segredos.env && set +a
-docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth youtube
-docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth tiktok
+docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth youtube --bind 0.0.0.0
+docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth tiktok --bind 0.0.0.0
 ```
 
 Subir o serviço contínuo do bot (um único processo por servidor Discord):
