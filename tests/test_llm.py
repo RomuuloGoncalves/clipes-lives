@@ -111,6 +111,8 @@ def test_complete_sends_no_think_temp_zero_and_json_schema():
                             "hashtags": ["#cortes", "#livesbr", "#gaming"],
                             "nota": 8.5,
                             "motivo": "Reação forte com contexto claro.",
+                            "gancho_topo": "Que susto foi esse?",
+                            "descricao_longa": "",
                         })
                     }
                 }]
@@ -611,3 +613,56 @@ def test_title_echo_rejects_repeated_live_title():
     live = "BISTECONE & GABRIEL COXINHA - Podpah #1049"
     assert is_title_echo("BISTECONE & GABRIEL COXINHA ?", live)
     assert not is_title_echo("Quem inventa mais história falsa?", live)
+
+
+def test_schema_and_prompt_ask_for_hook_top_and_long_description(tmp_path: Path):
+    from clipes import llm
+
+    props = llm.CLIP_JSON_SCHEMA["properties"]
+    assert props["gancho_topo"]["maxLength"] == 35
+    assert props["descricao_longa"]["maxLength"] == 500
+    assert {"gancho_topo", "descricao_longa"} <= set(llm.CLIP_JSON_SCHEMA["required"])
+    prompt = llm._build_clip_prompt("fala do clipe", _make_ing(tmp_path), "gaules")
+    for needle in ("gancho_topo", "descricao_longa", "conflito", "sem emoji", "sem URL"):
+        assert needle in prompt
+
+
+def test_pick_hook_top_valid_and_fallbacks():
+    from clipes.llm import pick_hook_top
+
+    tr = "ele perdeu tudo no jogo"
+    assert pick_hook_top("Ele perdeu tudo?", "Titulo qualquer!", tr) == "Ele perdeu tudo?"
+    # emoji, > 35 e entidade inventada caem no título (cortado na palavra ou inteiro)
+    assert pick_hook_top("Ele perdeu tudo? 😱", "Perdeu tudo?", tr) == "Perdeu tudo?"
+    assert pick_hook_top("x" * 36, "Perdeu tudo?", tr) == "Perdeu tudo?"
+    assert pick_hook_top("O Gaules perdeu?", "Perdeu tudo?", tr) == "Perdeu tudo?"
+    long_title = "Ele perdeu absolutamente tudo na live hoje?"
+    assert pick_hook_top("", long_title, tr) == "Ele perdeu absolutamente tudo na"
+    # título longo sem fronteira útil -> vazio
+    assert pick_hook_top("", "a" * 50 + "?", tr) == ""
+
+
+def test_long_description_validation_fallback_and_format():
+    from clipes.llm import format_long_description, long_paragraph_fallback, pick_long_description
+    from clipes.models import SnappedClip
+
+    text = "Ele perdeu tudo hoje. " + "Foi muito engraçado de ver. " * 20
+    clip = SnappedClip(peak=1, start=0, end=30, score=0.5, text=text)
+    fb = long_paragraph_fallback(clip)
+    assert fb.startswith("Ele perdeu tudo hoje. Foi muito")
+    assert len(fb) <= 320 and fb.endswith(".")
+
+    ok = "Ele perdeu tudo hoje e foi muito engraçado de ver a reação dele. " * 3
+    assert 150 <= len(ok.strip()) <= 500
+    assert pick_long_description(ok, clip) == (ok.strip(), "llm")
+    assert pick_long_description("curta demais", clip) == (fb, "fallback")
+    assert pick_long_description(ok + "veja twitch.tv/x", clip)[1] == "fallback"
+    assert pick_long_description(ok + " Gaules", clip)[1] == "fallback"
+    assert pick_long_description("a " * 300, clip)[1] == "fallback"  # > 500
+
+    out = format_long_description("Titulo?", "Paragrafo.", "gaules", "https://x/v", ["#a", "#b", "#c"], 2, 3)
+    assert out == (
+        "Titulo?\n\nParagrafo.\n\nCrédito: gaules\n"
+        "Live completa: https://x/v · Parte 2/3\n\n#a #b #c"
+    )
+    assert "Parte" not in format_long_description("T?", "P.", "c", "u", ["#a"])

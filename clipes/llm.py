@@ -43,8 +43,10 @@ CLIP_JSON_SCHEMA: dict[str, Any] = {
         },
         "nota": {"type": "number", "minimum": 0, "maximum": 10},
         "motivo": {"type": "string", "maxLength": 120},
+        "gancho_topo": {"type": "string", "maxLength": 35},
+        "descricao_longa": {"type": "string", "maxLength": 500},
     },
-    "required": ["titulo", "gancho", "hashtags", "nota", "motivo"],
+    "required": ["titulo", "gancho", "hashtags", "nota", "motivo", "gancho_topo", "descricao_longa"],
     "additionalProperties": False,
 }
 
@@ -310,7 +312,7 @@ def complete(
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 300,
+        "max_tokens": 600,
         "response_format": {
             "type": "json_object",
             "schema": schema,
@@ -522,6 +524,74 @@ def format_three_line_caption(
     return f"{line1}\n{credit}\n{line3}"
 
 
+def pick_hook_top(raw: str, title: str, transcript: str, reference_text: str = "") -> str:
+    """Gancho de topo (<= 35, sem emoji, sem entidade inventada); inválido -> título cortado ou ""."""
+    limit = 35
+    clean = " ".join(str(raw or "").split())
+    if (
+        clean
+        and len(clean) <= limit
+        and not _EMOJI_RE.search(clean)
+        and not _URL_OR_MENTION_RE.search(clean)
+        and validate_no_hallucinated_entities(clean, transcript, reference_text)
+    ):
+        return clean
+    t = " ".join(str(title or "").split())
+    if len(t) > limit:
+        cut = t[: limit + 1]
+        if " " not in cut:
+            return ""
+        t = cut.rsplit(" ", 1)[0]
+    t = t.rstrip(" ,;:-")
+    return "" if _EMOJI_RE.search(t) else t
+
+
+def long_paragraph_fallback(clip: SnappedClip, limit: int = 320) -> str:
+    """Primeiras frases completas da transcrição do clipe, até `limit` caracteres."""
+    text = " ".join(clip.text.split())
+    out = ""
+    for sent in re.split(r"(?<=[.!?…])\s+", text):
+        nxt = f"{out} {sent}".strip()
+        if len(nxt) > limit:
+            break
+        out = nxt
+    if out or not text:
+        return out
+    cut = text[: limit + 1]  # primeira frase sozinha estoura: corta na palavra
+    return (cut.rsplit(" ", 1)[0] if " " in cut and len(text) > limit else text[:limit]).rstrip()
+
+
+def pick_long_description(raw: str, clip: SnappedClip, reference_text: str = "") -> tuple[str, str]:
+    """(parágrafo, fonte): "llm" se 150-500, sem URL e sem entidade inventada; senão fallback."""
+    clean = " ".join(str(raw or "").split())
+    if (
+        150 <= len(clean) <= 500
+        and not _URL_OR_MENTION_RE.search(clean)
+        and validate_no_hallucinated_entities(clean, clip.text, reference_text)
+    ):
+        return clean, "llm"
+    return long_paragraph_fallback(clip), "fallback"
+
+
+def format_long_description(
+    title: str,
+    paragraph: str,
+    channel: str,
+    url: str,
+    hashtags: list[str],
+    part_index: int = 1,
+    part_total: int = 1,
+) -> str:
+    """Título, parágrafo, crédito, live completa (+ parte), hashtags."""
+    live = f"Live completa: {url}"
+    if part_total > 1:
+        live += f" · Parte {part_index}/{part_total}"
+    return (
+        f"{' '.join(title.split())}\n\n{paragraph}\n\n"
+        f"Crédito: {channel or 'streamer'}\n{live}\n\n{' '.join(hashtags)}"
+    )
+
+
 def _infer_channel(ing: IngestResult) -> str:
     explicit = str(getattr(ing, "channel", "") or "").strip()
     if explicit:
@@ -562,8 +632,13 @@ def _build_clip_prompt(clip_text: str, ing: IngestResult, channel: str) -> str:
         f"<transcricao>{truncated}</transcricao>\n\n"
         "Gere JSON com:\n"
         "- titulo: <= 60 chars, termine ou contenha ? ou !, no máximo 1 emoji, "
+        "sobre o conflito, a revelação ou a reação do trecho (nada genérico e nunca o título da live), "
         "SEM inventar nomes próprios ausentes da transcrição/título.\n"
         "- gancho: frase curta (<= 140 chars) apresentando o momento.\n"
+        "- gancho_topo: <= 35 chars, pergunta ou promessa que prenda o espectador, "
+        "sem emoji e sem entregar o desfecho.\n"
+        "- descricao_longa: 2 a 4 frases (150 a 500 chars) resumindo o momento, "
+        "sem URL e sem inventar nomes ou números ausentes da transcrição.\n"
         "- hashtags: 3 a 5 hashtags PT-BR específicas (sem #fyp, #foryou, #viral, #reels, sem hífen).\n"
         "- nota: número de 0 a 10 com base na rubrica:\n"
         "  0-3: fala desconexa sem clímax;\n"
