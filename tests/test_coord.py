@@ -219,7 +219,7 @@ def test_claim_sem_dono_anterior_ou_do_proprio_dono_nao_marca_lost(env):
 
 # ---- T8: heartbeat do PC ----
 
-CAP = {"cpus": 3, "ram_gb": 2.6, "disco_livre_gb": 15.1, "temp_c": 78, "gpu": None, "score": 3}
+CAP = {"cpus": 3, "cpu_pct": 42.5, "ram_gb": 2.6, "disco_livre_gb": 15.1, "temp_c": 78, "gpu": None, "score": 3}
 
 
 def test_181_batidas_deixam_180_no_historico(env):
@@ -242,6 +242,7 @@ def test_beat_grava_campos_do_design_e_nada_alem_deles(env):
         "PC-1", CAP, "job-x", 2, 0.5)
     assert doc["heartbeat_at"] == a._dt()
     assert set(doc["history"][0]) == {"t", "cpu_pct", "temp_c"}
+    assert doc["history"][0]["cpu_pct"] == 42.5
     assert doc["history"][0]["temp_c"] == 78
 
 

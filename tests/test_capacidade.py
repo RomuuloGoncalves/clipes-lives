@@ -30,12 +30,14 @@ def _make_sysfs(root: Path, cpu_max: str | None = "300000 100000", mem_max: str 
     return root
 
 
-def _make_proc(root: Path, mem_available_kb: int = 4 * 1024 * 1024) -> Path:
+def _make_proc(root: Path, mem_available_kb: int = 4 * 1024 * 1024, load1: float | None = None) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     (root / "meminfo").write_text(
         f"MemTotal:       16777216 kB\nMemAvailable:   {mem_available_kb} kB\n",
         encoding="utf-8",
     )
+    if load1 is not None:
+        (root / "loadavg").write_text(f"{load1:.2f} 0.50 0.40 1/200 1234\n", encoding="utf-8")
     return root
 
 
@@ -72,13 +74,14 @@ def test_capacity_picks_min_of_cgroup_and_memavailable(tmp_path, monkeypatch):
 
     # cgroup limit = 2 GiB, host MemAvailable = 6 GiB -> 2.0 GiB
     sysfs = _make_sysfs(tmp_path / "sys1", cpu_max="300000 100000", mem_max=str(2 * 1024**3))
-    proc = _make_proc(tmp_path / "proc1", mem_available_kb=6 * 1024 * 1024)
+    proc = _make_proc(tmp_path / "proc1", mem_available_kb=6 * 1024 * 1024, load1=1.5)
 
     def missing_smi(*args, **kwargs):
         raise FileNotFoundError("nvidia-smi")
 
     cap = capacity(out, sysfs=sysfs, proc=proc, run=missing_smi)
     assert cap["cpus"] == 3
+    assert cap["cpu_pct"] == 50.0
     assert cap["ram_gb"] == pytest.approx(2.0, rel=1e-2)
     assert cap["temp_c"] == 78
     assert cap["gpu"] is None
@@ -105,7 +108,13 @@ def test_capacity_temp_sem_sensor_or_missing_returns_none(tmp_path, monkeypatch)
 
     cap_missing = capacity(out, sysfs=sysfs, proc=proc, run=fail_smi)
     assert cap_missing["temp_c"] is None
+    assert cap_missing["cpu_pct"] is None
     assert cap_missing["gpu"] is None
+
+    # load1 acima da cota de CPUs é limitado a 100.0%
+    proc_cheio = _make_proc(tmp_path / "proc_cheio", load1=9.0)
+    cap_cheio = capacity(out, sysfs=sysfs, proc=proc_cheio, run=fail_smi)
+    assert cap_cheio["cpu_pct"] == 100.0
 
     (out / ".temp").write_text("sem-sensor\n", encoding="utf-8")
     cap_sem = capacity(out, sysfs=sysfs, proc=proc, run=fail_smi)
