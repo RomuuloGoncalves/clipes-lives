@@ -1235,26 +1235,53 @@ def follow_live(
     jobs: list[str] = []
 
     live_id: str | None = None
+    cap_fn = capacity_fn
+    ml_fn = max_lives_fn
+    worker_alias = os.environ.get("CLIPES_ALIAS", "").strip()
+    beat_interval = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20")))
     if coord is not None:
-        from .capacidade import capacity as default_cap
+        from .capacidade import capacity as default_cap, worker_id as get_worker_id
         from .perfil import max_lives as default_max_lives
 
-        cap = (capacity_fn or default_cap)(out_root)
-        allowed = (max_lives_fn or default_max_lives)(out_root, cap.get("cpus"))
+        cap_fn = cap_fn or default_cap
+        ml_fn = ml_fn or default_max_lives
+        if not worker_alias:
+            worker_alias = get_worker_id(out_root)
+        cap = cap_fn(out_root)
+        allowed = ml_fn(out_root, cap.get("cpus"))
         if allowed < 1:
             return {"status": "not_claimed", "jobs": jobs}
-        if hasattr(coord, "db") and hasattr(coord, "worker_id"):
-            owned_count = coord.db.lives.count_documents({"owner": coord.worker_id, "status": "live"})
-            if owned_count >= allowed:
-                return {"status": "not_claimed", "jobs": jobs}
         sid = stream_id or _resolve_stream_id(channel, probe=probe)
         if not sid:
             return {"status": "not_claimed", "jobs": jobs}
         live_id = f"twitch:{channel}:{sid}"
+        if hasattr(coord, "db") and hasattr(coord, "worker_id"):
+            owned_count = coord.db.lives.count_documents({
+                "_id": {"$ne": live_id},
+                "owner": coord.worker_id,
+                "status": "live",
+            })
+            if owned_count >= allowed:
+                return {"status": "not_claimed", "jobs": jobs}
         coord.ensure_live(live_id, channel=channel, platform="twitch", stream_id=sid)
         _wait_claim_sync(30.0 / max(1.0, float(cap.get("score") or 1)), now=now, sleep=sleep)
         if not coord.claim_live(live_id):
             return {"status": "not_claimed", "jobs": jobs}
+
+    mongo_offline_until = float("-inf")
+    current_job: list[str | None] = [None]
+    lost_lives: set[str] = set()
+
+    def _coord_active() -> Any | None:
+        if coord is None or live_id is None or now() < mongo_offline_until:
+            return None
+        return coord
+
+    def _on_mongo_err(exc: BaseException) -> None:
+        nonlocal mongo_offline_until
+        mongo_offline_until = now() + MONGO_RECONNECT_S
+        uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
+        print(f"[fila] Mongo indisponivel ({_sanitize_error(exc, uri)}); seguindo local", flush=True)
 
     def pending() -> list[Path]:
         found = []
@@ -1298,6 +1325,25 @@ def follow_live(
         (job_dir / "meta.json").write_text(json.dumps(
             {"id": job_id, "title": f"{channel} - live", "url": url, "extractor": "twitch",
              "channel": channel, "is_live": False, "duration": duration}, ensure_ascii=False), encoding="utf-8")
+
+        c_active = _coord_active()
+        if c_active is not None and job["status"] != "rejected":
+            mongo_job_id = f"{live_id}:{int(e)}"
+            try:
+                added = c_active.add_job(mongo_job_id, live_id, (start_ts, e), 0.0)
+            except Exception as exc:
+                if not _is_mongo_error(exc):
+                    raise
+                _on_mongo_err(exc)
+                job["coord_synced"] = False
+            else:
+                if not added:
+                    shutil.rmtree(job_dir, ignore_errors=True)
+                    return
+                job.update(live_id=live_id, mongo_job_id=mongo_job_id, coord_synced=True)
+        elif coord is not None:
+            job["coord_synced"] = False
+
         _write_job(job_dir, job)
         queue.enqueue(job_dir)
         jobs.append(job_id)
@@ -1305,12 +1351,46 @@ def follow_live(
         backlog = pending()
         if len(backlog) > LIVE_MAX_BACKLOG:
             print(f"[live] backlog {len(backlog)} > {LIVE_MAX_BACKLOG}: {backlog[0].name} lost", flush=True)
-            queue.complete(backlog[0], "rejected", {"reject_reason": "lost", "lost": True})
+            lost_dir = backlog[0]
+            try:
+                lost_job = _read_job(lost_dir)
+            except (OSError, ValueError):
+                lost_job = {}
+            queue.complete(lost_dir, "rejected", {"reject_reason": "lost", "lost": True})
+            c_lost = _coord_active()
+            if c_lost is not None and lost_job.get("mongo_job_id"):
+                try:
+                    if hasattr(c_lost, "mark_job_lost"):
+                        c_lost.mark_job_lost(lost_job["mongo_job_id"])
+                    elif hasattr(c_lost, "db"):
+                        c_lost.db.jobs.update_one(
+                            {
+                                "_id": lost_job["mongo_job_id"],
+                                "owner": c_lost.worker_id,
+                                "status": {"$in": ["pending", "processing"]},
+                            },
+                            {"$set": {"status": "lost", "updated_at": c_lost._dt()}},
+                        )
+                except Exception as exc:
+                    if not _is_mongo_error(exc):
+                        raise
+                    _on_mongo_err(exc)
 
     def process_one() -> bool:
-        return run_worker_step(queue, out_root, active_policy, live_pipeline)
+        return run_worker_step(
+            queue,
+            out_root,
+            active_policy,
+            live_pipeline,
+            coord=_coord_active(),
+            on_mongo_error=_on_mongo_err,
+            lost_lives=lost_lives,
+            on_job_active=lambda jid: current_job.__setitem__(0, jid),
+        )
 
     live_ended = False
+    lease_lost = False
+    last_beat = float("-inf")
     try:
         if not pool.start_on_demand(channel):
             raise RuntimeError(f"nao foi possivel gravar {channel}")
@@ -1321,6 +1401,30 @@ def follow_live(
         since: dict[str, float] = {}
         while True:
             t = now()
+            c_active = _coord_active()
+            if c_active is not None and t - last_beat >= beat_interval:
+                last_beat = t
+                cap_now = cap_fn(out_root) if cap_fn is not None else {"cpus": 1, "score": 1}
+                ml_now = max(1, int(ml_fn(out_root, cap_now.get("cpus")) if ml_fn is not None else 1))
+                razao_now = _read_perfil_razao(out_root, cap_now.get("cpus"))
+                try:
+                    c_active.beat(worker_alias, cap_now, current_job[0], ml_now, razao_now)
+                    renewed = c_active.renew(live_id)
+                except Exception as exc:
+                    if not _is_mongo_error(exc):
+                        raise
+                    _on_mongo_err(exc)
+                else:
+                    if not renewed:
+                        print(f"[fila] lease perdida {live_id}", flush=True)
+                        lost_lives.add(live_id)
+                        if hasattr(pool, "stop_channel"):
+                            pool.stop_channel(channel)
+                        else:
+                            pool.release_on_demand(channel)
+                        lease_lost = True
+                        live_ended = False
+                        break
             if t - last_check >= LIVE_IS_LIVE_EVERY_S:
                 last_check = t
                 try:
@@ -1349,13 +1453,14 @@ def follow_live(
             if not (pending() and process_one()):
                 sleep(1.0)
             pool.cleanup(t)
-        # end: close the tail (>= MIN_CLIP_SOURCE_S past the last boundary), then drain this live's queue
-        segs = pool.segments(channel)
-        e = min(now(), segs[-1][0] + SEGMENT_S) if segs else 0.0
-        if e - (next_e - step) >= MIN_CLIP_SOURCE_S:
-            close_window(e, last=True)
-        while pending():
-            process_one()
+        if not lease_lost:
+            # end: close the tail (>= MIN_CLIP_SOURCE_S past the last boundary), then drain this live's queue
+            segs = pool.segments(channel)
+            e = min(now(), segs[-1][0] + SEGMENT_S) if segs else 0.0
+            if e - (next_e - step) >= MIN_CLIP_SOURCE_S:
+                close_window(e, last=True)
+            while pending():
+                process_one()
     finally:
         pool.release_hold(channel)
         pool.release_on_demand(channel)
@@ -1365,7 +1470,7 @@ def follow_live(
             except Exception as exc:
                 if not _is_mongo_error(exc):
                     raise
-    return {"status": "ended", "jobs": jobs}
+    return {"status": "lease_lost" if lease_lost else "ended", "jobs": jobs}
 
 
 # --- main loop and `python -m clipes monitor` entrypoint ------------------------------------------
@@ -1793,6 +1898,14 @@ async def run_monitor(
             lock.close()
 
 
+def _connect_coord_for_follow(out_root: Path) -> Any | None:
+    session = _CoordSession(out_root)
+    if not session.configured:
+        return None
+    session.connect()
+    return session.active
+
+
 def main(argv: list[str] | None = None) -> int:
     import argparse
 
@@ -1819,12 +1932,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[monitor] canal bloqueado ou invalido: {args.follow}", flush=True)
             return 2
         print(f"[monitor] acompanhando {channel}", flush=True)
+        follow_coord = _connect_coord_for_follow(out_root)
         try:
             follow_live(
                 channel,
                 out_root,
                 queue_root=queue_root,
                 policy=policy,
+                coord=follow_coord,
             )
         except KeyboardInterrupt:
             pass

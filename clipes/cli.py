@@ -211,16 +211,27 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
     cloud_llm.set_out_dir(out_root)
-    if getattr(args, "ate_acabar", False) and bool(probe_metadata(args.url).get("is_live")):
-        out_root.mkdir(parents=True, exist_ok=True)
-        print(f"[live] Live ativa detectada; acompanhando até acabar: {args.url}", flush=True)
-        follow_kwargs: dict[str, Any] = {}
-        sig_params = inspect.signature(follow_live).parameters
-        has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
-        if has_varkw or "max_dur" in sig_params:
-            follow_kwargs["max_dur"] = args.max_dur
-        follow_live(args.url, out_root, **follow_kwargs)
-        return 0
+    if getattr(args, "ate_acabar", False):
+        meta = probe_metadata(args.url)
+        if bool(meta.get("is_live")):
+            out_root.mkdir(parents=True, exist_ok=True)
+            print(f"[live] Live ativa detectada; acompanhando até acabar: {args.url}", flush=True)
+            follow_kwargs: dict[str, Any] = {}
+            sig_params = inspect.signature(follow_live).parameters
+            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
+            if has_varkw or "max_dur" in sig_params:
+                follow_kwargs["max_dur"] = args.max_dur
+            if (has_varkw or "stream_id" in sig_params) and isinstance(meta, dict) and meta.get("id"):
+                follow_kwargs["stream_id"] = str(meta["id"])
+            if has_varkw or "coord" in sig_params:
+                if os.environ.get("CLIPES_MONGO_URI", "").strip():
+                    from .monitor import _connect_coord_for_follow
+
+                    follow_kwargs["coord"] = _connect_coord_for_follow(out_root)
+                else:
+                    follow_kwargs["coord"] = None
+            follow_live(args.url, out_root, **follow_kwargs)
+            return 0
 
     timings: dict[str, float] = {}
 

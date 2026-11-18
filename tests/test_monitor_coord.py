@@ -815,3 +815,415 @@ def test_follow_live_so_marca_ended_quando_live_realmente_acaba(tmp_path, monkey
     assert doc_start["owner"] is None
 
 
+# ---- REV-onda-B: Achado 1 (follow_live & --follow with Coord) ------------------------------------
+
+
+def test_follow_live_renova_lease_cria_jobs_e_para_ao_perder_lease(tmp_path, monkeypatch, capsys):
+    """Achado 1: follow_live calls beat+renew every CLIPES_BEAT_S, writes db.jobs, and stops on lost lease."""
+    B = 1_700_000_100
+    monkeypatch.setenv("CLIPES_BEAT_S", "20")
+    monkeypatch.setenv("CLIPES_ALIAS", "PC-FL")
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+
+    clock = Clock(B + 10)
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-fl", now=clock, lease_s=90)
+
+    beats: list[tuple] = []
+    renews: list[tuple[str, bool]] = []
+    orig_beat = coord.beat
+    orig_renew = coord.renew
+
+    def spy_beat(alias, cap, job_atual, max_lives, razao):
+        beats.append((alias, cap, job_atual, max_lives, razao))
+        return orig_beat(alias, cap, job_atual, max_lives, razao)
+
+    def spy_renew(live_id):
+        ok = orig_renew(live_id)
+        renews.append((live_id, ok))
+        # After 2 windows (B+600) and at least 3 successful renews, another worker steals the live
+        if len(renews) == 35 and clock() >= B + 610:
+            db.lives.update_one({"_id": "twitch:canal:701"}, {"$set": {"owner": "w-outro"}})
+        return ok
+
+    coord.beat = spy_beat
+    coord.renew = spy_renew
+
+    class LiveFakePool:
+        def __init__(self):
+            self.stopped = False
+
+        def start_on_demand(self, ch):
+            self.stopped = False
+            return True
+
+        def release_on_demand(self, ch):
+            self.stopped = True
+
+        def stop_channel(self, ch):
+            self.stopped = True
+
+        def is_recording(self, ch):
+            return not self.stopped
+
+        def segments(self, ch):
+            return [(e, None) for e in range(B, int(clock()) + 1, 10)]
+
+        def video_start_ts(self, ch, s, e):
+            return float(B)
+
+        def freeze_and_concat(self, ch, s, e, dst):
+            dst.write_bytes(b"x")
+
+        def hold(self, ch, ts):
+            pass
+
+        def release_hold(self, ch):
+            pass
+
+        def cleanup(self, now):
+            pass
+
+    pool = LiveFakePool()
+
+    def pipe(job_dir, out):
+        job = json.loads((job_dir / "job.json").read_text())
+        vs, e = job["video_start"], job["window_end"]
+        center = e - 100
+        return {
+            "clips": [{"file": "c.mp4", "score": 0.9, "start": center - 20 - vs, "end": center + 20 - vs}],
+            "output_dir": str(out / job_dir.name),
+        }
+
+    res = monitor.follow_live(
+        "canal",
+        tmp_path / "out",
+        pool=pool,
+        pipeline=pipe,
+        coord=coord,
+        stream_id="701",
+        is_live=lambda _: True,
+        now=clock,
+        sleep=lambda d: setattr(clock, "t", clock.t + d),
+        capacity_fn=lambda _: {"cpus": 4, "ram_gb": 8.0, "disco_livre_gb": 20.0, "temp_c": 60, "gpu": None, "score": 30},
+    )
+
+    assert res["status"] == "lease_lost"
+    assert pool.stopped is True
+    assert len(beats) >= 3
+    assert sum(1 for _, ok in renews if ok) >= 3
+    assert renews[-1] == ("twitch:canal:701", False)
+    assert "[fila] lease perdida twitch:canal:701" in capsys.readouterr().out
+    assert db.lives.find_one({"_id": "twitch:canal:701"})["status"] == "live"
+    j1 = db.jobs.find_one({"_id": f"twitch:canal:701:{B + 300}"})
+    j2 = db.jobs.find_one({"_id": f"twitch:canal:701:{B + 600}"})
+    assert j1 is not None and j1["status"] == "done" and j1["owner"] == "w-fl"
+    assert j2 is not None and j2["status"] == "done" and j2["owner"] == "w-fl"
+
+
+def test_follow_live_backlog_marca_lost_no_mongo(tmp_path, monkeypatch):
+    """Achado 1: backlog > LIVE_MAX_BACKLOG marks oldest window as `lost` in Mongo as well as DiskQueue."""
+    B = 1_700_000_100
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    clock = Clock(B + 10)
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-bl", now=clock, lease_s=5000)
+
+    class EndAtPool:
+        def __init__(self, stop_at):
+            self.stop_at = stop_at
+
+        def start_on_demand(self, ch):
+            return True
+
+        def release_on_demand(self, ch):
+            pass
+
+        def is_recording(self, ch):
+            return clock() < self.stop_at
+
+        def segments(self, ch):
+            last = min(clock(), self.stop_at) - 10
+            return [(e, None) for e in range(B, int(last) + 1, 10)]
+
+        def video_start_ts(self, ch, s, e):
+            return float(B)
+
+        def freeze_and_concat(self, ch, s, e, dst):
+            dst.write_bytes(b"x")
+
+        def hold(self, ch, ts):
+            pass
+
+        def release_hold(self, ch):
+            pass
+
+        def cleanup(self, now):
+            pass
+
+    calls = []
+
+    def slow_pipe(d, o):
+        if not calls:
+            clock.t += 1000
+        calls.append(d.name)
+        return {"clips": []}
+
+    monitor.follow_live(
+        "canal",
+        tmp_path / "out",
+        pool=EndAtPool(B + 2500),
+        pipeline=slow_pipe,
+        coord=coord,
+        stream_id="702",
+        is_live=lambda _: True,
+        now=clock,
+        sleep=lambda d: setattr(clock, "t", clock.t + d),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    lost_doc = db.jobs.find_one({"_id": f"twitch:canal:702:{B + 600}"})
+    assert lost_doc is not None
+    assert lost_doc["status"] == "lost"
+
+
+def test_follow_live_dois_pcs_um_grava_e_respeita_job_existente(tmp_path, monkeypatch):
+    """Achado 1: two PCs following the same live -> only 1 records; existing job _id is never recreated."""
+    B = 1_700_000_100
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    clock = Clock(B + 10)
+    db = mongomock.MongoClient().db
+    coord1 = Coord(db, "w-pc1", now=clock, lease_s=300)
+    coord2 = Coord(db, "w-pc2", now=clock, lease_s=300)
+
+    # Pre-seed an existing job for B + 300 (simulating a window already recorded earlier)
+    coord1.ensure_live("twitch:canal:801", channel="canal", platform="twitch", stream_id="801")
+    db.jobs.insert_one({
+        "_id": f"twitch:canal:801:{B + 300}",
+        "live_id": "twitch:canal:801",
+        "window_start": B - 300,
+        "window_end": B + 300,
+        "status": "done",
+        "owner": "w-prev",
+        "attempts": 1,
+        "priority": 0.0,
+        "result": {"clips": 1},
+    })
+
+    class FinitePool:
+        def __init__(self, stop_at):
+            self.stop_at = stop_at
+            self.started = False
+
+        def start_on_demand(self, ch):
+            self.started = True
+            return True
+
+        def release_on_demand(self, ch):
+            pass
+
+        def is_recording(self, ch):
+            return clock() < self.stop_at
+
+        def segments(self, ch):
+            last = min(clock(), self.stop_at) - 10
+            return [(e, None) for e in range(B, int(last) + 1, 10)]
+
+        def video_start_ts(self, ch, s, e):
+            return float(B)
+
+        def freeze_and_concat(self, ch, s, e, dst):
+            dst.write_bytes(b"x")
+
+        def hold(self, ch, ts):
+            pass
+
+        def release_hold(self, ch):
+            pass
+
+        def cleanup(self, now):
+            pass
+
+    pool1 = FinitePool(B + 620)
+    pool2 = FinitePool(B + 620)
+
+    # PC2 attempts to follow while PC1 already owns the live
+    assert coord1.claim_live("twitch:canal:801") is True
+    res2 = monitor.follow_live(
+        "canal", tmp_path / "out2", pool=pool2, coord=coord2, stream_id="801",
+        is_live=lambda _: True, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+        capacity_fn=lambda _: {"cpus": 6, "score": 30},
+    )
+    assert res2 == {"status": "not_claimed", "jobs": []}
+    assert pool2.started is False
+
+    # PC1 continues: B+300 already exists (untouched!), B+600 is newly created and completed
+    processed_jobs: list[str] = []
+    res1 = monitor.follow_live(
+        "canal", tmp_path / "out1", pool=pool1, coord=coord1, stream_id="801",
+        pipeline=lambda d, o: (processed_jobs.append(d.name), {"clips": []})[1],
+        is_live=lambda _: True, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+        capacity_fn=lambda _: {"cpus": 6, "score": 30},
+    )
+    assert res1["status"] == "ended"
+    assert pool1.started is True
+    assert processed_jobs == [f"canal_{B + 600}"]
+    existing = db.jobs.find_one({"_id": f"twitch:canal:801:{B + 300}"})
+    assert existing["owner"] == "w-prev" and existing["status"] == "done" and existing["result"] == {"clips": 1}
+    new_doc = db.jobs.find_one({"_id": f"twitch:canal:801:{B + 600}"})
+    assert new_doc["owner"] == "w-pc1" and new_doc["status"] == "rejected"
+
+
+def test_monitor_follow_com_uri_monta_coord_e_sem_uri_nao_importa_pymongo(tmp_path, monkeypatch):
+    """Achado 1: `monitor --follow` passes Coord when CLIPES_MONGO_URI is set, and skips pymongo without URI."""
+    import pymongo
+
+    client = mongomock.MongoClient()
+    monkeypatch.setenv("CLIPES_MONGO_URI", SECRET_URI)
+    monkeypatch.setattr(pymongo, "MongoClient", lambda *a, **kw: client)
+
+    seen_coords: list = []
+
+    def fake_follow(ch, out_root, **kwargs):
+        seen_coords.append(kwargs.get("coord"))
+        return {"status": "ended", "jobs": []}
+
+    monkeypatch.setattr(monitor, "follow_live", fake_follow)
+    rc = monitor.main(["--follow", "gaules", "--out-dir", str(tmp_path / "out")])
+    assert rc == 0
+    assert len(seen_coords) == 1
+    assert isinstance(seen_coords[0], Coord)
+
+    # Without CLIPES_MONGO_URI: pymongo is never imported
+    script = (
+        "import sys, tempfile\n"
+        "from pathlib import Path\n"
+        "from clipes import monitor\n"
+        "seen = []\n"
+        "monitor.follow_live = lambda ch, out, **kw: (seen.append(kw.get('coord')), {'status': 'ended', 'jobs': []})[1]\n"
+        "with tempfile.TemporaryDirectory() as td:\n"
+        "    rc = monitor.main(['--follow', 'gaules', '--out-dir', td])\n"
+        "assert rc == 0 and seen == [None]\n"
+        "assert 'pymongo' not in sys.modules\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "CLIPES_MONGO_URI"}
+    res = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False)
+    assert res.returncode == 0, res.stderr + res.stdout
+
+
+# ---- REV-onda-B: Achado 11 (e2e failover: owner drops -> B claims -> no duplicate jobs) -----------
+
+
+def test_follow_live_failover_dono_cai_segundo_worker_reivindica_sem_recriar_jobs(tmp_path, monkeypatch):
+    """Achado 11: worker A crashes mid-live; after lease expiry, B claims, marks A's pending/processing lost, and continues."""
+    B = 1_700_000_100
+    monkeypatch.setenv("CLIPES_BEAT_S", "20")
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+
+    clock = Clock(B + 10)
+    db = mongomock.MongoClient().db
+    coord_a = Coord(db, "w-alpha", now=clock, lease_s=90)
+    coord_b = Coord(db, "w-beta", now=clock, lease_s=90)
+
+    class CrashAfterOneWindowPool:
+        def __init__(self):
+            self.seg_calls = 0
+
+        def start_on_demand(self, ch):
+            return True
+
+        def release_on_demand(self, ch):
+            pass
+
+        def is_recording(self, ch):
+            return True
+
+        def segments(self, ch):
+            self.seg_calls += 1
+            if clock() >= B + 310:
+                raise RuntimeError("worker A crashed")
+            return [(e, None) for e in range(B, int(clock()) + 1, 10)]
+
+        def video_start_ts(self, ch, s, e):
+            return float(B)
+
+        def freeze_and_concat(self, ch, s, e, dst):
+            dst.write_bytes(b"x")
+
+        def hold(self, ch, ts):
+            pass
+
+        def release_hold(self, ch):
+            pass
+
+        def cleanup(self, now):
+            pass
+
+    def pipe_a(job_dir, out):
+        job = json.loads((job_dir / "job.json").read_text())
+        vs, e = job["video_start"], job["window_end"]
+        center = e - 100
+        return {"clips": [{"file": "c.mp4", "score": 0.9, "start": center - 20 - vs, "end": center + 20 - vs}]}
+
+    with pytest.raises(RuntimeError):
+        monitor.follow_live(
+            "canal", tmp_path / "out-a", pool=CrashAfterOneWindowPool(), pipeline=pipe_a,
+            coord=coord_a, stream_id="999", is_live=lambda _: True,
+            now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+            capacity_fn=lambda _: {"cpus": 4, "score": 30},
+        )
+
+    # Simulate an un-drained/stuck job left by A before its lease expired
+    coord_a.claim_live("twitch:canal:999")
+    coord_a.add_job("twitch:canal:999:stuck", "twitch:canal:999", (B, B + 300), 1.0)
+    assert coord_a.start_job("twitch:canal:999:stuck") is True
+
+    # Lease expires (+91s) -> worker B starts at B+401 and runs through B+620
+    clock.t = B + 401
+
+    class PoolB:
+        def start_on_demand(self, ch):
+            return True
+
+        def release_on_demand(self, ch):
+            pass
+
+        def is_recording(self, ch):
+            return clock() < B + 620
+
+        def segments(self, ch):
+            last = min(clock(), B + 620) - 10
+            return [(e, None) for e in range(B + 400, int(last) + 1, 10)]
+
+        def video_start_ts(self, ch, s, e):
+            return float(B + 400)
+
+        def freeze_and_concat(self, ch, s, e, dst):
+            dst.write_bytes(b"x")
+
+        def hold(self, ch, ts):
+            pass
+
+        def release_hold(self, ch):
+            pass
+
+        def cleanup(self, now):
+            pass
+
+    b_jobs: list[str] = []
+    res_b = monitor.follow_live(
+        "canal", tmp_path / "out-b", pool=PoolB(),
+        pipeline=lambda d, o: (b_jobs.append(d.name), {"clips": []})[1],
+        coord=coord_b, stream_id="999", is_live=lambda _: True,
+        now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+        capacity_fn=lambda _: {"cpus": 6, "score": 30},
+    )
+    assert res_b["status"] == "ended"
+    assert b_jobs == [f"canal_{B + 600}"]
+    assert db.jobs.find_one({"_id": f"twitch:canal:999:{B + 300}"})["owner"] == "w-alpha"
+    assert db.jobs.find_one({"_id": "twitch:canal:999:stuck"})["status"] == "lost"
+    assert db.jobs.find_one({"_id": f"twitch:canal:999:{B + 600}"})["owner"] == "w-beta"
+    assert db.lives.find_one({"_id": "twitch:canal:999"})["status"] == "ended"
+
+
+
+

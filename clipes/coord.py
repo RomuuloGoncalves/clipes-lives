@@ -112,6 +112,12 @@ class Coord:
             {"$set": {"status": "lost", "updated_at": self._dt()}},
         )
 
+    def mark_job_lost(self, job_id: str) -> None:
+        self.db.jobs.update_one(
+            {"_id": job_id, "owner": self.worker_id, "status": {"$in": ["pending", "processing"]}},
+            {"$set": {"status": "lost", "updated_at": self._dt()}},
+        )
+
     # ---- heartbeat ----
 
     def beat(self, alias: str, capacity: dict, job_atual: str | None, max_lives: int, razao: float) -> None:

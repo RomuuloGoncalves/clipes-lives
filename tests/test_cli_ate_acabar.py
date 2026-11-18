@@ -157,3 +157,49 @@ def test_ate_acabar_invalid_duration_exits_2_before_probing(monkeypatch):
 
     rc = cli.main(["https://www.twitch.tv/gaules", "--ate-acabar", "--min-dur", "0"])
     assert rc == 2
+
+
+def test_ate_acabar_com_uri_passa_coord_para_follow_live_e_sem_uri_segue_local(tmp_path: Path, monkeypatch):
+    """Achado 1: `--ate-acabar` builds Coord when CLIPES_MONGO_URI is set, and never imports pymongo without URI."""
+    import os
+    import subprocess
+    import sys
+
+    import mongomock
+    import pymongo
+
+    from clipes.coord import Coord
+
+    client = mongomock.MongoClient()
+    monkeypatch.setenv("CLIPES_MONGO_URI", "mongodb+srv://user:secret@cluster0.example.mongodb.net/clipes_lives")
+    monkeypatch.setattr(pymongo, "MongoClient", lambda *a, **kw: client)
+    monkeypatch.setattr(cli, "probe_metadata", lambda url: {"id": "live777", "is_live": True})
+
+    seen: list[dict] = []
+
+    def fake_follow(url: str, root: Path, **kwargs):
+        seen.append(kwargs)
+        return {"status": "ended", "jobs": []}
+
+    monkeypatch.setattr(cli, "follow_live", fake_follow)
+
+    rc = cli.main(["https://www.twitch.tv/gaules", "--ate-acabar", "--out-dir", str(tmp_path / "out")])
+    assert rc == 0
+    assert len(seen) == 1
+    assert isinstance(seen[0].get("coord"), Coord)
+    assert seen[0].get("stream_id") == "live777"
+
+    script = (
+        "import sys, tempfile\n"
+        "from clipes import cli\n"
+        "seen = []\n"
+        "cli.probe_metadata = lambda url: {'id': 'live1', 'is_live': True}\n"
+        "cli.follow_live = lambda url, out, **kw: (seen.append(kw), {'status': 'ended', 'jobs': []})[1]\n"
+        "with tempfile.TemporaryDirectory() as td:\n"
+        "    rc = cli.main(['https://www.twitch.tv/gaules', '--ate-acabar', '--out-dir', td])\n"
+        "assert rc == 0 and len(seen) == 1 and seen[0].get('coord') is None\n"
+        "assert 'pymongo' not in sys.modules\n"
+    )
+    env = {k: v for k, v in os.environ.items() if k != "CLIPES_MONGO_URI"}
+    res = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False)
+    assert res.returncode == 0, res.stderr + res.stdout
