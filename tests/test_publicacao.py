@@ -561,3 +561,90 @@ def test_run_pending_youtube_over_180s_marks_erro_and_reports_on_thread(
     assert outcomes[0]["status"] == "erro"
     assert "clipe acima de 3 min" in thread_msgs[0][1]
 
+
+def test_run_pending_default_refresh_uses_oauth_without_injected_refreshers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """B1: real _default_refresh -> oauth.refresh_google / refresh_tiktok -> urlopen path."""
+    import io
+    import urllib.parse
+    import urllib.request
+
+    class _FakeHttpResp:
+        def __init__(self, body: dict[str, Any]):
+            self._raw = json.dumps(body).encode("utf-8")
+
+        def read(self) -> bytes:
+            return self._raw
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: Any):
+            return False
+
+    _make_clip_fixture(tmp_path, owner="w-pc1")
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    monkeypatch.setenv("YOUTUBE_CLIENT_ID", "yt-cid")
+    monkeypatch.setenv("YOUTUBE_CLIENT_SECRET", "yt-csec")
+    monkeypatch.setenv("TIKTOK_CLIENT_KEY", "tt-ckey")
+    monkeypatch.setenv("TIKTOK_CLIENT_SECRET", "tt-csec")
+
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(
+        tokens_path,
+        {
+            "youtube": {"refresh_token": SECRET_REFRESH},
+            "tiktok": {"refresh_token": SECRET_REFRESH, "open_id": "op-1"},
+        },
+    )
+
+    oauth_urls: list[str] = []
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float = 30):
+        oauth_urls.append(req.full_url)
+        form = urllib.parse.parse_qs(req.data.decode("utf-8"))
+        assert form["grant_type"] == ["refresh_token"]
+        assert form["refresh_token"] == [SECRET_REFRESH]
+        if "googleapis.com" in req.full_url:
+            return _FakeHttpResp({"access_token": "yt-fresh-acc"})
+        return _FakeHttpResp({
+            "access_token": "tt-fresh-acc",
+            "refresh_token": SECRET_REFRESH_NEW,
+            "open_id": "op-1",
+        })
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+    seen_tokens: dict[str, str] = {}
+
+    def fake_yt(mp4, title, desc, token):
+        seen_tokens["youtube"] = token
+        return {"video_id": "yt-real-refresh"}
+
+    def fake_tt(mp4, caption, token):
+        seen_tokens["tiktok"] = token
+        return {"publish_id": "tt-real-refresh"}
+
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": fake_yt, "tiktok": fake_tt},
+    )
+
+    by_plat = {o["plataforma"]: o for o in outcomes}
+    assert by_plat["youtube"]["status"] == "ok"
+    assert by_plat["tiktok"]["status"] == "ok"
+    assert seen_tokens == {"youtube": "yt-fresh-acc", "tiktok": "tt-fresh-acc"}
+    assert len(oauth_urls) == 2
+
+    saved_tokens = json.loads(tokens_path.read_text(encoding="utf-8"))
+    assert saved_tokens["tiktok"]["refresh_token"] == SECRET_REFRESH_NEW
+    assert stat.S_IMODE(tokens_path.stat().st_mode) == 0o600
+
+

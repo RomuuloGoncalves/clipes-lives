@@ -553,16 +553,24 @@ def request(
     return "\n".join(messages) if messages else "nenhuma plataforma configurada"
 
 
-def _default_refresh(plataforma: str, plat_tokens: dict[str, Any]) -> dict[str, Any]:
+def _default_refresh(
+    plataforma: str,
+    plat_tokens: dict[str, Any],
+    *,
+    tokens_path: Path | str | None = None,
+) -> dict[str, Any]:
     refresh_tok = plat_tokens.get("refresh_token")
     if not refresh_tok:
         raise RuntimeError(f"missing refresh_token for {plataforma}")
     from . import oauth  # lazy: module from T4
 
+    resolved_tokens = Path(tokens_path) if tokens_path is not None else None
     if plataforma == "youtube":
-        return oauth.refresh_google(refresh_tok)
+        access_token = oauth.refresh_google(refresh_tok, tokens_path=resolved_tokens)
+        return {"access_token": access_token}
     if plataforma == "tiktok":
-        return oauth.refresh_tiktok(refresh_tok)
+        access_token = oauth.refresh_tiktok(refresh_tok, tokens_path=resolved_tokens)
+        return {"access_token": access_token}
     raise ValueError(f"unknown platform: {plataforma}")
 
 
@@ -748,14 +756,24 @@ def run_pending(
         secrets = _secret_values(tok_map)
 
         def do_refresh() -> str:
-            ref_fn = (refreshers or {}).get(plat) or (lambda p, t: _default_refresh(p, t))
+            ref_fn = (refreshers or {}).get(plat) or (
+                lambda p, t: _default_refresh(p, t, tokens_path=tokens_path)
+            )
             refreshed = ref_fn(plat, plat_tok)
-            new_access = refreshed.get("access_token")
+            if isinstance(refreshed, str):
+                new_access = refreshed
+                new_refresh = ""
+            elif isinstance(refreshed, dict):
+                new_access = str(refreshed.get("access_token") or "")
+                new_refresh = str(refreshed.get("refresh_token") or "")
+            else:
+                new_access = ""
+                new_refresh = ""
             if not new_access:
                 raise RuntimeError("refresh returned no access_token")
             plat_tok["access_token"] = new_access
-            if refreshed.get("refresh_token"):
-                plat_tok["refresh_token"] = refreshed["refresh_token"]
+            if new_refresh:
+                plat_tok["refresh_token"] = new_refresh
                 tok_map[plat] = plat_tok
                 save_fn(tok_map, tokens_path)
             else:

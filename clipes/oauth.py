@@ -147,10 +147,11 @@ def refresh_google(
     client_id: str | None = None,
     client_secret: str | None = None,
     tokens_path: Path | None = None,
-    urlopen: Callable[..., Any] = urllib.request.urlopen,
+    urlopen: Callable[..., Any] | None = None,
     timeout: float = 30.0,
 ) -> str:
     """Exchange Google refresh_token for a new access_token."""
+    opener = urlopen if urlopen is not None else urllib.request.urlopen
     tokens = load_tokens(tokens_path) if refresh_token is None else None
     rtok = (refresh_token or (tokens or {}).get("youtube", {}).get("refresh_token") or "").strip()
     if not rtok:
@@ -165,7 +166,7 @@ def refresh_google(
             "refresh_token": rtok,
             "grant_type": "refresh_token",
         },
-        urlopen=urlopen,
+        urlopen=opener,
         timeout=timeout,
         secrets_to_scrub=[csec, rtok],
     )
@@ -190,10 +191,11 @@ def refresh_tiktok(
     client_key: str | None = None,
     client_secret: str | None = None,
     tokens_path: Path | None = None,
-    urlopen: Callable[..., Any] = urllib.request.urlopen,
+    urlopen: Callable[..., Any] | None = None,
     timeout: float = 30.0,
 ) -> str:
     """Exchange TikTok refresh_token for a new access_token and persist rotated refresh_token."""
+    opener = urlopen if urlopen is not None else urllib.request.urlopen
     tokens = load_tokens(tokens_path) if refresh_token is None else None
     rtok = (refresh_token or (tokens or {}).get("tiktok", {}).get("refresh_token") or "").strip()
     if not rtok:
@@ -208,7 +210,7 @@ def refresh_tiktok(
             "grant_type": "refresh_token",
             "refresh_token": rtok,
         },
-        urlopen=urlopen,
+        urlopen=opener,
         timeout=timeout,
         secrets_to_scrub=[csec, rtok],
     )
