@@ -439,6 +439,105 @@ def test_slash_listar_returns_last_10_clips_and_handles_empty(tmp_path: Path):
     assert "vid02_c01" not in text
 
 
+def test_slash_publicar_and_listar_reject_outside_configured_channel_and_threads(tmp_path: Path):
+    """S1: /publicar and /listar must reject outside configured channel or its threads with ephemeral message."""
+    _make_clip(tmp_path)
+    tokens_path = _write_tokens(tmp_path / "tokens.json")
+    db, store = _mongo_store()
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=T0,
+    )
+    pub_cmd = bot.tree.get_command("publicar")
+    list_cmd = bot.tree.get_command("listar")
+    assert pub_cmd is not None and list_cmd is not None
+
+    wrong_channels = [
+        _FakeChannel(OTHER_CHANNEL_ID),
+        _FakeChannel(THREAD_ID, parent_id=OTHER_CHANNEL_ID),
+    ]
+    for ch in wrong_channels:
+        inter_pub = _FakeInteraction(user_id=ALLOWED_USER, channel=ch)
+        inter_list = _FakeInteraction(user_id=ALLOWED_USER, channel=ch)
+        asyncio.run(pub_cmd.callback(inter_pub, "live1_c01"))
+        asyncio.run(list_cmd.callback(inter_list))
+        assert inter_pub.response.messages == [("canal nao permitido", True)]
+        assert inter_list.response.messages == [("canal nao permitido", True)]
+
+    assert db.publish_requests.count_documents({}) == 0
+
+    # Allowed inside a thread of the configured channel
+    valid_thread = _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+    inter_thread_list = _FakeInteraction(user_id=ALLOWED_USER, channel=valid_thread)
+    asyncio.run(list_cmd.callback(inter_thread_list))
+    assert inter_thread_list.response.messages[0][1] is False
+    assert "live1_c01" in inter_thread_list.response.messages[0][0]
+
+    inter_thread_pub = _FakeInteraction(user_id=ALLOWED_USER, channel=valid_thread)
+    asyncio.run(pub_cmd.callback(inter_thread_pub, "live1_c01"))
+    assert "youtube: publicacao enfileirada" in inter_thread_pub.response.messages[0][0]
+
+
+def test_slash_listar_denies_unauthorized_and_empty_allowed_list(tmp_path: Path):
+    """S1: /listar must require an allowed user and never leak clip titles/IDs to unauthorized users."""
+    _make_clip(tmp_path)
+    store = LocalStore(tmp_path)
+
+    bot_restricted = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+    )
+    list_cmd = bot_restricted.tree.get_command("listar")
+    assert list_cmd is not None
+    inter_other = _FakeInteraction(user_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(list_cmd.callback(inter_other))
+    assert inter_other.response.messages == [("sem permissao", True)]
+
+    bot_empty = bot_mod.make_bot(
+        store,
+        allowed_ids=[],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+    )
+    list_cmd_empty = bot_empty.tree.get_command("listar")
+    assert list_cmd_empty is not None
+    inter_owner = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(list_cmd_empty.callback(inter_owner))
+    assert inter_owner.response.messages == [("sem permissao", True)]
+
+
+def test_slash_rejects_when_channel_id_not_configured(tmp_path: Path):
+    """S1 fail-closed: unconfigured channel_id rejects /publicar and /listar."""
+    _make_clip(tmp_path)
+    store = LocalStore(tmp_path)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=None,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+    )
+    pub_cmd = bot.tree.get_command("publicar")
+    list_cmd = bot.tree.get_command("listar")
+    assert pub_cmd is not None and list_cmd is not None
+
+    inter_pub = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    inter_list = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    asyncio.run(pub_cmd.callback(inter_pub, "live1_c01"))
+    asyncio.run(list_cmd.callback(inter_list))
+    assert inter_pub.response.messages == [("canal nao permitido", True)]
+    assert inter_list.response.messages == [("canal nao permitido", True)]
+
+
 # --- Single-PC LocalStore direct execution ---
 
 

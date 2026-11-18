@@ -56,6 +56,21 @@ def _in_configured_channel(channel: Any, configured_channel_id: str | int | None
     return parent_id is not None and str(parent_id) == target
 
 
+def _interaction_in_configured_channel(interaction: Any, configured_channel_id: str | int | None) -> bool:
+    channel = getattr(interaction, "channel", None)
+    if channel is not None:
+        return _in_configured_channel(channel, configured_channel_id)
+    if configured_channel_id is None or str(configured_channel_id).strip() == "":
+        return False
+    cid = getattr(interaction, "channel_id", None)
+    return cid is not None and str(cid) == str(configured_channel_id).strip()
+
+
+def _interaction_user_allowed(interaction: Any, allowed_ids: Iterable[str | int] | None) -> bool:
+    user_id = getattr(getattr(interaction, "user", None), "id", "")
+    return str(user_id).strip() in publicacao._allowed_user_set(allowed_ids)
+
+
 def _clip_id_from_entry(manifest: dict[str, Any], entry: dict[str, Any]) -> str | None:
     cid = entry.get("clip_id")
     if cid:
@@ -296,6 +311,9 @@ def make_bot(
     @bot.tree.command(name="publicar", description="Publica um clipe como privado no YouTube e no TikTok")
     @app_commands.describe(id="ID do clipe (ex: video_c01)")
     async def publicar_cmd(interaction: discord.Interaction, id: str) -> None:
+        if not _interaction_in_configured_channel(interaction, bot.channel_id):
+            await interaction.response.send_message("canal nao permitido", ephemeral=True)
+            return
         clip_id = id.strip()
         channel = getattr(interaction, "channel", None)
         thread_id = _extract_thread_id(channel)
@@ -308,6 +326,12 @@ def make_bot(
 
     @bot.tree.command(name="listar", description="Lista os 10 ultimos clip_id disponiveis")
     async def listar_cmd(interaction: discord.Interaction) -> None:
+        if not _interaction_in_configured_channel(interaction, bot.channel_id):
+            await interaction.response.send_message("canal nao permitido", ephemeral=True)
+            return
+        if not _interaction_user_allowed(interaction, bot.allowed_ids):
+            await interaction.response.send_message("sem permissao", ephemeral=True)
+            return
         text = _format_recent_clips(bot.out_root, store=bot.store, limit=10)
         await interaction.response.send_message(text, ephemeral=False)
 
