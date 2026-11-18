@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Clipes Lives - Painel</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0f172a;
+      --card: #1e293b;
+      --border: #334155;
+      --text: #e2e8f0;
+      --muted: #94a3b8;
+      --ok: #22c55e;
+      --off: #ef4444;
+      --warn: #f59e0b;
+      --btn: #dc2626;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 16px;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.4;
+    }
+    header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 16px;
+    }
+    h1 { font-size: 1.25rem; margin: 0; }
+    h2 { font-size: 1rem; margin: 20px 0 8px; color: var(--muted); }
+    .meta { font-size: 0.875rem; color: var(--muted); }
+    .msg {
+      padding: 8px 12px;
+      border-radius: 6px;
+      margin-bottom: 12px;
+      background: var(--card);
+      border: 1px solid var(--border);
+      font-size: 0.9rem;
+    }
+    .msg:empty { display: none; }
+    .msg.erro { border-color: var(--off); color: #fecaca; }
+    .msg.ok { border-color: var(--ok); color: #bbf7d0; }
+    .wrap {
+      overflow-x: auto;
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+    }
+    th, td {
+      padding: 10px 12px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      white-space: nowrap;
+    }
+    th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }
+    tr:last-child td { border-bottom: 0; }
+    .badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+    }
+    .on { background: rgba(34, 197, 94, 0.18); color: #86efac; }
+    .off { background: rgba(239, 68, 68, 0.18); color: #fca5a5; }
+    .nd {
+      background: rgba(245, 158, 11, 0.22);
+      color: #fde68a;
+      border: 1px solid var(--warn);
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-weight: 700;
+    }
+    .acao { display: flex; gap: 6px; align-items: center; }
+    input[type="text"] {
+      width: 88px;
+      padding: 5px 8px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.85rem;
+    }
+    button {
+      padding: 6px 10px;
+      border: 0;
+      border-radius: 4px;
+      background: var(--btn);
+      color: #fff;
+      font-weight: 600;
+      font-size: 0.85rem;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    .cards { display: flex; flex-wrap: wrap; gap: 10px; }
+    .pill {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 8px 12px;
+      font-size: 0.875rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Clipes Lives</h1>
+    <div id="atualizado" class="meta">Carregando...</div>
+  </header>
+
+  <div id="feedback" class="msg" role="status"></div>
+
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>PC</th>
+          <th>Status</th>
+          <th>CPU</th>
+          <th>RAM</th>
+          <th>Disco</th>
+          <th>Temp</th>
+          <th>GPU</th>
+          <th>Job atual</th>
+          <th>max_lives</th>
+          <th>Acao</th>
+        </tr>
+      </thead>
+      <tbody id="pcs"></tbody>
+    </table>
+  </div>
+
+  <h2>Lives ativas</h2>
+  <div id="lives" class="cards"></div>
+
+  <h2>Jobs (24 h)</h2>
+  <div id="jobs" class="cards"></div>
+
+  <script>
+    (function () {
+      var pcsEl = document.getElementById("pcs");
+      var livesEl = document.getElementById("lives");
+      var jobsEl = document.getElementById("jobs");
+      var atualizadoEl = document.getElementById("atualizado");
+      var feedbackEl = document.getElementById("feedback");
+      var drafts = Object.create(null);
+      var carregando = false;
+
+      function el(tag, cls, txt) {
+        var n = document.createElement(tag);
+        if (cls) n.className = cls;
+        if (txt !== undefined && txt !== null) n.textContent = String(txt);
+        return n;
+      }
+
+      function mostrarMsg(texto, tipo) {
+        feedbackEl.className = "msg" + (tipo ? " " + tipo : "");
+        feedbackEl.textContent = texto || "";
+      }
+
+      function fmtNum(v, suf) {
+        if (v === null || v === undefined || v === "") return "-";
+        return String(v) + (suf || "");
+      }
+
+      function fmtGpu(gpu) {
+        if (!gpu) return "-";
+        if (typeof gpu === "string") return gpu;
+        var partes = [];
+        var nome = gpu.nome || gpu.name;
+        if (nome) partes.push(String(nome));
+        var vram = gpu.vram_gb || gpu.vram_mb || gpu.vram;
+        if (vram !== undefined && vram !== null) partes.push(String(vram));
+        var uso = gpu.uso_pct !== undefined ? gpu.uso_pct : gpu.util_pct;
+        if (uso !== undefined && uso !== null) partes.push(String(uso) + "%");
+        if (gpu.temp_c !== undefined && gpu.temp_c !== null) partes.push(String(gpu.temp_c) + " C");
+        return partes.length ? partes.join(" / ") : "-";
+      }
+
+      function enviarLiberar(worker, input, btn) {
+        var nome = worker.alias || worker.id;
+        var val = (input.value || "").trim();
+        if (val !== "LIBERAR") {
+          mostrarMsg("Digite LIBERAR para liberar recursos de " + nome + ".", "erro");
+          input.focus();
+          return;
+        }
+        if (!confirm("Liberar recursos de " + nome + "? O container sera encerrado e reiniciado.")) {
+          return;
+        }
+        btn.disabled = true;
+        fetch("/api/comando", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ worker_id: worker.id, confirmar: val })
+        })
+          .then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (body) {
+              return { status: r.status, body: body };
+            });
+          })
+          .then(function (res) {
+            if (res.status === 202) {
+              drafts[worker.id] = "";
+              input.value = "";
+              mostrarMsg("Comando liberar recursos enviado para " + nome + ".", "ok");
+              atualizar();
+            } else {
+              var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
+              mostrarMsg("Falha ao enviar comando: " + erro, "erro");
+            }
+          })
+          .catch(function () {
+            mostrarMsg("Erro de rede ao enviar comando.", "erro");
+          })
+          .finally(function () {
+            btn.disabled = false;
+          });
+      }
+
+      function renderWorkers(workers) {
+        var rows = [];
+        if (!workers || !workers.length) {
+          var trVazio = el("tr");
+          var tdVazio = el("td", "meta", "Nenhum PC registrado.");
+          tdVazio.colSpan = 10;
+          trVazio.appendChild(tdVazio);
+          rows.push(trVazio);
+          pcsEl.replaceChildren.apply(pcsEl, rows);
+          return;
+        }
+        workers.forEach(function (w) {
+          var cap = w.capacity || {};
+          var tr = el("tr");
+          var label = w.alias || w.id;
+
+          tr.appendChild(el("td", null, label));
+
+          var tdOn = el("td");
+          tdOn.appendChild(el("span", "badge " + (w.online ? "on" : "off"), w.online ? "online" : "offline"));
+          tr.appendChild(tdOn);
+
+          tr.appendChild(el("td", null, fmtNum(cap.cpus)));
+          tr.appendChild(el("td", null, fmtNum(cap.ram_gb, " GB")));
+          tr.appendChild(el("td", null, fmtNum(cap.disco_livre_gb, " GB")));
+
+          var tdTemp = el("td");
+          if (cap.temp_c === null || cap.temp_c === undefined) {
+            tdTemp.appendChild(el("span", "nd", "n/d"));
+          } else {
+            tdTemp.textContent = String(cap.temp_c) + " C";
+          }
+          tr.appendChild(tdTemp);
+
+          tr.appendChild(el("td", null, fmtGpu(cap.gpu)));
+          tr.appendChild(el("td", null, w.job_atual || "-"));
+          tr.appendChild(el("td", null, fmtNum(w.max_lives)));
+
+          var tdAcao = el("td");
+          var box = el("div", "acao");
+          var input = el("input");
+          input.type = "text";
+          input.placeholder = "LIBERAR";
+          input.setAttribute("aria-label", "Digite LIBERAR para " + label);
+          if (drafts[w.id]) input.value = drafts[w.id];
+          input.addEventListener("input", function () {
+            drafts[w.id] = input.value;
+          });
+          var btn = el("button", null, "liberar recursos");
+          btn.type = "button";
+          btn.addEventListener("click", function () {
+            enviarLiberar(w, input, btn);
+          });
+          box.appendChild(input);
+          box.appendChild(btn);
+          tdAcao.appendChild(box);
+          tr.appendChild(tdAcao);
+
+          rows.push(tr);
+        });
+        pcsEl.replaceChildren.apply(pcsEl, rows);
+      }
+
+      function renderLives(lives, workers) {
+        var nomes = Object.create(null);
+        (workers || []).forEach(function (w) {
+          nomes[w.id] = w.alias || w.id;
+        });
+        if (!lives || !lives.length) {
+          livesEl.replaceChildren(el("div", "pill meta", "Nenhuma live ativa."));
+          return;
+        }
+        var items = lives.map(function (l) {
+          var dono = nomes[l.owner] || l.owner || "-";
+          var canal = l.channel || l.id;
+          return el("div", "pill", canal + " (" + dono + ")");
+        });
+        livesEl.replaceChildren.apply(livesEl, items);
+      }
+
+      function renderJobs(jobs) {
+        var keys = jobs ? Object.keys(jobs) : [];
+        if (!keys.length) {
+          jobsEl.replaceChildren(el("div", "pill meta", "Sem jobs nas ultimas 24 h."));
+          return;
+        }
+        var items = keys.sort().map(function (k) {
+          return el("div", "pill", k + ": " + String(jobs[k]));
+        });
+        jobsEl.replaceChildren.apply(jobsEl, items);
+      }
+
+      function atualizar() {
+        if (carregando) return;
+        carregando = true;
+        fetch("/api/status", { credentials: "same-origin" })
+          .then(function (r) {
+            if (!r.ok) {
+              return r.json().catch(function () { return {}; }).then(function (b) {
+                throw new Error((b && b.erro) ? b.erro : ("HTTP " + r.status));
+              });
+            }
+            return r.json();
+          })
+          .then(function (dados) {
+            renderWorkers(dados.workers || []);
+            renderLives(dados.lives || [], dados.workers || []);
+            renderJobs(dados.jobs_24h || {});
+            atualizadoEl.textContent = "Atualizado: " + new Date().toLocaleTimeString();
+          })
+          .catch(function (err) {
+            atualizadoEl.textContent = "Erro ao atualizar";
+            mostrarMsg("Falha ao consultar /api/status: " + (err && err.message ? err.message : "erro"), "erro");
+          })
+          .finally(function () {
+            carregando = false;
+          });
+      }
+
+      atualizar();
+      setInterval(atualizar, 10000);
+    })();
+  </script>
+</body>
+</html>
