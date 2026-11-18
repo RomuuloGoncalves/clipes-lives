@@ -868,6 +868,7 @@ def run_worker_step(
     coord: Any | None = None,
     on_mongo_error: Callable[[BaseException], None] | None = None,
     lost_lives: set[str] | None = None,
+    on_job_active: Callable[[str | None], None] | None = None,
 ) -> bool:
     """Process one pending job end to end (never publishes). False when the queue is empty."""
     job_dir = queue.claim_next()
@@ -912,6 +913,8 @@ def run_worker_step(
                 return True
 
     started = time.perf_counter()
+    if on_job_active is not None:
+        on_job_active(mongo_job_id)
     try:
         result = pipeline(job_dir, out_root)
     except Exception as exc:  # a broken job must not stop the worker
@@ -928,6 +931,9 @@ def run_worker_step(
                     raise
                 report_mongo_error(mexc)
         return True
+    finally:
+        if on_job_active is not None:
+            on_job_active(None)
 
     clips = result.get("clips") or []
     final_status = "done" if clips else "rejected"
@@ -1196,6 +1202,59 @@ def _lock_worker(queue_root: Path):
     return lock
 
 
+def _terminate_child_processes(
+    proc_root: Path = Path("/proc"),
+    *,
+    kill_fn: Callable[[int, int], None] = os.kill,
+) -> None:
+    """Send SIGTERM to all descendant PIDs of the current process (ffmpeg, streamlink, llama-server)."""
+    me = os.getpid()
+    children: dict[int, list[int]] = {}
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        return
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        try:
+            stat = (entry / "stat").read_text(encoding="utf-8", errors="ignore")
+            rparen = stat.rfind(")")
+            if rparen < 0:
+                continue
+            ppid = int(stat[rparen + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(pid)
+
+    stack = list(children.get(me, ()))
+    seen: set[int] = set()
+    while stack:
+        pid = stack.pop()
+        if pid == me or pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children.get(pid, ()))
+        try:
+            kill_fn(pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def _read_perfil_razao(out_root: Path, cpus: int | None) -> float:
+    try:
+        data = json.loads((out_root / ".perfil.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return 0.0
+    if not isinstance(data, dict) or (cpus is not None and data.get("cpus") != cpus):
+        return 0.0
+    razao = data.get("razao")
+    if isinstance(razao, (int, float)) and not isinstance(razao, bool) and razao > 0:
+        return float(razao)
+    return 0.0
+
+
 async def run_monitor(
     channels: list[str],
     out_root: Path,
@@ -1215,6 +1274,9 @@ async def run_monitor(
     max_lives_fn: Callable[[Path, int | None], int] | None = None,
     stream_ids: dict[str, str] | None = None,
     probe: Callable[[str], dict[str, Any]] = probe_metadata,
+    beat_s: float | None = None,
+    alias: str | None = None,
+    kill_children: Callable[[], None] | None = None,
 ) -> None:
     """IRC -> ChannelSpikeDetector -> rolling recorder -> capture_job -> DiskQueue, plus 1 sequential worker.
 
@@ -1249,6 +1311,10 @@ async def run_monitor(
     queue = pool = lock = coord_session = None
     cap_getter = capacity_fn
     max_lives_getter = max_lives_fn
+    worker_alias = alias or os.environ.get("CLIPES_ALIAS", "").strip()
+    beat_interval = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20") if beat_s is None else beat_s))
+    child_killer = kill_children or _terminate_child_processes
+    current_job: list[str | None] = [None]
     if not dry_run:
         queue_root = queue_root or out_root / "queue"
         queue = DiskQueue(queue_root)
@@ -1264,6 +1330,9 @@ async def run_monitor(
                 from .capacidade import capacity as cap_getter
             if max_lives_getter is None:
                 from .perfil import max_lives as max_lives_getter
+            if not worker_alias:
+                from .capacidade import worker_id as get_worker_id
+                worker_alias = get_worker_id(out_root)
             coord_session.connect()
 
     def _current_limits() -> tuple[dict[str, Any], int]:
@@ -1433,13 +1502,54 @@ async def run_monitor(
             if not await asyncio.to_thread(
                 run_worker_step, queue, out_root, policy, pipeline,
                 coord=active_coord, on_mongo_error=on_err, lost_lives=lost_lives,
+                on_job_active=lambda jid: current_job.__setitem__(0, jid),
             ):
                 await sleep(WORKER_IDLE_S)
+
+    async def heartbeat_loop() -> None:
+        last_beat = float("-inf")
+        while not stop.is_set():
+            t = now()
+            active_coord = coord_session.active if coord_session is not None else None
+            if active_coord is not None and t - last_beat >= beat_interval:
+                last_beat = t
+                cap, ml = _current_limits()
+                razao = _read_perfil_razao(out_root, cap.get("cpus"))
+                try:
+                    await asyncio.to_thread(
+                        active_coord.beat, worker_alias, cap, current_job[0], ml, razao
+                    )
+                    for ch, live_id in list(owned_lives.items()):
+                        ok = await asyncio.to_thread(active_coord.renew, live_id)
+                        if not ok:
+                            print(f"[fila] lease perdida {live_id}", flush=True)
+                            owned_lives.pop(ch, None)
+                            lost_lives.add(live_id)
+                            if pool is not None:
+                                pool.stop_channel(ch)
+                    cmd = await asyncio.to_thread(active_coord.pending_command)
+                except Exception as exc:
+                    if not _is_mongo_error(exc):
+                        raise
+                    coord_session.mark_offline(exc)
+                else:
+                    if cmd and cmd.get("acao") == "liberar":
+                        await asyncio.to_thread(active_coord.mark_command, cmd["_id"], "executando")
+                        if pool is not None:
+                            pool.stop_all()
+                        await asyncio.to_thread(child_killer)
+                        await asyncio.to_thread(active_coord.mark_command, cmd["_id"], "feito")
+                        print("[comando] liberar recursos", flush=True)
+                        raise SystemExit(75)
+            wait_rem = beat_interval if active_coord is None else max(1.0, beat_interval - (now() - last_beat))
+            await sleep(max(1.0, wait_rem))
 
     irc_call = irc(channels, on_message, stop=stop, on_join=on_join) if real_irc else irc(channels, on_message, stop=stop)
     coros = [irc_call, tick_loop()]
     if not dry_run:
         coros.append(worker_loop())
+        if coord_session is not None and coord_session.configured:
+            coros.append(heartbeat_loop())
     tasks = [asyncio.create_task(c) for c in coros]
     stopper = asyncio.create_task(stop.wait())
     try:

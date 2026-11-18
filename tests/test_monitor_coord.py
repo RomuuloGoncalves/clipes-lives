@@ -359,8 +359,8 @@ def test_coord_que_nega_claim_nunca_inicia_gravador(tmp_path, monkeypatch):
     """FILA-01 AC 2-3: when claim_live returns False, streamlink/ffmpeg recorder is never started."""
     clock = Clock()
     db = mongomock.MongoClient().db
-    coord_a = Coord(db, "w-dono", now=clock)
-    coord_b = Coord(db, "w-eu", now=clock)
+    coord_a = Coord(db, "w-dono", now=clock, lease_s=300)
+    coord_b = Coord(db, "w-eu", now=clock, lease_s=300)
     coord_a.ensure_live("twitch:canal:123", channel="canal", platform="twitch")
     assert coord_a.claim_live("twitch:canal:123") is True  # another PC owns it
 
@@ -384,8 +384,8 @@ def test_coord_que_nega_claim_nunca_inicia_gravador(tmp_path, monkeypatch):
     ))
     assert popen.procs == []
 
-    # Also verify follow_live does not start recorder when claim is denied (renew lease so it's still active)
-    coord_a.renew("twitch:canal:123")
+    # Also verify follow_live does not start recorder when claim is denied
+    assert coord_a.renew("twitch:canal:123") is True
     pool = monitor.RollingRecorderPool(tmp_path / "buf2", max_hot=0, max_on_demand=1, popen=popen)
     res = monitor.follow_live(
         "canal", tmp_path / "out2", pool=pool, coord=coord_b, stream_id="123",
@@ -525,3 +525,204 @@ def test_espera_proporcional_a_1_sobre_score_antes_do_claim(tmp_path):
     assert exact_waits[3] == pytest.approx(10.0)
     assert exact_waits[6] == pytest.approx(5.0)
     assert exact_waits[3] == pytest.approx(2.0 * exact_waits[6])
+
+
+# ---- T24: heartbeat, renew lease, and liberar command -------------------------------------------
+
+
+def test_heartbeat_3_ciclos_chama_3_beat_e_3_renew_e_renew_falso_para_gravador(tmp_path, monkeypatch, capsys):
+    """PAINEL-01 AC 1, FILA-01 AC 4-5: 3 cycles -> 3 beats + 3 renews; failed renew stops recorder and blocks finish_job."""
+    clock = Clock()
+    monkeypatch.setenv("CLIPES_BEAT_S", "20")
+    monkeypatch.setenv("CLIPES_ALIAS", "PC-TESTE")
+    out_root = tmp_path / "out"
+    out_root.mkdir()
+    (out_root / ".perfil.json").write_text(
+        json.dumps({"razao": 0.25, "cpus": 4, "segundos_live": 300.0, "segundos_proc": 75.0, "medido_em": "x"}),
+        encoding="utf-8",
+    )
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-hb", now=clock, lease_s=90)
+    other = Coord(db, "w-outro", now=clock, lease_s=90)
+
+    beats: list[tuple] = []
+    renews: list[tuple[str, bool]] = []
+    orig_beat = coord.beat
+    orig_renew = coord.renew
+
+    def spy_beat(alias, cap, job_atual, max_lives, razao):
+        beats.append((alias, cap, job_atual, max_lives, razao))
+        return orig_beat(alias, cap, job_atual, max_lives, razao)
+
+    def spy_renew(live_id):
+        ok = orig_renew(live_id)
+        renews.append((live_id, ok))
+        return ok
+
+    coord.beat = spy_beat
+    coord.renew = spy_renew
+
+    popen = FakePopen()
+    queue_root = tmp_path / "q"
+
+    async def irc(channels, on_message, stop):
+        while clock() < T0 + 70:
+            await clock.sleep(1)
+        for i in range(12):
+            on_message("canal", clock(), f"u{i % 6}", "KKKK")
+        while not stop.is_set():
+            await clock.sleep(1)
+            on_message("canal", clock(), "viewer_keepalive", "pog")
+
+    # Run until live is owned and 3 renew cycles succeed; then steal lease before the 4th renew
+    stolen = [False]
+
+    async def driver():
+        stop = asyncio.Event()
+        task = asyncio.create_task(monitor.run_monitor(
+            ["canal"], out_root, monitor.ChannelPolicy(),
+            queue_root=queue_root, irc=irc, popen=popen,
+            pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+            stop=stop, coord=coord, stream_ids={"canal": "501"},
+            capacity_fn=lambda _: {"cpus": 4, "ram_gb": 8.0, "disco_livre_gb": 20.0, "temp_c": 65, "gpu": None, "score": 30},
+        ))
+        for _ in range(4000):
+            if len(renews) == 3 and not stolen[0]:
+                # Force another PC to steal the lease
+                db.lives.update_one({"_id": "twitch:canal:501"}, {"$set": {"owner": "w-outro"}})
+                stolen[0] = True
+            if len(renews) >= 4 and not renews[-1][1]:
+                break
+            await asyncio.sleep(0.002)
+        assert popen.pipelines() and any(p.returncode is None for p in popen.procs) is False  # already stopped by renew=False!
+        stop.set()
+        await task
+
+    asyncio.run(driver())
+
+    assert len(renews) == 4
+    assert [ok for _, ok in renews[:3]] == [True, True, True]
+    assert renews[3] == ("twitch:canal:501", False)
+    assert len(beats) >= 3
+    worker_doc = db.workers.find_one({"_id": "w-hb"})
+    assert worker_doc["alias"] == "PC-TESTE"
+    assert worker_doc["max_lives"] == 2  # floor(0.6 / 0.25) == 2
+    assert worker_doc["razao"] == 0.25
+    assert len(worker_doc["history"]) == len(beats)
+    assert all(p.returncode is not None for p in popen.procs)
+    assert "[fila] lease perdida twitch:canal:501" in capsys.readouterr().out
+
+
+def test_comando_liberar_para_pool_mata_filhos_marca_feito_e_sai_75(tmp_path, capsys):
+    """CMD-02 AC 8: pending `liberar` -> executando -> stop_all + kill children -> feito -> log -> SystemExit(75)."""
+    clock = Clock()
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-cmd", now=clock)
+    cmd_id = db.commands.insert_one({
+        "worker_id": "w-cmd", "acao": "liberar", "status": "pending", "criado_em": coord._dt(), "executado_em": None,
+    }).inserted_id
+
+    statuses: list[str] = []
+    orig_mark = coord.mark_command
+
+    def spy_mark(cid, status):
+        statuses.append(status)
+        return orig_mark(cid, status)
+
+    coord.mark_command = spy_mark
+
+    popen = FakePopen()
+    killed_children: list[bool] = []
+
+    async def irc(channels, on_message, stop):
+        while clock() < T0 + 70:
+            await clock.sleep(1)
+        await stop.wait()
+
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(monitor.run_monitor(
+            ["canal"], tmp_path / "out", monitor.ChannelPolicy(),
+            queue_root=tmp_path / "q", irc=irc, popen=popen,
+            pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+            coord=coord, capacity_fn=lambda _: {"cpus": 2, "score": 2},
+            kill_children=lambda: killed_children.append(True),
+        ))
+
+    assert exc_info.value.code == 75
+    assert statuses == ["executando", "feito"]
+    assert killed_children == [True]
+    doc = db.commands.find_one({"_id": cmd_id})
+    assert doc["status"] == "feito" and doc["executado_em"] is not None
+    assert "[comando] liberar recursos" in capsys.readouterr().out
+
+
+def test_liberar_chama_stop_all_antes_de_marcar_feito(tmp_path, monkeypatch):
+    """CMD-02 AC 8: pool.stop_all() runs between `executando` and `feito` when recorders are active."""
+    clock = Clock()
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-cmd2", now=clock)
+    events: list[str] = []
+    orig_mark = coord.mark_command
+
+    def spy_mark(cid, status):
+        events.append(f"mark:{status}")
+        return orig_mark(cid, status)
+
+    coord.mark_command = spy_mark
+
+    orig_stop_all = monitor.RollingRecorderPool.stop_all
+
+    def spy_stop_all(self):
+        events.append("stop_all")
+        return orig_stop_all(self)
+
+    monkeypatch.setattr(monitor.RollingRecorderPool, "stop_all", spy_stop_all)
+
+    cmd_inserted = [False]
+
+    async def irc(channels, on_message, stop):
+        while clock() < T0 + 70:
+            await clock.sleep(1)
+        for i in range(12):
+            on_message("canal", clock(), f"u{i % 6}", "KKKK")
+        while len(events) == 0 and not cmd_inserted[0]:
+            if db.lives.find_one({"_id": "twitch:canal:88", "owner": "w-cmd2"}):
+                db.commands.insert_one({
+                    "worker_id": "w-cmd2", "acao": "liberar", "status": "pending",
+                    "criado_em": coord._dt(), "executado_em": None,
+                })
+                cmd_inserted[0] = True
+            await clock.sleep(1)
+        await stop.wait()
+
+    popen = FakePopen()
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(monitor.run_monitor(
+            ["canal"], tmp_path / "out", monitor.ChannelPolicy(),
+            queue_root=tmp_path / "q", irc=irc, popen=popen,
+            pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+            coord=coord, stream_ids={"canal": "88"},
+            capacity_fn=lambda _: {"cpus": 4, "score": 30},
+            kill_children=lambda: events.append("kill_children"),
+        ))
+
+    assert exc_info.value.code == 75
+    assert events[:4] == ["mark:executando", "stop_all", "kill_children", "mark:feito"]
+    assert len(popen.pipelines()) >= 1
+    assert all(p.returncode is not None for p in popen.procs)
+
+
+def test_terminate_child_processes_atinge_apenas_descendentes(tmp_path, monkeypatch):
+    """CMD-02 AC 8: _terminate_child_processes terminates only descendants of current PID."""
+    proc = tmp_path / "proc"
+    for pid, ppid, comm in [(100, 1, "init"), (200, 100, "python"), (201, 200, "ffmpeg"), (202, 201, "llama-server"), (300, 100, "other")]:
+        d = proc / str(pid)
+        d.mkdir(parents=True)
+        (d / "stat").write_text(f"{pid} ({comm}) S {ppid} 0 0 0 0 0", encoding="utf-8")
+
+    monkeypatch.setattr(os, "getpid", lambda: 200)
+    sent: list[tuple[int, int]] = []
+    monitor._terminate_child_processes(proc_root=proc, kill_fn=lambda pid, sig: sent.append((pid, sig)))
+    assert sorted(pid for pid, _ in sent) == [201, 202]
+
