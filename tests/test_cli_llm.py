@@ -451,3 +451,47 @@ def test_cli_cloud_privacy_notice_written_only_when_cloud_used(tmp_path: Path, m
     assert rc_local == 0
     readme_local = (ing_local.out_dir / "README.md").read_text(encoding="utf-8")
     assert "Texto da transcrição enviado a:" not in readme_local
+
+
+def test_cli_cloud_cota_respects_out_dir(tmp_path: Path, monkeypatch):
+    import io
+    import urllib.error
+
+    custom_out = tmp_path / "custom_out"
+    env_out = tmp_path / "env_out"
+    ing = _make_ing(tmp_path, "cota_out_dir")
+    clip = SnappedClip(peak=31.0, start=20.0, end=50.0, score=0.90, text="Jogada absurda no round final!")
+    _mock_base_stages(monkeypatch, ing, [clip], [Word(30.0, 31.0, " Jogada!")])
+
+    monkeypatch.delenv("CLIPES_GEMINI_COTA_FILE", raising=False)
+    monkeypatch.setenv("OUT_DIR", str(env_out))
+    monkeypatch.setenv("GEMINI_API_KEYS", "secret-key-cota")
+    monkeypatch.setenv("CLIPES_LLM_BACKEND", "auto")
+    monkeypatch.setenv("CLIPES_GEMINI_MODELS", "m1")
+    monkeypatch.setenv("CLIPES_GEMINI_MIN_INTERVAL_S", "0")
+    monkeypatch.setattr(cloud_llm, "_out_dir", None)
+
+    daily_body = json.dumps({
+        "error": {
+            "status": "RESOURCE_EXHAUSTED",
+            "details": [{"violations": [{"quotaId": "GenerateRequestsPerDayPerProjectPerModel"}]}],
+        }
+    }).encode()
+
+    def raise_daily(*a, **kw):
+        raise urllib.error.HTTPError("u", 429, "err", {}, io.BytesIO(daily_body))
+
+    monkeypatch.setattr(cloud_llm, "_call", raise_daily)
+    monkeypatch.setattr(
+        llm,
+        "llama_server_session",
+        lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("sem local")),
+    )
+
+    rc = cli.main(["https://www.twitch.tv/gaules", "--out-dir", str(custom_out), "--skip-render"])
+    assert rc == 0
+
+    cota_file = custom_out / ".gemini_cota.json"
+    assert cota_file.is_file()
+    assert json.loads(cota_file.read_text(encoding="utf-8"))["esgotados"] == ["m1#0"]
+    assert not (env_out / ".gemini_cota.json").exists()

@@ -207,6 +207,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         return 2
 
     out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
+    cloud_llm.set_out_dir(out_root)
     timings: dict[str, float] = {}
 
     t0 = time.perf_counter()

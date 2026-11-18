@@ -22,6 +22,12 @@ _failed: set[tuple[str, int]] = set()
 _used: list[str] = []
 _last_call: dict[int, float] = {}
 _logged = False
+_out_dir: Path | None = None
+
+
+def set_out_dir(out_dir: Path | str | None) -> None:
+    global _out_dir
+    _out_dir = Path(out_dir) if out_dir is not None else None
 
 
 def _keys() -> list[str]:
@@ -71,7 +77,10 @@ def _min_interval() -> float:
 
 def _cota_path() -> Path:
     env = os.environ.get("CLIPES_GEMINI_COTA_FILE", "").strip()
-    return Path(env) if env else Path(os.environ.get("OUT_DIR") or "out") / ".gemini_cota.json"
+    if env:
+        return Path(env)
+    base = _out_dir if _out_dir is not None else Path(os.environ.get("OUT_DIR") or "out")
+    return base / ".gemini_cota.json"
 
 
 def _dia(now: Any) -> str:

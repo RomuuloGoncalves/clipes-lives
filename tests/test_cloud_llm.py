@@ -232,3 +232,19 @@ def test_timeout_usa_clipes_cloud_timeout_padrao_20s(monkeypatch):
         f_bad = Fake({"titulo": "x"})
         run(f_bad)
         assert f_bad.timeouts == [20.0]
+
+
+def test_cota_path_usa_set_out_dir_antes_de_out_dir_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_GEMINI_COTA_FILE", raising=False)
+    monkeypatch.setenv("OUT_DIR", str(tmp_path / "env_out"))
+    monkeypatch.setattr(cloud_llm, "_out_dir", None)
+    assert cloud_llm._cota_path() == tmp_path / "env_out" / ".gemini_cota.json"
+
+    custom_dir = tmp_path / "cli_out"
+    cloud_llm.set_out_dir(custom_dir)
+    assert cloud_llm._cota_path() == custom_dir / ".gemini_cota.json"
+
+    # CLIPES_GEMINI_COTA_FILE explícito continua prevalecendo
+    explicit = tmp_path / "explicit.json"
+    monkeypatch.setenv("CLIPES_GEMINI_COTA_FILE", str(explicit))
+    assert cloud_llm._cota_path() == explicit
