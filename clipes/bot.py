@@ -48,6 +48,49 @@ def _parse_button_custom_id(custom_id: str) -> tuple[tuple[str, ...], str] | Non
     return None
 
 
+def _parse_agendar_custom_id(custom_id: str) -> tuple[bool, str] | None:
+    if not custom_id.startswith("agendar:"):
+        return None
+    state, sep, raw_clip_id = custom_id[len("agendar:") :].partition(":")
+    clip_id = raw_clip_id.strip()
+    if not sep or not clip_id or state not in ("on", "off"):
+        return None
+    return (state == "on", clip_id)
+
+
+def _read_agendar_toggle(message: Any) -> bool:
+    components = getattr(message, "components", None)
+    if not components:
+        return True
+    for row in components:
+        items = row.get("components") if isinstance(row, dict) else (
+            getattr(row, "children", None) or getattr(row, "components", None) or ()
+        )
+        for item in items:
+            cid = str(item.get("custom_id") if isinstance(item, dict) else getattr(item, "custom_id", "") or "")
+            if cid.startswith("agendar:on:"):
+                return True
+            if cid.startswith("agendar:off:"):
+                return False
+    return True
+
+
+def _build_clip_view(clip_id: str, *, agendar_on: bool) -> discord.ui.View:
+    view = discord.ui.View(timeout=None)
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle(4), label="YouTube", custom_id=f"publicar:youtube:{clip_id}", row=0))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle(2), label="TikTok", custom_id=f"publicar:tiktok:{clip_id}", row=0))
+    view.add_item(discord.ui.Button(style=discord.ButtonStyle(3), label="Ambos", custom_id=f"publicar:ambos:{clip_id}", row=0))
+    view.add_item(
+        discord.ui.Button(
+            style=discord.ButtonStyle(1 if agendar_on else 2),
+            label="Agendar: sim" if agendar_on else "Agendar: nao",
+            custom_id=f"agendar:{'on' if agendar_on else 'off'}:{clip_id}",
+            row=1,
+        )
+    )
+    return view
+
+
 def _accepted_platforms(result: str) -> list[str]:
     accepted: list[str] = []
     for line in result.splitlines():
@@ -436,6 +479,8 @@ class ClipesBot(discord.Client):
         accepted: list[str],
         result: str,
         no_mentions: discord.AllowedMentions,
+        *,
+        agendar: bool = True,
     ) -> None:
         if msg is None or not hasattr(msg, "edit"):
             return
@@ -446,11 +491,12 @@ class ClipesBot(discord.Client):
         )
         user_name = str(raw_name).replace("\n", " ").strip()
         orig_content = str(getattr(msg, "content", "") or "")
+        mode = "agendado" if agendar else "agora"
         lines_to_add: list[str] = []
         for plat in accepted:
             label = _PLATFORM_LABELS[plat]
             if not _has_platform_line(orig_content, label):
-                lines_to_add.append(f"{label} por {user_name}")
+                lines_to_add.append(f"{label} por {user_name} ({mode})")
         new_content = _append_message_lines(orig_content, lines_to_add)
         has_yt = _has_platform_line(new_content, "YouTube") or ("youtube: ja publicado" in result)
         has_tt = _has_platform_line(new_content, "TikTok") or ("tiktok: ja publicado" in result)
@@ -476,10 +522,11 @@ class ClipesBot(discord.Client):
         data = getattr(interaction, "data", None)
         if not isinstance(data, dict):
             return
-        parsed = _parse_button_custom_id(str(data.get("custom_id") or ""))
-        if parsed is None:
+        custom_id = str(data.get("custom_id") or "")
+        toggle_parsed = _parse_agendar_custom_id(custom_id)
+        dest_parsed = None if toggle_parsed is not None else _parse_button_custom_id(custom_id)
+        if toggle_parsed is None and dest_parsed is None:
             return
-        platforms, clip_id = parsed
 
         no_mentions = discord.AllowedMentions.none()
         if not _interaction_in_configured_channel(interaction, self.channel_id):
@@ -497,11 +544,24 @@ class ClipesBot(discord.Client):
             )
             return
 
+        if toggle_parsed is not None:
+            current_on, clip_id = toggle_parsed
+            view = _build_clip_view(clip_id, agendar_on=not current_on)
+            edit_kw: dict[str, Any] = {"view": view}
+            if _accepts_kw(interaction.response.edit_message, "allowed_mentions"):
+                edit_kw["allowed_mentions"] = no_mentions
+            await interaction.response.edit_message(**edit_kw)
+            return
+
+        assert dest_parsed is not None
+        platforms, clip_id = dest_parsed
+        msg = getattr(interaction, "message", None)
+        agendar = _read_agendar_toggle(msg)
         channel = getattr(interaction, "channel", None)
         thread_id = _extract_thread_id(channel)
         user = getattr(interaction, "user", None)
         user_id = getattr(user, "id", "")
-        result = self._request_publish(clip_id, user_id, thread_id, platforms=platforms)
+        result = self._request_publish(clip_id, user_id, thread_id, agendar=agendar, platforms=platforms)
         await interaction.response.send_message(
             result,
             ephemeral=(result == "sem permissao"),
@@ -511,12 +571,13 @@ class ClipesBot(discord.Client):
         accepted = _accepted_platforms(result)
         if accepted:
             await self._update_button_message(
-                getattr(interaction, "message", None),
+                msg,
                 user,
                 user_id,
                 accepted,
                 result,
                 no_mentions,
+                agendar=agendar,
             )
 
         current_cid = getattr(interaction, "channel_id", getattr(channel, "id", None))

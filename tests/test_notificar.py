@@ -536,10 +536,21 @@ def test_notify_envia_botoes_publicar_com_custom_id_no_post_e_fallback_413(tmp_p
                         "custom_id": f"publicar:ambos:{clip_id}",
                     },
                 ],
-            }
+            },
+            {
+                "type": 1,
+                "components": [
+                    {
+                        "type": 2,
+                        "style": 2,
+                        "label": "Agendar: nao",
+                        "custom_id": f"agendar:off:{clip_id}",
+                    },
+                ],
+            },
         ]
 
-    # 413 fallback text post also keeps the 3 destination buttons
+    # 413 fallback text post also keeps the 3 destination buttons + Agendar toggle
     class Client413(FakeDiscordClient):
         def post(self, channel_id, content, file=None, components=None):
             if file is not None:
@@ -553,6 +564,7 @@ def test_notify_envia_botoes_publicar_com_custom_id_no_post_e_fallback_413(tmp_p
     c413 = Client413()
     notify_discord(out_413, policy=ChannelPolicy(), discord_client=c413, preview_fn=lambda s, d, c: s)
     assert c413.posts[-1]["file"] is None
+    assert len(c413.posts[-1]["components"]) == 2
     row_btns = c413.posts[-1]["components"][0]["components"]
     assert [b["custom_id"] for b in row_btns] == [
         "publicar:youtube:vid413_c01",
@@ -561,6 +573,15 @@ def test_notify_envia_botoes_publicar_com_custom_id_no_post_e_fallback_413(tmp_p
     ]
     assert [b["label"] for b in row_btns] == ["YouTube", "TikTok", "Ambos"]
     assert [b["style"] for b in row_btns] == [4, 2, 3]
+    row_toggle = c413.posts[-1]["components"][1]["components"]
+    assert row_toggle == [
+        {
+            "type": 2,
+            "style": 2,
+            "label": "Agendar: nao",
+            "custom_id": "agendar:off:vid413_c01",
+        }
+    ]
 
 
 def test_notify_registro_e_liberar_nao_derrubam_pipeline(tmp_path, monkeypatch, capsys):

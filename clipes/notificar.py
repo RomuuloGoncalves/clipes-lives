@@ -154,7 +154,18 @@ def _approve_components(clip_id: str) -> list[dict[str, Any]]:
                     "custom_id": f"publicar:ambos:{clip_id}",
                 },
             ],
-        }
+        },
+        {
+            "type": 1,
+            "components": [
+                {
+                    "type": 2,
+                    "style": 2,
+                    "label": "Agendar: nao",
+                    "custom_id": f"agendar:off:{clip_id}",
+                },
+            ],
+        },
     ]
 
 

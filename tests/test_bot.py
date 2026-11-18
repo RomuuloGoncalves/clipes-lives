@@ -964,7 +964,7 @@ def test_on_interaction_publicar_por_destino_yt_tt_ambos_e_sequencia(tmp_path: P
     assert db.publish_requests.find_one({"_id": "yt1_c01:youtube"})["status"] == "pending"
     assert db.publish_requests.find_one({"_id": "yt1_c01:tiktok"}) is None
     assert msg_yt.edits[-1]["view"] == "UNSET"
-    assert msg_yt.content == "**Titulo yt1_c01**\nYouTube por Romulo"
+    assert msg_yt.content == "**Titulo yt1_c01**\nYouTube por Romulo (agendado)"
 
     # 2. TikTok only -> calls request with ("tiktok",), keeps buttons
     msg_tt = _CompMsg("**Titulo tt1_c01**")
@@ -976,7 +976,7 @@ def test_on_interaction_publicar_por_destino_yt_tt_ambos_e_sequencia(tmp_path: P
     assert db.publish_requests.find_one({"_id": "tt1_c01:tiktok"})["status"] == "pending"
     assert db.publish_requests.find_one({"_id": "tt1_c01:youtube"}) is None
     assert msg_tt.edits[-1]["view"] == "UNSET"
-    assert msg_tt.content == "**Titulo tt1_c01**\nTikTok por Romulo"
+    assert msg_tt.content == "**Titulo tt1_c01**\nTikTok por Romulo (agendado)"
 
     # 3. Ambos -> calls request with PLATFORMS, adds both lines, removes buttons
     msg_amb = _CompMsg("**Titulo amb1_c01**")
@@ -988,7 +988,7 @@ def test_on_interaction_publicar_por_destino_yt_tt_ambos_e_sequencia(tmp_path: P
     assert db.publish_requests.find_one({"_id": "amb1_c01:youtube"})["status"] == "pending"
     assert db.publish_requests.find_one({"_id": "amb1_c01:tiktok"})["status"] == "pending"
     assert msg_amb.edits[-1]["view"] is None
-    assert msg_amb.content == "**Titulo amb1_c01**\nYouTube por Romulo\nTikTok por Romulo"
+    assert msg_amb.content == "**Titulo amb1_c01**\nYouTube por Romulo (agendado)\nTikTok por Romulo (agendado)"
 
     # 4. Sequential clicks (even with offline worker -> "pedido fica na fila"):
     #    1st click keeps buttons; 2nd click removes buttons
@@ -997,13 +997,13 @@ def test_on_interaction_publicar_por_destino_yt_tt_ambos_e_sequencia(tmp_path: P
     asyncio.run(bot.on_interaction(i_seq_tt))
     assert "pedido fica na fila" in i_seq_tt.response.messages[0][0]
     assert msg_seq.edits[-1]["view"] == "UNSET"
-    assert msg_seq.content == "**Titulo seq1_c01**\nTikTok por Romulo"
+    assert msg_seq.content == "**Titulo seq1_c01**\nTikTok por Romulo (agendado)"
 
     i_seq_yt = _CompInteraction("publicar:youtube:seq1_c01", msg_seq, user_name="Maria")
     asyncio.run(bot.on_interaction(i_seq_yt))
     assert "pedido fica na fila" in i_seq_yt.response.messages[0][0]
     assert msg_seq.edits[-1]["view"] is None
-    assert msg_seq.content == "**Titulo seq1_c01**\nTikTok por Romulo\nYouTube por Maria"
+    assert msg_seq.content == "**Titulo seq1_c01**\nTikTok por Romulo (agendado)\nYouTube por Maria (agendado)"
 
 
 def test_on_interaction_publicar_destino_negado_desligada_e_idempotente(tmp_path: Path):
@@ -1089,7 +1089,7 @@ def test_on_interaction_publicar_destino_negado_desligada_e_idempotente(tmp_path
     assert db.publish_requests.find_one({"_id": "desl1_c01:tiktok"}) is None
     assert len(msg_desl.edits) == 1
     assert msg_desl.edits[0]["view"] == "UNSET"
-    assert msg_desl.content == "**Titulo desl1_c01**\nYouTube por Romulo"
+    assert msg_desl.content == "**Titulo desl1_c01**\nYouTube por Romulo (agendado)"
     assert "TikTok por" not in msg_desl.content
 
     # 4. Double-click idempotency: clicking YouTube twice does not duplicate line or DB doc
@@ -1317,3 +1317,185 @@ def test_bot_respostas_usam_allowed_mentions_none_e_buscar_usa_to_thread(
     _assert_none_mentions(i_btn.response.kwargs_list[0].get("allowed_mentions"))
     assert len(edit_msg.edits) == 1
     _assert_none_mentions(edit_msg.edits[0].get("allowed_mentions"))
+
+
+def test_on_interaction_toggle_agendar_on_off_destinos_modos_e_legado(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from zoneinfo import ZoneInfo
+    from discord.components import _component_factory
+    from clipes.notificar import _approve_components
+
+    sp = ZoneInfo("America/Sao_Paulo")
+    t_now = datetime(2026, 11, 18, 10, 0, tzinfo=sp).timestamp()
+    monkeypatch.setenv("CLIPES_AGENDA_HORARIOS", "11:30,19:00")
+    monkeypatch.setenv("CLIPES_TZ", "America/Sao_Paulo")
+
+    _make_clip(tmp_path, video_id="tg1", clip_id="tg1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    _make_clip(tmp_path, video_id="tg2", clip_id="tg2_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    _make_clip(tmp_path, video_id="leg1", clip_id="leg1_c01", owner="w-pc1", thread_id=str(THREAD_ID))
+    tokens_path = _write_tokens(
+        tmp_path / "tokens.json",
+        {"youtube": {"refresh_token": "yt-refresh"}, "tiktok": {"refresh_token": "tt-refresh"}},
+    )
+    db, store = _mongo_store("w-pc1", "pc-mesa", t_now)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        tokens_path=tokens_path,
+        now=t_now,
+    )
+
+    class _ToggleMsg:
+        def __init__(self, content: str, components: list[Any]):
+            self.content = content
+            self.components = components
+            self.edits: list[dict[str, Any]] = []
+
+        async def edit(self, *, content: str | None = None, view: Any = "UNSET") -> None:
+            self.edits.append({"content": content, "view": view})
+            if content is not None:
+                self.content = content
+            if view is None:
+                self.components = []
+
+    class _ToggleResponse(_FakeInteractionResponse):
+        def __init__(self, msg: _ToggleMsg | None) -> None:
+            super().__init__()
+            self._msg = msg
+            self.edited: list[dict[str, Any]] = []
+
+        async def edit_message(self, *, view: Any = None, **kwargs: Any) -> None:
+            self.edited.append({"view": view, **kwargs})
+            if self._msg is not None and view is not None:
+                self._msg.components = [_component_factory(c) for c in view.to_components()]
+
+    class _ToggleInteraction:
+        def __init__(
+            self,
+            custom_id: str,
+            msg: _ToggleMsg | None,
+            *,
+            user_id: int | str = ALLOWED_USER,
+            user_name: str = "Romulo",
+            channel: _FakeChannel | None = None,
+        ):
+            self.type = discord.InteractionType.component
+            self.data = {"custom_id": custom_id, "component_type": 2}
+            self.user = _FakeUser(user_id, name=user_name)
+            self.channel = channel or _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+            self.channel_id = self.channel.id
+            self.message = msg
+            self.response = _ToggleResponse(msg)
+
+    recorded_agendar: list[tuple[str, bool, tuple[str, ...]]] = []
+    real_request = publicacao.request
+
+    def spy_request(*args: Any, **kwargs: Any) -> str:
+        recorded_agendar.append((args[1], bool(kwargs.get("agendar", True)), kwargs.get("platforms", publicacao.PLATFORMS)))
+        return real_request(*args, **kwargs)
+
+    monkeypatch.setattr(publicacao, "request", spy_request)
+
+    # 1. Negados e custom_ids invalidos no toggle
+    msg_neg = _ToggleMsg("**Titulo tg1_c01**", [_component_factory(c) for c in _approve_components("tg1_c01")])
+    i_wrong_ch = _ToggleInteraction("agendar:off:tg1_c01", msg_neg, channel=_FakeChannel(OTHER_CHANNEL_ID))
+    i_wrong_user = _ToggleInteraction("agendar:off:tg1_c01", msg_neg, user_id=OTHER_USER)
+    i_bad_state = _ToggleInteraction("agendar:talvez:tg1_c01", msg_neg)
+    i_empty_id = _ToggleInteraction("agendar:on:", msg_neg)
+    asyncio.run(bot.on_interaction(i_wrong_ch))
+    asyncio.run(bot.on_interaction(i_wrong_user))
+    asyncio.run(bot.on_interaction(i_bad_state))
+    asyncio.run(bot.on_interaction(i_empty_id))
+    assert i_wrong_ch.response.messages == [("canal nao permitido", True)]
+    assert i_wrong_ch.response.edited == []
+    assert i_wrong_user.response.messages == [("sem permissao", True)]
+    assert i_wrong_user.response.edited == []
+    assert i_bad_state.response.messages == [] and i_bad_state.response.edited == []
+    assert i_empty_id.response.messages == [] and i_empty_id.response.edited == []
+    assert msg_neg.content == "**Titulo tg1_c01**"
+
+    # 2. Toggle off -> on -> off via edit_message mantendo linha 1 e conteudo
+    msg_tg = _ToggleMsg("**Titulo tg1_c01**", [_component_factory(c) for c in _approve_components("tg1_c01")])
+    i_on = _ToggleInteraction("agendar:off:tg1_c01", msg_tg)
+    asyncio.run(bot.on_interaction(i_on))
+    assert i_on.response.messages == []
+    assert len(i_on.response.edited) == 1
+    comps_on = i_on.response.edited[0]["view"].to_components()
+    assert [b["custom_id"] for b in comps_on[0]["components"]] == [
+        "publicar:youtube:tg1_c01",
+        "publicar:tiktok:tg1_c01",
+        "publicar:ambos:tg1_c01",
+    ]
+    assert comps_on[1]["components"] == [
+        {
+            "type": 2,
+            "style": 1,
+            "disabled": False,
+            "label": "Agendar: sim",
+            "custom_id": "agendar:on:tg1_c01",
+        }
+    ]
+    assert msg_tg.content == "**Titulo tg1_c01**"
+
+    i_off = _ToggleInteraction("agendar:on:tg1_c01", msg_tg)
+    asyncio.run(bot.on_interaction(i_off))
+    assert i_off.response.messages == []
+    comps_off = i_off.response.edited[0]["view"].to_components()
+    assert comps_off[1]["components"] == [
+        {
+            "type": 2,
+            "style": 2,
+            "disabled": False,
+            "label": "Agendar: nao",
+            "custom_id": "agendar:off:tg1_c01",
+        }
+    ]
+
+    # 3. Clique YouTube com toggle off -> agendar=False (agora), preserva toggle
+    i_yt_now = _ToggleInteraction("publicar:youtube:tg1_c01", msg_tg, user_name="Romulo")
+    asyncio.run(bot.on_interaction(i_yt_now))
+    assert recorded_agendar[-1] == ("tg1_c01", False, ("youtube",))
+    assert "agendado para" not in i_yt_now.response.messages[0][0]
+    doc_yt = db.publish_requests.find_one({"_id": "tg1_c01:youtube"})
+    assert doc_yt is not None and "agendar_para" not in doc_yt
+    assert msg_tg.content == "**Titulo tg1_c01**\nYouTube por Romulo (agora)"
+    assert msg_tg.edits[-1]["view"] == "UNSET"
+    assert len(msg_tg.components) == 2
+
+    # 4. Alterna para on e re-clica YouTube (prefixo "YouTube por " nao duplica), depois clica TikTok -> (agendado) e remove tudo
+    asyncio.run(bot.on_interaction(_ToggleInteraction("agendar:off:tg1_c01", msg_tg)))
+    i_yt_dup = _ToggleInteraction("publicar:youtube:tg1_c01", msg_tg, user_name="Maria")
+    asyncio.run(bot.on_interaction(i_yt_dup))
+    assert msg_tg.content.count("YouTube por ") == 1
+
+    i_tt_sched = _ToggleInteraction("publicar:tiktok:tg1_c01", msg_tg, user_name="Maria")
+    asyncio.run(bot.on_interaction(i_tt_sched))
+    assert recorded_agendar[-1] == ("tg1_c01", True, ("tiktok",))
+    assert "agendado para 2026-11-18 11:30 (America/Sao_Paulo)" in i_tt_sched.response.messages[0][0]
+    doc_tt = db.publish_requests.find_one({"_id": "tg1_c01:tiktok"})
+    assert doc_tt is not None and doc_tt.get("agendar_para") is not None
+    assert msg_tg.content == "**Titulo tg1_c01**\nYouTube por Romulo (agora)\nTikTok por Maria (agendado)"
+    assert msg_tg.edits[-1]["view"] is None
+    assert msg_tg.components == []
+
+    # 5. Toggle off com dicts crus (Ambos -> agora em ambas as plataformas e remove tudo)
+    msg_dict = _ToggleMsg("**Titulo tg2_c01**", _approve_components("tg2_c01"))
+    i_amb_now = _ToggleInteraction("publicar:ambos:tg2_c01", msg_dict, user_name="Romulo")
+    asyncio.run(bot.on_interaction(i_amb_now))
+    assert recorded_agendar[-1] == ("tg2_c01", False, publicacao.PLATFORMS)
+    assert msg_dict.content == "**Titulo tg2_c01**\nYouTube por Romulo (agora)\nTikTok por Romulo (agora)"
+    assert msg_dict.edits[-1]["view"] is None
+
+    # 6. Mensagem legada sem toggle -> agendar=True (agendado)
+    legacy_row = _component_factory({"type": 1, "components": [{"type": 2, "style": 3, "label": "Aprovar", "custom_id": "aprovar:leg1_c01"}]})
+    msg_leg = _ToggleMsg("**Titulo leg1_c01**", [legacy_row])
+    i_leg = _ToggleInteraction("aprovar:leg1_c01", msg_leg, user_name="Romulo")
+    asyncio.run(bot.on_interaction(i_leg))
+    assert recorded_agendar[-1] == ("leg1_c01", True, publicacao.PLATFORMS)
+    assert "agendado para 2026-11-18 19:00 (America/Sao_Paulo)" in i_leg.response.messages[0][0]
+    assert msg_leg.content == "**Titulo leg1_c01**\nYouTube por Romulo (agendado)\nTikTok por Romulo (agendado)"
+    assert msg_leg.edits[-1]["view"] is None
