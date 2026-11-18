@@ -46,6 +46,8 @@ class Coord:
             {"$set": {"owner": self.worker_id, "lease_until": self._dt(self.lease_s)}},
             return_document=ReturnDocument.BEFORE,
         )
+        if got and got.get("owner") not in (None, self.worker_id):
+            self.mark_lost(live_id, got["owner"])  # dono anterior caiu: janelas dele não voltam
         return got is not None
 
     def renew(self, live_id: str) -> bool:
@@ -59,3 +61,45 @@ class Coord:
         if ended:
             fields.update(status="ended", ended_at=self._dt())
         self.db.lives.update_one({"_id": live_id, "owner": self.worker_id}, {"$set": fields})
+
+    # ---- jobs ----
+
+    def add_job(self, job_id: str, live_id: str, window: tuple, priority: float) -> bool:
+        doc = {"_id": job_id, "live_id": live_id, "window_start": window[0], "window_end": window[1],
+               "status": "pending", "owner": self.worker_id, "lease_until": None, "attempts": 0,
+               "priority": priority, "result": None, "updated_at": self._dt()}
+        try:
+            self.db.jobs.insert_one(doc)
+        except DuplicateKeyError:
+            return False
+        return True
+
+    def start_job(self, job_id: str) -> bool:
+        # ponytail: AC 8 ("atingir attempts >= 3") lido literal: a 3ª partida já marca failed (2 execuções reais).
+        got = self.db.jobs.find_one_and_update(
+            {"_id": job_id, "status": {"$in": ["pending", "processing"]},
+             "$or": [{"owner": None}, {"owner": self.worker_id}, {"lease_until": {"$lt": self._dt()}}]},
+            {"$inc": {"attempts": 1},
+             "$set": {"status": "processing", "owner": self.worker_id,
+                      "lease_until": self._dt(self.lease_s), "updated_at": self._dt()}},
+            return_document=ReturnDocument.AFTER,
+        )
+        if got is None:
+            return False
+        if got["attempts"] >= 3:
+            self.db.jobs.update_one({"_id": job_id}, {"$set": {"status": "failed", "updated_at": self._dt()}})
+            return False
+        return True
+
+    def finish_job(self, job_id: str, status: str, result: dict) -> bool:
+        res = self.db.jobs.update_one(
+            {"_id": job_id, "owner": self.worker_id, "status": "processing"},
+            {"$set": {"status": status, "result": result, "updated_at": self._dt()}},
+        )
+        return res.modified_count == 1
+
+    def mark_lost(self, live_id: str, old_owner: str) -> None:
+        self.db.jobs.update_many(
+            {"live_id": live_id, "owner": old_owner, "status": {"$in": ["pending", "processing"]}},
+            {"$set": {"status": "lost", "updated_at": self._dt()}},
+        )

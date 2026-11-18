@@ -110,3 +110,92 @@ def test_ensure_indexes_cria_os_indices_do_design(env):
 def test_mask_uri():
     assert mask_uri("mongodb+srv://u:p@h/x") == "mongodb+srv://***@***"
     assert mask_uri("lixo-sem-esquema") == "***"
+
+
+# ---- T7: jobs idempotentes por janela e janelas perdidas ----
+
+JOB = f"{LIVE}:1763416800"
+
+
+def add(c, job_id=JOB, end=1763416800, priority=4.2):
+    return c.add_job(job_id, LIVE, (end - 600, end), priority)
+
+
+def test_add_job_insere_e_nao_recria_id_existente(env):
+    _, db, a, b = env
+    assert add(a) is True
+    doc = db.jobs.find_one({"_id": JOB})
+    assert (doc["status"], doc["live_id"], doc["window_start"], doc["window_end"], doc["priority"]) == (
+        "pending", LIVE, 1763416200, 1763416800, 4.2)
+    db.jobs.update_one({"_id": JOB}, {"$set": {"status": "done"}})
+    assert add(b, priority=9.9) is False
+    assert db.jobs.count_documents({}) == 1
+    assert db.jobs.find_one({"_id": JOB})["status"] == "done"
+
+
+def test_concluir_duas_vezes_deixa_um_done_e_devolve_false_na_segunda(env):
+    _, db, a, _ = env
+    add(a)
+    assert a.start_job(JOB) is True
+    assert a.finish_job(JOB, "done", {"clips": 3}) is True
+    assert a.finish_job(JOB, "done", {"clips": 99}) is False
+    doc = db.jobs.find_one({"_id": JOB})
+    assert (doc["status"], doc["result"]) == ("done", {"clips": 3})
+    assert db.jobs.count_documents({"status": "done"}) == 1
+
+
+def test_outro_owner_nao_conclui(env):
+    _, db, a, b = env
+    add(a)
+    a.start_job(JOB)
+    assert b.finish_job(JOB, "done", {}) is False
+    assert db.jobs.find_one({"_id": JOB})["status"] == "processing"
+
+
+def test_job_pendente_so_e_iniciado_por_um_pc(env):
+    _, _, a, b = env
+    add(a)
+    assert a.start_job(JOB) is True
+    assert b.start_job(JOB) is False
+
+
+def test_terceira_tentativa_marca_failed(env):
+    clock, db, a, _ = env
+    add(a)
+    assert a.start_job(JOB) is True  # attempts 1
+    assert a.start_job(JOB) is True  # attempts 2 (retomada pelo mesmo dono)
+    assert a.start_job(JOB) is False  # attempts 3 -> failed
+    doc = db.jobs.find_one({"_id": JOB})
+    assert (doc["status"], doc["attempts"]) == ("failed", 3)
+    assert a.finish_job(JOB, "done", {}) is False
+
+
+def test_start_job_de_id_inexistente_devolve_false(env):
+    assert env[2].start_job("nao-existe") is False
+
+
+def test_claim_de_dono_vencido_marca_lost_pending_e_processing_dele(env):
+    clock, db, a, b = env
+    a.claim_live(LIVE)
+    add(a, f"{LIVE}:1", 1)
+    add(a, f"{LIVE}:2", 2)
+    add(a, f"{LIVE}:3", 3)
+    a.start_job(f"{LIVE}:2")
+    a.start_job(f"{LIVE}:3")
+    a.finish_job(f"{LIVE}:3", "done", {})
+    add(b, f"{LIVE}:4", 4)  # job de outro dono/sem dono não é tocado
+    db.jobs.update_one({"_id": f"{LIVE}:4"}, {"$set": {"owner": "w-b"}})
+    clock.t += 91
+    assert b.claim_live(LIVE) is True
+    st = {d["_id"]: d["status"] for d in db.jobs.find()}
+    assert st == {f"{LIVE}:1": "lost", f"{LIVE}:2": "lost", f"{LIVE}:3": "done", f"{LIVE}:4": "pending"}
+
+
+def test_claim_sem_dono_anterior_ou_do_proprio_dono_nao_marca_lost(env):
+    clock, db, a, b = env
+    add(a)
+    db.jobs.update_one({"_id": JOB}, {"$set": {"owner": "w-a"}})
+    a.claim_live(LIVE)
+    clock.t += 91
+    assert a.claim_live(LIVE) is True  # o próprio dono volta com a lease vencida
+    assert db.jobs.find_one({"_id": JOB})["status"] == "pending"
