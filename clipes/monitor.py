@@ -1032,6 +1032,7 @@ def follow_live(
     capacity_fn: Callable[[Path], dict[str, Any]] | None = None,
     max_lives_fn: Callable[[Path, int | None], int] | None = None,
     probe: Callable[[str], dict[str, Any]] = probe_metadata,
+    policy: ChannelPolicy | None = None,
 ) -> dict[str, Any]:
     """Clip one live in `step`-aligned windows [e-600, e] until it ends; returns {"status", "jobs"}.
 
@@ -1040,7 +1041,11 @@ def follow_live(
     each window. More than LIVE_MAX_BACKLOG pending windows: the oldest is marked `lost`.
     """
     channel = _live_channel(url_or_channel)
+    active_policy = policy or ChannelPolicy()
+    if not CHANNEL_RE.fullmatch(channel) or not active_policy.permits(channel):
+        return {"status": "blocked", "jobs": []}
     url = f"https://www.twitch.tv/{channel}"
+    out_root.mkdir(parents=True, exist_ok=True)
     min_free = float(os.environ.get("CLIPES_MIN_FREE_GB", "5") if min_free_gb is None else min_free_gb)
     pad = max_dur / 2
     queue = DiskQueue(queue_root or out_root / "queue")
@@ -1124,7 +1129,7 @@ def follow_live(
             queue.complete(backlog[0], "rejected", {"reject_reason": "lost", "lost": True})
 
     def process_one() -> bool:
-        return run_worker_step(queue, out_root, ChannelPolicy(), live_pipeline)
+        return run_worker_step(queue, out_root, active_policy, live_pipeline)
 
     if not pool.start_on_demand(channel):
         raise RuntimeError(f"nao foi possivel gravar {channel}")
@@ -1588,10 +1593,32 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-dir", default=None, help="Padrão: OUT_DIR ou ./out")
     p.add_argument("--queue-dir", type=Path, default=None, help="Padrão: <out-dir>/queue")
     p.add_argument("--dry-run", action="store_true", help="Só IRC + detector; não grava nem processa")
+    p.add_argument("--follow", default=None, help="Acompanha um único canal em janelas contínuas até acabar")
     args = p.parse_args(argv)
 
     out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
     policy = load_policy(args.policy_file or args.channels_file.with_name("policy.json"))
+    queue_root = args.queue_dir.expanduser().resolve() if args.queue_dir else None
+    if args.follow is not None:
+        channel = _live_channel(args.follow)
+        if not CHANNEL_RE.fullmatch(channel) or not policy.permits(channel):
+            print(f"[monitor] canal bloqueado ou invalido: {args.follow}", flush=True)
+            return 2
+        print(f"[monitor] acompanhando {channel}", flush=True)
+        try:
+            follow_live(
+                channel,
+                out_root,
+                queue_root=queue_root,
+                policy=policy,
+            )
+        except KeyboardInterrupt:
+            pass
+        except RuntimeError as exc:
+            print(f"[monitor] {exc}", flush=True)
+            return 1
+        return 0
+
     channels = discover_channels(args.channels_file, policy, args.game_id)
     if not channels:
         print(f"[monitor] nenhum canal para vigiar (veja {args.channels_file} e policy.json)", flush=True)
@@ -1600,7 +1627,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         asyncio.run(run_monitor(
             channels, out_root, policy,
-            queue_root=args.queue_dir.expanduser().resolve() if args.queue_dir else None,
+            queue_root=queue_root,
             max_recorders=args.max_recorders,
             dry_run=args.dry_run,
         ))

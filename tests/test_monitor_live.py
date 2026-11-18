@@ -116,3 +116,100 @@ def test_so_clipes_da_regiao_dona_e_sem_repeticao_sobrevivem(tmp_path, monkeypat
     _, q = run(tmp_path, monkeypatch, stop_after=620, pipeline=make)
     counts = {n: json.loads((q / "done" / n / "job.json").read_text())["clips"] for n in jobs_in(q, "done")}
     assert counts == {f"canal_{B + 300}": 1, f"canal_{B + 600}": 1}
+
+
+def test_monitor_follow_dispatches_follow_live_with_policy_and_dirs(tmp_path, monkeypatch):
+    from clipes import __main__ as entry
+
+    policy_path = tmp_path / "policy.json"
+    policy_path.write_text(json.dumps({"delay_h": {"gaules": 12.0}}), encoding="utf-8")
+    out_root = tmp_path / "out"
+    queue_root = tmp_path / "fila"
+    calls = []
+
+    def fake_follow(url_or_channel, root, **kwargs):
+        calls.append({"target": url_or_channel, "out_root": root, **kwargs})
+        return {"status": "ended", "jobs": []}
+
+    async def fail_run_monitor(*args, **kwargs):
+        raise AssertionError("run_monitor must not be called in --follow mode")
+
+    monkeypatch.setattr(monitor, "follow_live", fake_follow)
+    monkeypatch.setattr(monitor, "run_monitor", fail_run_monitor)
+
+    rc = entry.main([
+        "monitor",
+        "--follow", "https://www.twitch.tv/Gaules",
+        "--policy-file", str(policy_path),
+        "--out-dir", str(out_root),
+        "--queue-dir", str(queue_root),
+    ])
+
+    assert rc == 0
+    assert len(calls) == 1
+    assert calls[0]["target"] == "gaules"
+    assert calls[0]["out_root"] == out_root.resolve()
+    assert calls[0]["queue_root"] == queue_root.resolve()
+    assert calls[0]["policy"] == monitor.ChannelPolicy(delay_h={"gaules": 12.0})
+
+
+def test_monitor_follow_blocked_in_policy_exits_2_without_recording(tmp_path, monkeypatch):
+    channels_file = tmp_path / "channels.txt"  # does not need to exist; policy.json sits beside it
+    (tmp_path / "policy.json").write_text(json.dumps({"blocked": ["Proibido"]}), encoding="utf-8")
+
+    def fail_follow(*args, **kwargs):
+        raise AssertionError("follow_live must not run when channel is blocked")
+
+    monkeypatch.setattr(monitor, "follow_live", fail_follow)
+
+    rc_blocked = monitor.main(["--follow", "proibido", "--channels-file", str(channels_file)])
+    assert rc_blocked == 2
+
+    (tmp_path / "policy.json").write_text(json.dumps({"allowed": ["outro"]}), encoding="utf-8")
+    rc_not_allowed = monitor.main(["--follow", "proibido", "--channels-file", str(channels_file)])
+    assert rc_not_allowed == 2
+
+
+def test_monitor_follow_invalid_channel_exits_2_without_recording(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        monitor,
+        "follow_live",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("follow_live must not run for invalid channel")),
+    )
+
+    rc = monitor.main(["--follow", "canal invalido!", "--out-dir", str(tmp_path / "out")])
+    assert rc == 2
+
+
+def test_follow_live_respects_policy_blocked_and_delay(tmp_path, monkeypatch):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    pool = FakePool(clock, B + 320)
+
+    blocked_res = monitor.follow_live(
+        "canal", tmp_path / "blocked_out", pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        is_live=lambda u: True, now=clock.now, sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        policy=monitor.ChannelPolicy(blocked={"canal"}),
+    )
+    assert blocked_res == {"status": "blocked", "jobs": []}
+    assert pool.started is False
+
+    def pipe_one(job_dir, out):
+        job = json.loads((job_dir / "job.json").read_text())
+        vs, e = job["video_start"], job["window_end"]
+        center = e - 100
+        return {"clips": [{"file": "c.mp4", "score": 1.0, "start": center - 20 - vs, "end": center + 20 - vs}]}
+
+    res = monitor.follow_live(
+        "canal", tmp_path / "out", pool=pool, pipeline=pipe_one,
+        is_live=lambda u: True, now=clock.now, sleep=clock.sleep, min_free_gb=5,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        policy=monitor.ChannelPolicy(delay_h={"canal": 6.0}),
+    )
+    assert res["status"] == "ended"
+    done_jobs = list((tmp_path / "out" / "queue" / "done").iterdir())
+    assert len(done_jobs) == 1
+    job = json.loads((done_jobs[0] / "job.json").read_text())
+    assert job["ready_at"] == job["created_at"] + 6.0 * 3600
