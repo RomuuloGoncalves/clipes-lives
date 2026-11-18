@@ -123,6 +123,39 @@ def _ass_escape(text: str) -> str:
     return text.replace("\\", "").replace("{", "(").replace("}", ")")
 
 
+def is_hook_top_enabled() -> bool:
+    """Top hook overlay is enabled by default unless CLIPES_HOOK_TOP is '0', 'false', 'no', or 'off'."""
+    val = os.environ.get("CLIPES_HOOK_TOP", "1").strip().lower()
+    return val not in ("0", "false", "no", "off")
+
+
+def wrap_top_hook(text: str, max_chars: int = 18, max_lines: int = 2) -> str:
+    """Uppercase, ASS-escape, and wrap hook into up to max_lines of <= max_chars with alternating white/yellow."""
+    clean = _ass_escape(" ".join(text.split())).upper()
+    if not clean or max_chars <= 0 or max_lines <= 0:
+        return ""
+    lines: list[str] = []
+    cur = ""
+    for word in clean.split():
+        candidate = f"{cur} {word}" if cur else word
+        if len(candidate) <= max_chars:
+            cur = candidate
+        elif not cur:
+            lines.append(word[:max_chars])
+            if len(lines) >= max_lines:
+                break
+        else:
+            lines.append(cur)
+            if len(lines) >= max_lines:
+                cur = ""
+                break
+            cur = word[:max_chars] if len(word) > max_chars else word
+    if cur and len(lines) < max_lines:
+        lines.append(cur)
+    colors = ("&H00FFFFFF&", "&H0000FFFF&")
+    return r"\N".join(f"{{\\c{colors[i % 2]}}}{line}" for i, line in enumerate(lines))
+
+
 def build_ass(
     words: list[Word],
     clip_start: float,
@@ -135,6 +168,7 @@ def build_ass(
     part_index: int = 1,
     part_total: int = 1,
     outro_duration: float = OUTRO_DURATION,
+    hook_top: str = "",
 ) -> int:
     """Write word-highlighted ASS subtitles, channel credit, and end card. Returns dialogue count."""
     content_dur = max(0.0, clip_end - clip_start)
@@ -142,10 +176,17 @@ def build_ass(
         w for w in words
         if w.end > clip_start and w.start < clip_end and w.clean
     ]
+    wrapped_hook = wrap_top_hook(hook_top) if (hook_top and content_dur > 0 and is_hook_top_enabled()) else ""
     part_style = (
         "Style: PartBadge,DejaVu Sans,52,&H0000FFFF,&H0000FFFF,&H00000000,&H80000000,"
         f"-1,0,0,0,100,100,0,0,1,4,2,8,{SAFE_MARGIN_L},{SAFE_MARGIN_R},490,1\n"
         if part_total > 1
+        else ""
+    )
+    hook_style = (
+        "Style: TopHook,DejaVu Sans,64,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
+        f"-1,0,0,0,100,100,0,0,1,6,3,5,{SAFE_MARGIN_L},{SAFE_MARGIN_R},0,1\n"
+        if wrapped_hook
         else ""
     )
     header = (
@@ -165,12 +206,21 @@ def build_ass(
         "Style: Credit,DejaVu Sans,38,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
         f"-1,0,0,0,100,100,0,0,1,3,1,7,{SAFE_MARGIN_L},{SAFE_MARGIN_R},0,1\n"
         f"{part_style}"
+        f"{hook_style}"
         "Style: Card,DejaVu Sans,54,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
         f"-1,0,0,0,100,100,0,0,3,14,0,5,{SAFE_MARGIN_L},{SAFE_MARGIN_R},0,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
     events: list[str] = []
+    if wrapped_hook:
+        hook_end = _ass_time(min(5.0, content_dur))
+        events.append(
+            f"Dialogue: 3,0:00:00.00,{hook_end},TopHook,,0,0,0,,"
+            f"{{\\an5\\pos({width // 2},365)\\fad(120,350)"
+            f"\\fscx75\\fscy75\\t(0,220,\\fscx106\\fscy106)\\t(220,320,\\fscx100\\fscy100)}}"
+            f"{wrapped_hook}"
+        )
     if part_total > 1:
         badge_end = _ass_time(max(0.1, content_dur))
         events.append(
@@ -393,6 +443,7 @@ def render_clip(
         part_index=clip.part_index,
         part_total=clip.part_total,
         outro_duration=OUTRO_DURATION,
+        hook_top=clip.hook_top,
     )
 
     temp_seg: Path | None = None
