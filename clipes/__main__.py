@@ -1,9 +1,36 @@
-"""Module entrypoint for `python -m clipes` (`monitor` and `bench-live` subcommands)."""
+"""Module entrypoint for `python -m clipes` (`monitor`, `bench-live`, `bot`, and `auth` subcommands)."""
 
 import argparse
 import os
 import sys
 from pathlib import Path
+
+
+def _auth(argv: list[str]) -> int:
+    from . import oauth
+
+    p = argparse.ArgumentParser(
+        prog="clipes auth",
+        description="Autoriza o YouTube ou TikTok via OAuth local e salva o token em /config/tokens.json.",
+    )
+    p.add_argument("plataforma", help="Plataforma OAuth (youtube ou tiktok)")
+    args = p.parse_args(argv)
+
+    plat = args.plataforma.strip().lower()
+    if plat not in ("youtube", "tiktok"):
+        print(
+            f"[auth] erro: plataforma invalida {args.plataforma!r} (use youtube ou tiktok)",
+            file=sys.stderr,
+            flush=True,
+        )
+        return 2
+
+    try:
+        oauth.auth_flow(plat)
+    except (oauth.OAuthError, ValueError) as exc:
+        print(f"[auth] erro: {exc}", file=sys.stderr, flush=True)
+        return 2
+    return 0
 
 
 def _bench_live(argv: list[str]) -> int:
@@ -39,6 +66,12 @@ def main(argv: list[str]) -> int:
         return monitor_main(argv[1:])
     if argv[:1] == ["bench-live"]:
         return _bench_live(argv[1:])
+    if argv[:1] == ["bot"]:
+        from .bot import main as bot_main
+
+        return bot_main(argv[1:])
+    if argv[:1] == ["auth"]:
+        return _auth(argv[1:])
     from .cli import main as cli_main
 
     return cli_main(argv)
