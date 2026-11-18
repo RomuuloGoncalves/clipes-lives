@@ -193,7 +193,7 @@ O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o s
 1. No Google Cloud Console, habilite a **YouTube Data API v3**.
 2. Em **OAuth consent screen**, configure o app e altere o *Publishing status* para **"In production"** (em *"Testing"*, o *refresh token* expira em 7 dias).
 3. Em **Credentials → Create Credentials → OAuth client ID**, escolha **Desktop app** (app instalado) e salve `YOUTUBE_CLIENT_ID` e `YOUTUBE_CLIENT_SECRET` no `segredos.env`.
-4. Cota diária local conservadora: `CLIPES_YT_MAX_DIA=6` (padrão; `videos.insert` consome ~1.600 das 10.000 unidades/dia padrão). Clipes acima de 180 s são recusados para Shorts.
+4. Cota diária local conservadora: `CLIPES_YT_MAX_DIA=6` (padrão; `videos.insert` consome ~1.600 das 10.000 unidades/dia padrão). Clipes acima de 180 s são recusados para Shorts. O contador local (`OUT_DIR/.cotas_publicacao.json`) é **por PC** (não global entre PCs) e zera pelo dia **UTC** (a cota oficial do YouTube zera à meia-noite no fuso do Pacífico).
 
 ### 3. TikTok for Developers (Content Posting API)
 
@@ -212,14 +212,16 @@ docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth youtube --bind 0.0.0.
 docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth tiktok --bind 0.0.0.0
 ```
 
-Subir o serviço contínuo do bot (um único processo por servidor Discord):
+Subir o serviço contínuo do bot (um único processo por servidor Discord; exige `DISCORD_BOT_TOKEN` definido, caso contrário sai com código 2 em reinício contínuo):
 
 ```sh
 set -a && . ~/.config/clipes-lives/segredos.env && set +a
 docker compose up -d bot
 ```
 
-Comandos disponíveis no canal configurado e suas threads: `publicar <clip_id>`, `/publicar id:<clip_id>` e `/listar`.
+Comandos disponíveis apenas no canal configurado (`DISCORD_CHANNEL_ID`), suas threads e para IDs em `DISCORD_ALLOWED_USER_IDS`: `publicar <clip_id>`, `/publicar id:<clip_id>` e `/listar`.
+
+> **Workers multi-PC:** todo PC que executa o `monitor` e publica seus próprios clipes também precisa de `DISCORD_BOT_TOKEN` no `segredos.env`; sem ele o worker pula prévias e `run_pending`, deixando pedidos `pending` na fila.
 
 ### 5. Auditoria para publicação pública (futuro)
 
