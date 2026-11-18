@@ -36,6 +36,7 @@ services:
       TIKTOK_CLIENT_ID:
       TIKTOK_CLIENT_SECRET:
       CLIPES_TOKENS_PATH:
+      CLIPES_OAUTH_BIND:
       CLIPES_OAUTH_PORT:
       CLIPES_YT_MAX_DIA:
       CLIPES_TIKTOK_MAX_DIA:
@@ -47,7 +48,8 @@ services:
   bot:
     image: clipes-lives:latest
     user: "${UID:-1000}:${GID:-1000}"
-    restart: unless-stopped
+    profiles: ["bot"]
+    restart: on-failure:3
     mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256

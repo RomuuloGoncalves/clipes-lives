@@ -324,8 +324,65 @@ def test_falha_discord_429_grava_discord_error_sem_token_e_worker_segue(tmp_path
     assert (queue.root / "rejected" / "gaules_next").is_dir()
 
 
+def test_falha_em_um_clipe_registra_discord_error_sem_token_e_continua_proximos(tmp_path, monkeypatch):
+    """M1: falha ao enviar um clipe isolado grava discord_error sanitizado e continua proximos clipes."""
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_BOT_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL_ID)
+
+    queue = monitor.DiskQueue(tmp_path / "q")
+    clips_spec = [
+        {"index": 1, "clip_id": "c_fail", "file": "c1.mp4", "title": "Clip 1", "score": 0.9, "duration": 20.0},
+        {"index": 2, "clip_id": "c_ok", "file": "c2.mp4", "title": "Clip 2", "score": 0.8, "duration": 20.0},
+    ]
+    out_dir, manifest = _make_job_with_clips(queue, tmp_path, job_id="job_part_fail", clips_spec=clips_spec)
+
+    class PartialFailClient(FakeDiscordClient):
+        def post(self, channel_id: str | int, content: str, file: Path | None = None) -> dict[str, Any]:
+            self._seq += 1
+            if self._seq == 2:
+                raise RuntimeError(f"HTTP 500 simulating failure with {FAKE_BOT_TOKEN}")
+            msg_id = f"msg-{self._seq}"
+            self.posts.append({
+                "channel_id": str(channel_id),
+                "content": content,
+                "file": Path(file) if file is not None else None,
+                "id": msg_id,
+            })
+            return {"id": msg_id}
+
+    fake_discord = PartialFailClient()
+    policy = monitor.ChannelPolicy()
+
+    assert monitor.run_worker_step(
+        queue,
+        tmp_path / "out",
+        policy,
+        pipeline=lambda *_: {**manifest, "output_dir": str(out_dir)},
+        discord_client=fake_discord,
+        preview_fn=lambda src, dur, cache_dir: src,
+    ) is True
+
+    # 1 cabecalho + 1 clipe enviado com sucesso (c_ok)
+    assert len(fake_discord.posts) == 2
+    header, msg_ok = fake_discord.posts[0], fake_discord.posts[1]
+    assert header["channel_id"] == FAKE_CHANNEL_ID
+    assert msg_ok["channel_id"] == fake_discord.threads[0]["id"]
+    assert "c_ok" in msg_ok["content"]
+
+    updated_manifest = json.loads((out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert "discord" not in updated_manifest["clips"][0]
+    assert updated_manifest["clips"][1]["discord"]["message_id"] == msg_ok["id"]
+
+    done_job = json.loads((queue.root / "done" / "job_part_fail" / "job.json").read_text(encoding="utf-8"))
+    assert "discord_error" in done_job
+    assert FAKE_BOT_TOKEN not in done_job["discord_error"]
+    assert "***" in done_job["discord_error"]
+    assert "c_fail" not in (done_job.get("discord") or {}).get("clips", {})
+    assert (done_job.get("discord") or {}).get("clips", {}).get("c_ok") == msg_ok["id"]
+
+
 def test_sem_discord_bot_token_pula_previa_e_run_pending(tmp_path, monkeypatch):
-    """DISC-01 AC 7: without DISCORD_BOT_TOKEN, skips preview and skips run_pending without error."""
+    """Sem DISCORD_BOT_TOKEN, pula previa mas executa run_pending no heartbeat sem erro."""
     monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
     monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL_ID)
 
@@ -347,7 +404,7 @@ def test_sem_discord_bot_token_pula_previa_e_run_pending(tmp_path, monkeypatch):
     assert "discord_error" not in done_job
     assert "discord" not in done_job
 
-    # Heartbeat with Coord and no DISCORD_BOT_TOKEN skips run_pending
+    # Heartbeat with Coord and no DISCORD_BOT_TOKEN runs run_pending without error
     clock = Clock()
     db = mongomock.MongoClient().db
     coord = Coord(db, "w-notok", now=clock)
@@ -364,7 +421,9 @@ def test_sem_discord_bot_token_pula_previa_e_run_pending(tmp_path, monkeypatch):
     called: list[bool] = []
 
     async def irc(channels, on_message, stop):
-        while len(list(db.workers.find())) == 0:
+        for _ in range(50):
+            if called:
+                break
             await clock.sleep(1)
         stop.set()
 
@@ -381,7 +440,7 @@ def test_sem_discord_bot_token_pula_previa_e_run_pending(tmp_path, monkeypatch):
         capacity_fn=lambda _: {"cpus": 2, "score": 2},
         run_pending_fn=lambda *a, **kw: called.append(True) or [],
     ))
-    assert called == []
+    assert len(called) >= 1
     assert db.publish_requests.find_one({"_id": "vnt_c01:youtube"})["status"] == "pending"
 
 
