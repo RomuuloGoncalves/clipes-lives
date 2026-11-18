@@ -56,10 +56,10 @@ def providers_used() -> list[str]:
 
 def _timeout() -> float:
     try:
-        v = float(os.environ.get("CLIPES_LLM_TIMEOUT", ""))
-        return v if v > 0 else 60.0
+        v = float(os.environ.get("CLIPES_CLOUD_TIMEOUT", ""))
+        return v if v > 0 else 20.0
     except ValueError:
-        return 60.0
+        return 20.0
 
 
 def _min_interval() -> float:
