@@ -648,3 +648,151 @@ def test_run_pending_default_refresh_uses_oauth_without_injected_refreshers(
     assert stat.S_IMODE(tokens_path.stat().st_mode) == 0o600
 
 
+def test_concurrent_run_pending_local_store_uploads_once_without_tmp_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """B3: two concurrent run_pending threads on LocalStore perform 1 upload and hit no tmp file collision."""
+    import concurrent.futures
+    import threading
+
+    _make_clip_fixture(tmp_path, owner="w-pc1")
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"access_token": SECRET_ACCESS, "refresh_token": SECRET_REFRESH}})
+
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+
+    uploads: list[str] = []
+    replies: list[tuple[str, str]] = []
+    start_barrier = threading.Barrier(2)
+    upload_started = threading.Event()
+    allow_finish = threading.Event()
+
+    def slow_yt(mp4, title, desc, token):
+        uploads.append(mp4.name)
+        upload_started.set()
+        allow_finish.wait(timeout=5.0)
+        return {"video_id": "yt-concurrent-1"}
+
+    def worker() -> list[dict[str, Any]]:
+        start_barrier.wait(timeout=5.0)
+        return run_pending(
+            store,
+            "w-pc1",
+            out_root=tmp_path,
+            now=T0,
+            tokens_path=tokens_path,
+            publishers={"youtube": slow_yt},
+            discord_post=lambda tid, msg: replies.append((tid, msg)),
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(worker)
+        f2 = pool.submit(worker)
+        assert upload_started.wait(timeout=5.0)
+        # Re-request while in-flight must not overwrite running -> pending
+        res_inflight = request(store, "live1_c01", ALLOWED_USER, T0 + 1, out_root=tmp_path, tokens_path=tokens_path)
+        assert "ja publicado" not in res_inflight
+        allow_finish.set()
+        out1 = f1.result(timeout=5.0)
+        out2 = f2.result(timeout=5.0)
+
+    assert len(uploads) == 1
+    assert len(replies) == 1
+    assert len(out1) + len(out2) == 1
+    req_doc = store.get_request("live1_c01", "youtube")
+    assert req_doc is not None and req_doc["status"] == "ok"
+
+
+def test_concurrent_run_pending_mongo_store_claims_atomically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """B3: two concurrent run_pending threads on MongoStore claim atomically and upload once."""
+    import concurrent.futures
+    import threading
+
+    _make_clip_fixture(tmp_path, owner="w-pc1")
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    _, db = _mongo_with_worker("w-pc1", "pc-mesa", T0)
+    store = MongoStore(db)
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"access_token": SECRET_ACCESS, "refresh_token": SECRET_REFRESH}})
+
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+
+    uploads: list[str] = []
+    start_barrier = threading.Barrier(2)
+    upload_started = threading.Event()
+    allow_finish = threading.Event()
+
+    def slow_yt(mp4, title, desc, token):
+        uploads.append(mp4.name)
+        upload_started.set()
+        allow_finish.wait(timeout=5.0)
+        return {"video_id": "yt-mongo-concurrent"}
+
+    def worker() -> list[dict[str, Any]]:
+        start_barrier.wait(timeout=5.0)
+        return run_pending(
+            store,
+            "w-pc1",
+            out_root=tmp_path,
+            now=T0,
+            tokens_path=tokens_path,
+            publishers={"youtube": slow_yt},
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        f1 = pool.submit(worker)
+        f2 = pool.submit(worker)
+        assert upload_started.wait(timeout=5.0)
+        allow_finish.set()
+        out1 = f1.result(timeout=5.0)
+        out2 = f2.result(timeout=5.0)
+
+    assert len(uploads) == 1
+    assert len(out1) + len(out2) == 1
+    doc = db.publish_requests.find_one({"_id": "live1_c01:youtube"})
+    assert doc is not None and doc["status"] == "ok"
+
+
+def test_run_pending_before_ready_at_keeps_pending_for_later_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """B3 safety: claiming before ready_at must revert to pending so future run_pending executes."""
+    ready_at = T0 + 3600
+    _make_clip_fixture(tmp_path, owner="w-pc1", ready_at=None)
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"access_token": SECRET_ACCESS, "refresh_token": SECRET_REFRESH}})
+
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    delayed_policy = ChannelPolicy(delay_h={"gaules": 2.0})
+    out_early = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        policy=delayed_policy,
+        tokens_path=tokens_path,
+        publishers={"youtube": lambda *a: {"video_id": "should-not-run"}},
+    )
+    assert out_early == []
+    assert store.get_request("live1_c01", "youtube")["status"] == "pending"
+
+    out_ready = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=ready_at + 7200,
+        policy=delayed_policy,
+        tokens_path=tokens_path,
+        publishers={"youtube": lambda *a: {"video_id": "yt-after-wait"}},
+    )
+    assert len(out_ready) == 1
+    assert out_ready[0]["status"] == "ok"
+
+
+
