@@ -590,3 +590,105 @@ def test_render_clip_real_ffmpeg_outro_card_and_credit(tmp_path: Path, monkeypat
     assert outro_late.mean() > 20  # not faded to black
 
     assert "Live completa: twitch.tv/gaules" in part2_ass and "Parte 3" not in part2_ass  # CRED-04
+
+
+def test_slugify_and_clip_stem():
+    from clipes.render import clip_stem, slugify
+
+    assert slugify("Ele NÃO acreditou no que viu?!") == "ele-nao-acreditou-no-que-viu"
+    assert slugify("  Olá---Mundo!! 2026 @#$ ") == "ola-mundo-2026"
+    assert slugify("?!🔥💥...") == ""
+    assert slugify("") == ""
+
+    # Word-boundary truncation <= 40 chars
+    long_title = "Ele nao acreditou no que aconteceu naquela live inteira hoje"
+    slug = slugify(long_title)
+    assert len(slug) <= 40
+    assert slug == "ele-nao-acreditou-no-que-aconteceu"
+    assert not slug.endswith("-")
+
+    # Exact boundary right before hyphen
+    exact = "aaaa bbbb cccc dddd eeee ffff gggg hhhh iiii"
+    exact_slug = slugify(exact)
+    assert len(exact_slug) <= 40
+    assert exact_slug == "aaaa-bbbb-cccc-dddd-eeee-ffff-gggg-hhhh"
+
+    # Single word > 40 chars still respects <= 40
+    single_word = "a" * 55
+    assert len(slugify(single_word)) == 40
+
+    # clip_stem variants
+    c_title = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Ele NÃO acreditou no que viu?!")
+    assert clip_stem(3, c_title) == "clip_03_ele-nao-acreditou-no-que-viu"
+
+    c_empty = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="???")
+    assert clip_stem(1, c_empty) == "clip_01"
+
+    c_part = SnappedClip(
+        peak=5.0, start=0.0, end=10.0, score=0.9,
+        title="Olha isso!", part_index=1, part_total=2,
+    )
+    assert clip_stem(2, c_part) == "clip_02_part1of2_olha-isso"
+
+    c_part_empty = SnappedClip(
+        peak=5.0, start=0.0, end=10.0, score=0.9,
+        title="", part_index=2, part_total=3,
+    )
+    assert clip_stem(4, c_part_empty) == "clip_04_part2of3"
+
+    # Same title on two clips keeps files distinct via NN
+    c_dup1 = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Mesmo título")
+    c_dup2 = SnappedClip(peak=15.0, start=10.0, end=20.0, score=0.9, title="Mesmo título")
+    assert clip_stem(1, c_dup1) == "clip_01_mesmo-titulo"
+    assert clip_stem(2, c_dup2) == "clip_02_mesmo-titulo"
+
+
+def test_render_clip_uses_slug_stem_and_overwrites_same_index(tmp_path: Path, monkeypatch):
+    from types import SimpleNamespace
+    from clipes import render as render_mod
+
+    monkeypatch.delenv("CLIPES_BLUR_BG", raising=False)
+    monkeypatch.setattr(
+        render_mod.subprocess,
+        "run",
+        lambda cmd, **kw: (
+            Path(cmd[-1]).write_bytes(b"new-mp4"),
+            SimpleNamespace(returncode=0, stderr="", stdout=""),
+        )[-1],
+    )
+
+    src = tmp_path / "live.mkv"
+    src.write_bytes(b"src")
+    out_dir = tmp_path / "out"
+    cache_dir = tmp_path / "cache"
+    out_dir.mkdir()
+    cache_dir.mkdir()
+
+    clip = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Ele NÃO acreditou no que viu?!")
+    out_mp4 = render_mod.render_clip(clip, 3, [], "", out_dir, cache_dir, live_video_path=src)
+    assert out_mp4 == out_dir / "clip_03_ele-nao-acreditou-no-que-viu.mp4"
+    assert out_mp4.is_file()
+    assert (cache_dir / "clip_03_ele-nao-acreditou-no-que-viu.ass").is_file()
+
+    # Re-render with same index overwrites cleanly
+    out_mp4.write_bytes(b"old-mp4")
+    out_mp4_2 = render_mod.render_clip(clip, 3, [], "", out_dir, cache_dir, live_video_path=src)
+    assert out_mp4_2 == out_mp4
+    assert out_mp4_2.read_bytes() == b"new-mp4"
+
+    # Multipart with slug
+    clip_part = SnappedClip(
+        peak=5.0, start=0.0, end=10.0, score=0.9,
+        title="Momento épico", part_index=1, part_total=2,
+    )
+    out_part = render_mod.render_clip(clip_part, 2, [], "", out_dir, cache_dir, live_video_path=src)
+    assert out_part == out_dir / "clip_02_part1of2_momento-epico.mp4"
+    assert out_part.is_file()
+    assert (cache_dir / "clip_02_part1of2_momento-epico.ass").is_file()
+
+    # Empty slug falls back to clip_NN.mp4
+    clip_empty = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="")
+    out_empty = render_mod.render_clip(clip_empty, 4, [], "", out_dir, cache_dir, live_video_path=src)
+    assert out_empty == out_dir / "clip_04.mp4"
+    assert out_empty.is_file()
+    assert (cache_dir / "clip_04.ass").is_file()

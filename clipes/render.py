@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 import time
+import unicodedata
 from pathlib import Path
 
 from .ingest import js_runtime_args
@@ -81,6 +82,33 @@ def generate_title(
     if best_phrase:
         best_phrase = best_phrase[0].upper() + best_phrase[1:]
     return best_phrase or f"Clipe ({clip.start:.0f}s-{clip.end:.0f}s)"
+
+
+def slugify(title: str, max_len: int = 40) -> str:
+    """Convert title to ASCII lowercase slug <= max_len, cut at last word boundary."""
+    if not title or max_len <= 0:
+        return ""
+    ascii_text = unicodedata.normalize("NFKD", title).encode("ascii", "ignore").decode("ascii")
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text.lower()).strip("-")
+    if len(slug) <= max_len:
+        return slug
+    window = slug[: max_len + 1]
+    if "-" in window:
+        cut = window.rsplit("-", 1)[0].strip("-")
+        if cut:
+            return cut
+    return slug[:max_len].strip("-")
+
+
+def clip_stem(idx: int, clip: SnappedClip) -> str:
+    """Build output filename stem: clip_NN[_partKofN][_slug]."""
+    base = (
+        f"clip_{idx:02d}_part{clip.part_index}of{clip.part_total}"
+        if clip.part_total > 1
+        else f"clip_{idx:02d}"
+    )
+    slug = slugify(clip.title)
+    return f"{base}_{slug}" if slug else base
 
 
 def _ass_time(seconds: float) -> str:
@@ -353,7 +381,7 @@ def render_clip(
     reframe: bool = False,
 ) -> Path:
     """Download window (or slice live recording) and render 1080x1920 MP4 with ASS captions."""
-    stem = f"clip_{idx:02d}_part{clip.part_index}of{clip.part_total}" if clip.part_total > 1 else f"clip_{idx:02d}"
+    stem = clip_stem(idx, clip)
     out_file = out_dir / f"{stem}.mp4"
     ass_path = cache_dir / f"{stem}.ass"
     n_subs = build_ass(
