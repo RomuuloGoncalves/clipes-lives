@@ -105,6 +105,9 @@ class SnappedClip:
     llm_score: float | None = None
     llm_reason: str = ""
     title_source: str = ""
+    hook_top: str = ""
+    description_long: str = ""
+    description_source: str = ""
 
     @property
     def duration(self) -> float:

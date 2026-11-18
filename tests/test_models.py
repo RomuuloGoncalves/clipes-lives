@@ -31,3 +31,23 @@ def test_snapped_clip_and_candidate_part_defaults():
     assert clip.part_total == 1
     assert clip.group_id == ""
     assert clip.duration == 50.0
+
+
+def test_snapped_clip_hook_and_description_defaults():
+    clip = SnappedClip(peak=50.0, start=10.0, end=60.0, score=0.8)
+    assert clip.hook_top == ""
+    assert clip.description_long == ""
+    assert clip.description_source == ""
+
+    populated = SnappedClip(
+        peak=50.0,
+        start=10.0,
+        end=60.0,
+        score=0.8,
+        hook_top="Ele perdeu tudo?",
+        description_long="Resumo do trecho.",
+        description_source="llm",
+    )
+    assert populated.hook_top == "Ele perdeu tudo?"
+    assert populated.description_long == "Resumo do trecho."
+    assert populated.description_source == "llm"
