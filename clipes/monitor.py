@@ -985,39 +985,45 @@ def _notify_discord_job(
             _write_job(completed_dir, completed_job)
 
         for idx, clip in enumerate(clips, start=1):
-            if isinstance(clip.get("discord"), dict) and clip["discord"].get("message_id"):
-                continue
-            clip_id = str(clip.get("clip_id") or f"{video_id}_c{int(clip.get('index', idx)):02d}")
-            file_rel = clip.get("file")
-            mp4_path = (out_dir / file_rel) if (out_dir is not None and file_rel) else None
+            try:
+                if isinstance(clip.get("discord"), dict) and clip["discord"].get("message_id"):
+                    continue
+                clip_id = str(clip.get("clip_id") or f"{video_id}_c{int(clip.get('index', idx)):02d}")
+                file_rel = clip.get("file")
+                mp4_path = (out_dir / file_rel) if (out_dir is not None and file_rel) else None
 
-            attach_path: Path | None = None
-            too_large_path: Path | None = None
-            if mp4_path is not None and mp4_path.is_file():
-                preview_impl = preview_fn
-                if preview_impl is None:
-                    from .previa import preview_for_discord as preview_impl
-                duration = float(clip.get("rendered_duration") or clip.get("duration") or 60.0)
-                attach_path = preview_impl(mp4_path, duration, out_dir / ".cache")
-                if attach_path is None:
-                    too_large_path = mp4_path
+                attach_path: Path | None = None
+                too_large_path: Path | None = None
+                if mp4_path is not None and mp4_path.is_file():
+                    preview_impl = preview_fn
+                    if preview_impl is None:
+                        from .previa import preview_for_discord as preview_impl
+                    duration = float(clip.get("rendered_duration") or clip.get("duration") or 60.0)
+                    attach_path = preview_impl(mp4_path, duration, out_dir / ".cache")
+                    if attach_path is None:
+                        too_large_path = mp4_path
 
-            msg_text = _format_clip_discord_message(clip, clip_id, policy_status, too_large_path=too_large_path)
-            msg_resp = client.post(thread_id, msg_text, file=attach_path)
-            msg_id = str(msg_resp["id"])
+                msg_text = _format_clip_discord_message(clip, clip_id, policy_status, too_large_path=too_large_path)
+                msg_resp = client.post(thread_id, msg_text, file=attach_path)
+                msg_id = str(msg_resp["id"])
 
-            clip["discord"] = {"thread_id": thread_id, "message_id": msg_id}
-            if manifest is not None and clips_json_path is not None:
-                manifest["clips"] = clips
-                _write_json_atomic(clips_json_path, manifest)
+                clip["discord"] = {"thread_id": thread_id, "message_id": msg_id}
+                if manifest is not None and clips_json_path is not None:
+                    manifest["clips"] = clips
+                    _write_json_atomic(clips_json_path, manifest)
 
-            job_discord = dict(completed_job.get("discord") or {})
-            job_clips = dict(job_discord.get("clips") or {})
-            job_clips[clip_id] = msg_id
-            job_discord["thread_id"] = thread_id
-            job_discord["clips"] = job_clips
-            completed_job["discord"] = job_discord
-            _write_job(completed_dir, completed_job)
+                job_discord = dict(completed_job.get("discord") or {})
+                job_clips = dict(job_discord.get("clips") or {})
+                job_clips[clip_id] = msg_id
+                job_discord["thread_id"] = thread_id
+                job_discord["clips"] = job_clips
+                completed_job["discord"] = job_discord
+                _write_job(completed_dir, completed_job)
+            except Exception as exc:
+                err_text = f"{type(exc).__name__}: {exc}".replace(token, "***")
+                completed_job["discord_error"] = err_text[-500:]
+                _write_job(completed_dir, completed_job)
+                print(f"[discord] falha ao enviar previa ({err_text[-200:]})", flush=True)
     except Exception as exc:
         err_text = f"{type(exc).__name__}: {exc}".replace(token, "***")
         completed_job["discord_error"] = err_text[-500:]
