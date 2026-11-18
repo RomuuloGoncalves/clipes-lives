@@ -6,6 +6,42 @@ Gerador gratuito e 100% CPU-only de clipes verticais (`1080x1920`, H.264/AAC) co
 
 - Apenas **Docker** e **Docker Compose** (nada instalado no host, sem GPU, sem chaves de API ou login).
 
+## Início rápido (Docker)
+
+Em cada PC (Linux; no Windows use uma distro WSL2, ver "Windows" abaixo):
+
+```sh
+git clone https://github.com/RomuuloGoncalves/clipes-lives.git && cd clipes-lives
+git checkout onda-ab                 # até o merge no master
+docker compose build                 # constrói a imagem (1x, ou após git pull)
+
+# credenciais fora do repositório (ver "Configuração fora do repositório")
+mkdir -p ~/.config/clipes-lives && chmod 700 ~/.config/clipes-lives
+nano ~/.config/clipes-lives/segredos.env && chmod 600 ~/.config/clipes-lives/segredos.env
+```
+
+Rodar:
+
+```sh
+./clipar "<url do VOD>"                      # um VOD
+./clipar "https://www.twitch.tv/<canal>" --ate-acabar   # live inteira, em janelas, até acabar
+./clipar monitor --follow <canal>            # monitor contínuo de um canal
+docker compose up -d bot                     # bot do Discord (1 só processo por servidor)
+```
+
+Operação:
+
+```sh
+docker compose ps                    # o que está rodando
+docker compose logs -f bot           # logs do bot
+docker compose down                  # parar tudo
+docker ps -q | xargs -r docker stop  # parar qualquer contêiner
+docker network prune                 # se o compose falhar por falta de sub-redes
+docker compose run --rm test         # testes
+```
+
+O valor de `CLIPES_MONGO_URI` e dos tokens é pessoal: peça ao dono do projeto por um canal privado e nunca o publique em chat, issue ou commit. O painel de status está em https://clipes-painel.vercel.app.
+
 ## Uso
 
 Construir a imagem:
