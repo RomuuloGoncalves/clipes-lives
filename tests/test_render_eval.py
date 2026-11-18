@@ -250,7 +250,7 @@ def test_cli_skip_render_writes_part_metadata_in_manifest_and_readme(tmp_path: P
     assert manifest["clips"][0]["part_total"] == 2
     assert manifest["clips"][1]["part_index"] == 2
     assert manifest["clips"][0]["group_id"] == manifest["clips"][1]["group_id"] != ""
-    assert manifest["clips"][0]["file"] == "clip_01_part1of2.mp4"
+    assert manifest["clips"][0]["file"] == "clip_01_part1of2_parte-da-historia-completa-aqui0.mp4"
     readme = (vid_dir / "README.md").read_text(encoding="utf-8")
     assert "1/2" in readme and "2/2" in readme
     assert manifest["clips"][0]["group_id"] in readme
