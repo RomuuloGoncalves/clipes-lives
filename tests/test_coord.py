@@ -237,3 +237,60 @@ def test_beat_atualiza_sem_duplicar_e_aceita_job_nulo(env):
     doc = db.workers.find_one({"_id": "w-a"})
     assert doc["job_atual"] is None and len(doc["history"]) == 2
     assert doc["heartbeat_at"] == a._dt()
+
+
+# ---- T9: comandos do painel por PC ----
+
+def cmd(db, worker_id="w-a", acao="liberar", t=1, status="pending"):
+    return db.commands.insert_one(
+        {"worker_id": worker_id, "acao": acao, "status": status, "criado_em": t, "executado_em": None}
+    ).inserted_id
+
+
+def test_comando_de_outro_worker_nao_e_lido(env):
+    _, db, a, _ = env
+    cmd(db, "w-b")
+    assert a.pending_command() is None
+
+
+def test_devolve_o_pending_mais_antigo_do_proprio_worker(env):
+    _, db, a, _ = env
+    cmd(db, t=5)
+    velho = cmd(db, t=2)
+    cmd(db, t=1, status="feito")
+    assert a.pending_command()["_id"] == velho
+
+
+def test_acao_fora_da_lista_branca_vira_rejeitado_e_nao_e_devolvida(env):
+    _, db, a, _ = env
+    ruim = cmd(db, acao="apagar", t=1)
+    ok = cmd(db, acao="liberar", t=2)
+    got = a.pending_command()
+    assert got["_id"] == ok and got["acao"] == "liberar"
+    assert db.commands.find_one({"_id": ruim})["status"] == "rejeitado"
+    assert a.pending_command()["_id"] == ok
+
+
+def test_so_acao_apagar_nunca_devolve_nada(env):
+    _, db, a, _ = env
+    ruim = cmd(db, acao="apagar")
+    assert a.pending_command() is None
+    assert db.commands.find_one({"_id": ruim})["status"] == "rejeitado"
+
+
+def test_mark_command_executando_e_feito_gravam_status_e_executado_em(env):
+    clock, db, a, _ = env
+    i = cmd(db)
+    a.mark_command(i, "executando")
+    assert db.commands.find_one({"_id": i})["status"] == "executando"
+    assert a.pending_command() is None
+    a.mark_command(i, "feito")
+    doc = db.commands.find_one({"_id": i})
+    assert doc["status"] == "feito" and doc["executado_em"] == a._dt()
+
+
+def test_mark_command_nao_mexe_em_comando_de_outro_worker(env):
+    _, db, a, _ = env
+    i = cmd(db, "w-b")
+    a.mark_command(i, "feito")
+    assert db.commands.find_one({"_id": i})["status"] == "pending"

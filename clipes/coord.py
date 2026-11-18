@@ -9,6 +9,9 @@ from datetime import datetime, timezone
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+ACOES = {"liberar"}  # lista branca de comandos do painel
+
+
 def mask_uri(uri: str) -> str:
     """Esconde usuário, senha e host: `mongodb+srv://***@***`."""
     return uri.split("://", 1)[0] + "://***@***" if "://" in uri else "***"
@@ -115,3 +118,20 @@ class Coord:
                                               "temp_c": capacity.get("temp_c")}], "$slice": -180}}},
             upsert=True,
         )
+
+    # ---- comandos do painel ----
+
+    def pending_command(self) -> dict | None:
+        """Comando `pending` mais antigo do próprio PC; ação fora da lista branca vira `rejeitado`."""
+        while (c := self.db.commands.find_one({"worker_id": self.worker_id, "status": "pending"},
+                                              sort=[("criado_em", 1)])) is not None:
+            if c.get("acao") in ACOES:
+                return c
+            self.mark_command(c["_id"], "rejeitado")
+        return None
+
+    def mark_command(self, command_id, status: str) -> None:
+        fields = {"status": status}
+        if status == "feito":
+            fields["executado_em"] = self._dt()
+        self.db.commands.update_one({"_id": command_id, "worker_id": self.worker_id}, {"$set": fields})
