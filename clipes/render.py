@@ -129,6 +129,14 @@ def is_hook_top_enabled() -> bool:
     return val not in ("0", "false", "no", "off")
 
 
+def _truncate_ellipsis(text: str, max_chars: int) -> str:
+    if max_chars <= 0:
+        return ""
+    if max_chars == 1:
+        return "…"
+    return text[: max_chars - 1].rstrip(" ,;:-") + "…"
+
+
 def wrap_top_hook(text: str, max_chars: int = 18, max_lines: int = 2) -> str:
     """Uppercase, ASS-escape, and wrap hook into up to max_lines of <= max_chars with alternating white/yellow."""
     clean = _ass_escape(" ".join(text.split())).upper()
@@ -136,22 +144,34 @@ def wrap_top_hook(text: str, max_chars: int = 18, max_lines: int = 2) -> str:
         return ""
     lines: list[str] = []
     cur = ""
+    truncated = False
     for word in clean.split():
+        if len(word) > max_chars:
+            if cur:
+                lines.append(cur)
+                cur = ""
+                if len(lines) >= max_lines:
+                    truncated = True
+                    break
+            lines.append(_truncate_ellipsis(word, max_chars))
+            if len(lines) >= max_lines:
+                break
+            continue
         candidate = f"{cur} {word}" if cur else word
         if len(candidate) <= max_chars:
             cur = candidate
-        elif not cur:
-            lines.append(word[:max_chars])
-            if len(lines) >= max_lines:
-                break
         else:
             lines.append(cur)
             if len(lines) >= max_lines:
                 cur = ""
+                truncated = True
                 break
-            cur = word[:max_chars] if len(word) > max_chars else word
+            cur = word
     if cur and len(lines) < max_lines:
         lines.append(cur)
+    if truncated and lines and not lines[-1].endswith("…"):
+        base = lines[-1].rstrip(" ,;:-")
+        lines[-1] = (base + "…") if len(base) < max_chars else _truncate_ellipsis(lines[-1], max_chars)
     colors = ("&H00FFFFFF&", "&H0000FFFF&")
     return r"\N".join(f"{{\\c{colors[i % 2]}}}{line}" for i, line in enumerate(lines))
 
