@@ -17,7 +17,7 @@ docker compose build                 # constrói a imagem (1x, ou após git pull
 
 # credenciais fora do repositório (ver "Configuração fora do repositório")
 mkdir -p ~/.config/clipes-lives && chmod 700 ~/.config/clipes-lives
-nano ~/.config/clipes-lives/segredos.env && chmod 600 ~/.config/clipes-lives/segredos.env
+touch .env && chmod 600 .env && nano .env
 ```
 
 Rodar:
@@ -101,18 +101,15 @@ Em `${OUT_DIR:-./out}/<AAAA-MM-DD - Título [id]>/` (reaproveita a pasta antiga 
 - `clips.json` (score, sinais que dispararam, início/fim, título, transcrição e métricas)
 - `README.md` (resumo da execução)
 
-## Configuração fora do repositório (`segredos.env`)
+## Configuração (`.env` na raiz do projeto)
 
-Credenciais, tokens e URIs **nunca** entram no repositório. Crie `~/.config/clipes-lives/segredos.env` com permissão `600` (o `./clipar` carrega esse arquivo automaticamente e avisa se o modo não for `600`):
+Todas as credenciais, tokens e URIs ficam em **um só arquivo**: `.env` na raiz (já está no `.gitignore`; nunca o commite). O `./clipar` carrega esse arquivo, o `docker compose` também o lê sozinho e avisa se o modo não for `600`. Para usar outro caminho, defina `CLIPES_SECRETS`.
 
 ```sh
-mkdir -p ~/.config/clipes-lives
-chmod 700 ~/.config/clipes-lives
-touch ~/.config/clipes-lives/segredos.env
-chmod 600 ~/.config/clipes-lives/segredos.env
+touch .env && chmod 600 .env
 ```
 
-Exemplo fictício de variáveis aceitas no `segredos.env` (use apenas as que for utilizar):
+Exemplo fictício de variáveis aceitas no `.env` (use apenas as que for utilizar):
 
 ```sh
 # Fila multi-PC (opcional; sem ela cada PC usa fila local em disco)
@@ -143,7 +140,7 @@ O MongoDB coordena apenas quem grava cada live, o estado dos jobs, o heartbeat d
 3. Em **Database Access**, crie dois usuários com permissão mínima:
    - `workers`: permissão `readWrite` apenas nas coleções `lives`, `jobs`, `workers` e `commands`.
    - `painel`: role customizada com leitura (`find`) em `lives`, `jobs`, `workers` e `insert`/`update` apenas na coleção `commands`.
-4. No `segredos.env` de cada máquina, defina `CLIPES_MONGO_URI` com o usuário `workers` e um apelido distinto em `CLIPES_ALIAS` (ex.: `PC-1`, `PC-2`, `PC-3`).
+4. No `.env` de cada máquina, defina `CLIPES_MONGO_URI` com o usuário `workers` e um apelido distinto em `CLIPES_ALIAS` (ex.: `PC-1`, `PC-2`, `PC-3`).
 
 > O Atlas M0 pausa automaticamente após 30 dias sem conexões; se o Mongo ficar fora do ar, os PCs seguem processando na fila local e tentam reconectar a cada 60 s.
 
@@ -208,34 +205,34 @@ db.commands.deleteMany({ status: { $in: ["feito", "rejeitado"] }, criado_em: { $
 
 ## Bot do Discord e Publicação Privada
 
-O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`), usando as variáveis definidas em `segredos.env` e os tokens gravados em `/config/tokens.json`.
+O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`), usando as variáveis definidas em `.env` e os tokens gravados em `/config/tokens.json`.
 
 ### 1. Discord Developer Portal
 
 1. Crie uma aplicação em `https://discord.com/developers/applications`.
 2. Em **Bot**:
-   - Gere o token e salve em `DISCORD_BOT_TOKEN` no `segredos.env`.
+   - Gere o token e salve em `DISCORD_BOT_TOKEN` no `.env`.
    - Em **Privileged Gateway Intents**, ative **Message Content Intent** e salve (necessário para o comando em texto `publicar <id>`; o slash `/publicar` funciona mesmo sem ele).
 3. Em **OAuth2 → URL Generator**:
    - **Scopes**: marque `bot` e `applications.commands`.
    - **Bot Permissions**: marque `View Channels`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Attach Files`, `Embed Links`, `Read Message History`, `Add Reactions` e `Use Slash Commands`.
    - Abra a URL gerada e autorize o bot no seu servidor.
-4. No `segredos.env` (obtidos pelo Modo Desenvolvedor do Discord):
-   - `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` e `DISCORD_ALLOWED_USER_IDS` (lista vazia bloqueia todas as publicações por segurança).
+4. No `.env` (obtidos pelo Modo Desenvolvedor do Discord):
+   - `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` e `DISCORD_ALLOWED_USER_IDS` (lista vazia bloqueia todas as publicações; `*` libera qualquer usuário que enxergue o canal).
    - `CLIPES_DISCORD_MAX_MB=10` (opcional; prévia é recomprimida para 720x1280 se passar de 90% do limite, preservando o original 1080x1920).
 
 ### 2. Google Cloud (YouTube Data API v3)
 
 1. No Google Cloud Console, habilite a **YouTube Data API v3**.
 2. Em **OAuth consent screen**, configure o app e altere o *Publishing status* para **"In production"** (em *"Testing"*, o *refresh token* expira em 7 dias).
-3. Em **Credentials → Create Credentials → OAuth client ID**, escolha **Desktop app** (app instalado) e salve `YOUTUBE_CLIENT_ID` e `YOUTUBE_CLIENT_SECRET` no `segredos.env`.
+3. Em **Credentials → Create Credentials → OAuth client ID**, escolha **Desktop app** (app instalado) e salve `YOUTUBE_CLIENT_ID` e `YOUTUBE_CLIENT_SECRET` no `.env`.
 4. Cota diária local conservadora: `CLIPES_YT_MAX_DIA=6` (padrão; `videos.insert` consome ~1.600 das 10.000 unidades/dia padrão). Clipes acima de 180 s são recusados para Shorts. O contador local (`OUT_DIR/.cotas_publicacao.json`) é **por PC** (não global entre PCs) e zera pelo dia **UTC** (a cota oficial do YouTube zera à meia-noite no fuso do Pacífico).
 
 ### 3. TikTok for Developers (Content Posting API)
 
 1. No portal `developers.tiktok.com`, adicione a **Content Posting API** (Direct Post) com escopo `video.publish` (além de `user.info.basic`).
 2. Configure o redirect URI local `http://127.0.0.1:8765/callback` (ou porta de `CLIPES_OAUTH_PORT`).
-3. Salve `TIKTOK_CLIENT_KEY` e `TIKTOK_CLIENT_SECRET` no `segredos.env` (cota local padrão: `CLIPES_TIKTOK_MAX_DIA=5`).
+3. Salve `TIKTOK_CLIENT_KEY` e `TIKTOK_CLIENT_SECRET` no `.env` (cota local padrão: `CLIPES_TIKTOK_MAX_DIA=5`).
 4. Enquanto o app não for auditado, a conta de destino no TikTok **precisa estar marcada como Conta Privada** nas configurações do app (`SELF_ONLY`); contas públicas falham com `unaudited_client_can_only_post_to_private_accounts`.
 
 ### 4. Autorização OAuth e execução do bot
@@ -243,7 +240,6 @@ O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o s
 Autorize cada plataforma uma vez (escuta em `127.0.0.1:8765` por padrão e grava `~/.config/clipes-lives/tokens.json` com modo `600`; tokens rotacionados do TikTok são regravados automaticamente). Dentro do contêiner, passe `--bind 0.0.0.0` (ou `CLIPES_OAUTH_BIND=0.0.0.0`) para o `-p 127.0.0.1:8765:8765` encaminhar o callback do navegador sem expor a porta fora do `127.0.0.1` no host:
 
 ```sh
-set -a && . ~/.config/clipes-lives/segredos.env && set +a
 docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth youtube --bind 0.0.0.0
 docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth tiktok --bind 0.0.0.0
 ```
@@ -251,13 +247,12 @@ docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth tiktok --bind 0.0.0.0
 Subir o serviço contínuo do bot (um único processo por servidor Discord; exige `DISCORD_BOT_TOKEN` definido, caso contrário sai com código 2 em reinício contínuo):
 
 ```sh
-set -a && . ~/.config/clipes-lives/segredos.env && set +a
 docker compose up -d bot
 ```
 
 Comandos disponíveis apenas no canal configurado (`DISCORD_CHANNEL_ID`), suas threads e para IDs em `DISCORD_ALLOWED_USER_IDS`: `publicar <clip_id>`, `/publicar id:<clip_id>` e `/listar`.
 
-> **Workers multi-PC:** todo PC que executa o `monitor` e publica seus próprios clipes também precisa de `DISCORD_BOT_TOKEN` no `segredos.env`; sem ele o worker pula prévias e `run_pending`, deixando pedidos `pending` na fila.
+> **Workers multi-PC:** todo PC que executa o `monitor` e publica seus próprios clipes também precisa de `DISCORD_BOT_TOKEN` no `.env`; sem ele o worker pula prévias e `run_pending`, deixando pedidos `pending` na fila.
 
 ### 5. Auditoria para publicação pública (futuro)
 
