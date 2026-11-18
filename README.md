@@ -65,6 +65,68 @@ Em `${OUT_DIR:-~/Downloads/clipes-lives}/<AAAA-MM-DD - Título [id]>/` (reaprove
 - `clips.json` (score, sinais que dispararam, início/fim, título, transcrição e métricas)
 - `README.md` (resumo da execução)
 
+## Bot do Discord e Publicação Privada
+
+O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`).
+
+Todos os segredos ficam fora do repositório, em `~/.config/clipes-lives/segredos.env` (permissão `600`, lido automaticamente pelo `./clipar`) e `~/.config/clipes-lives/tokens.json` (montado em `/config` nos serviços `clipes` e `bot`).
+
+### 1. Discord Developer Portal
+
+1. Crie uma aplicação em `https://discord.com/developers/applications`.
+2. Em **Bot**:
+   - Gere o token e salve em `DISCORD_BOT_TOKEN` no `segredos.env`.
+   - Em **Privileged Gateway Intents**, ative **Message Content Intent** e salve (necessário para o comando em texto `publicar <id>`; o slash `/publicar` funciona mesmo sem ele).
+3. Em **OAuth2 → URL Generator**:
+   - **Scopes**: marque `bot` e `applications.commands`.
+   - **Bot Permissions**: marque `View Channels`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Attach Files`, `Embed Links`, `Read Message History`, `Add Reactions` e `Use Slash Commands`.
+   - Abra a URL gerada e autorize o bot no seu servidor.
+4. No `segredos.env` (nunca no repositório), defina os IDs obtidos no Discord (Modo Desenvolvedor):
+   - `DISCORD_GUILD_ID=<ID_DO_SERVIDOR>`
+   - `DISCORD_CHANNEL_ID=<ID_DO_CANAL>`
+   - `DISCORD_ALLOWED_USER_IDS=<ID_USUARIO_1,ID_USUARIO_2>` (lista vazia bloqueia todas as publicações por segurança)
+   - `CLIPES_DISCORD_MAX_MB=10` (opcional; prévia é recomprimida para 720x1280 se passar de 90% do limite, preservando o original 1080x1920)
+
+### 2. Google Cloud (YouTube Data API v3)
+
+1. No Google Cloud Console, habilite a **YouTube Data API v3**.
+2. Em **OAuth consent screen**, configure o app e altere o *Publishing status* para **"In production"** (em *"Testing"*, o *refresh token* expira em 7 dias).
+3. Em **Credentials → Create Credentials → OAuth client ID**, escolha **Desktop app** (app instalado) e salve `YOUTUBE_CLIENT_ID` e `YOUTUBE_CLIENT_SECRET` no `segredos.env`.
+4. Cota diária local conservadora: `CLIPES_YT_MAX_DIA=6` (padrão; `videos.insert` consome ~1.600 das 10.000 unidades/dia padrão). Clipes acima de 180 s são recusados para Shorts.
+
+### 3. TikTok for Developers (Content Posting API)
+
+1. No portal `developers.tiktok.com`, adicione a **Content Posting API** (Direct Post) com escopo `video.publish` (além de `user.info.basic`).
+2. Configure o redirect URI local `http://127.0.0.1:8765/callback` (ou porta de `CLIPES_OAUTH_PORT`).
+3. Salve `TIKTOK_CLIENT_KEY` e `TIKTOK_CLIENT_SECRET` no `segredos.env` (cota local padrão: `CLIPES_TIKTOK_MAX_DIA=5`).
+4. Enquanto o app não for auditado, a conta de destino no TikTok **precisa estar marcada como Conta Privada** nas configurações do app (`SELF_ONLY`); contas públicas falham com `unaudited_client_can_only_post_to_private_accounts`.
+
+### 4. Autorização OAuth e execução do bot
+
+Autorize cada plataforma uma vez (escuta em `127.0.0.1:8765` e grava `~/.config/clipes-lives/tokens.json` com modo `600`; tokens rotacionados do TikTok são regravados automaticamente):
+
+```sh
+set -a && . ~/.config/clipes-lives/segredos.env && set +a
+docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth youtube
+docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth tiktok
+```
+
+Subir o serviço contínuo do bot (um único processo por servidor Discord):
+
+```sh
+set -a && . ~/.config/clipes-lives/segredos.env && set +a
+docker compose up -d bot
+```
+
+Comandos disponíveis no canal configurado e suas threads: `publicar <clip_id>`, `/publicar id:<clip_id>` e `/listar`.
+
+### 5. Auditoria para publicação pública (futuro)
+
+Nesta versão a privacidade é fixa no código (`private` / `SELF_ONLY`). Para liberar publicação pública após auditoria:
+
+- **YouTube**: preencher o formulário *YouTube API Services – Audit and Quota Extension Form* (*Complete a compliance audit*) com descrição arquitetural e screencast do fluxo de upload acionado pelo usuário.
+- **TikTok**: submeter revisão no portal com domínio verificado (Termos de Uso e Política de Privacidade), screencast completo do fluxo OAuth e da tela de publicação, e integração a `/v2/post/publish/creator_info/query/` exibindo opções de privacidade e consentimento conforme as diretrizes de UX da plataforma.
+
 ## Limpeza
 
 Para remover container, imagem e volume de cache de modelos:
