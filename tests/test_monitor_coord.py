@@ -1225,5 +1225,38 @@ def test_follow_live_failover_dono_cai_segundo_worker_reivindica_sem_recriar_job
     assert db.lives.find_one({"_id": "twitch:canal:999"})["status"] == "ended"
 
 
+# ---- REV-onda-B: Achado 9 (capacity() non-blocking in event loop) --------------------------------
+
+
+def test_run_monitor_chama_capacity_fora_do_event_loop(tmp_path):
+    """Achado 9: slow capacity_fn (e.g. nvidia-smi) must run in a worker thread without blocking asyncio."""
+    import threading
+    import time
+
+    clock = Clock()
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-async", now=clock)
+    main_tid = threading.get_ident()
+    cap_threads: list[int] = []
+
+    def slow_cap(_out_root):
+        cap_threads.append(threading.get_ident())
+        time.sleep(0.05)
+        return {"cpus": 4, "score": 30}
+
+    async def irc(channels, on_message, stop):
+        while not cap_threads:
+            await clock.sleep(1)
+        stop.set()
+
+    asyncio.run(monitor.run_monitor(
+        ["canal"], tmp_path / "out", monitor.ChannelPolicy(),
+        queue_root=tmp_path / "q", irc=irc, popen=FakePopen(),
+        pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+        coord=coord, capacity_fn=slow_cap,
+    ))
+    assert cap_threads and all(tid != main_tid for tid in cap_threads)
+
+
 
 

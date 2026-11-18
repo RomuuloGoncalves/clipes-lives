@@ -1635,6 +1635,9 @@ async def run_monitor(
         ml = max_lives_getter(out_root, cap.get("cpus")) if max_lives_getter is not None else 1
         return cap, max(1, int(ml))
 
+    async def _current_limits_async() -> tuple[dict[str, Any], int]:
+        return await asyncio.to_thread(_current_limits)
+
     async def _claim_live(channel: str) -> bool:
         try:
             active_coord = coord_session.active if coord_session is not None else None
@@ -1642,7 +1645,7 @@ async def run_monitor(
                 return True
             if channel in owned_lives:
                 return True
-            cap, ml = _current_limits()
+            cap, ml = await _current_limits_async()
             if len(owned_lives) >= ml:
                 return False
             sid = await asyncio.to_thread(_resolve_stream_id, channel, stream_ids, probe)
@@ -1665,7 +1668,7 @@ async def run_monitor(
             active_coord = coord_session.active
             if active_coord is None:
                 return True
-            _, ml = _current_limits()
+            _, ml = await _current_limits_async()
             if channel in owned_lives:
                 return True
             if len(owned_lives) >= ml:
@@ -1693,7 +1696,7 @@ async def run_monitor(
             return True
         if channel in claiming_tasks:
             return await claiming_tasks[channel]
-        _, ml = _current_limits()
+        _, ml = await _current_limits_async()
         if len(owned_lives) >= ml or now() < claim_retry_at.get(channel, 0.0):
             return False
         task = asyncio.create_task(_claim_live(channel))
@@ -1764,7 +1767,7 @@ async def run_monitor(
                     return sum(1 for m in detectors[c].messages if m[0] >= t - 60.0)
                 active = sorted((c for c in detectors if recent(c) > 0), key=lambda c: -recent(c))
                 if coord_session is not None and coord_session.active is not None:
-                    _, ml = _current_limits()
+                    _, ml = await _current_limits_async()
                     for c in active:
                         if (c not in owned_lives and c not in claiming_tasks
                                 and len(owned_lives) < ml and t >= claim_retry_at.get(c, 0.0)):
@@ -1810,7 +1813,7 @@ async def run_monitor(
             active_coord = coord_session.active if coord_session is not None else None
             if active_coord is not None and t - last_beat >= beat_interval:
                 last_beat = t
-                cap, ml = _current_limits()
+                cap, ml = await _current_limits_async()
                 razao = _read_perfil_razao(out_root, cap.get("cpus"))
                 try:
                     await asyncio.to_thread(
