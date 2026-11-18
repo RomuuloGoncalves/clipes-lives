@@ -726,3 +726,92 @@ def test_terminate_child_processes_atinge_apenas_descendentes(tmp_path, monkeypa
     monitor._terminate_child_processes(proc_root=proc, kill_fn=lambda pid, sig: sent.append((pid, sig)))
     assert sorted(pid for pid, _ in sent) == [201, 202]
 
+
+# ---- REV-onda-B: Achado 2 (release ended=False on crash/Ctrl+C/start failure) --------------------
+
+
+def test_follow_live_so_marca_ended_quando_live_realmente_acaba(tmp_path, monkeypatch):
+    """Achado 2: crash, KeyboardInterrupt, or start_on_demand failure must release with ended=False."""
+    B = 1_700_000_100
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+
+    class FailingMidwayPool:
+        def __init__(self, clock, *, fail_on_segments: BaseException | None = None, fail_start: bool = False):
+            self.clock = clock
+            self.fail_on_segments = fail_on_segments
+            self.fail_start = fail_start
+            self.calls = 0
+
+        def start_on_demand(self, ch):
+            return not self.fail_start
+
+        def release_on_demand(self, ch):
+            pass
+
+        def is_recording(self, ch):
+            return True
+
+        def segments(self, ch):
+            self.calls += 1
+            if self.fail_on_segments is not None and self.calls >= 3:
+                raise self.fail_on_segments
+            return [(B, None)]
+
+        def video_start_ts(self, ch, s, e):
+            return float(B)
+
+        def freeze_and_concat(self, ch, s, e, dst):
+            dst.write_bytes(b"x")
+
+        def hold(self, ch, ts):
+            pass
+
+        def release_hold(self, ch):
+            pass
+
+        def cleanup(self, now):
+            pass
+
+    for exc_kind, exc in [("crash", RuntimeError("boom")), ("ctrl_c", KeyboardInterrupt())]:
+        clock = Clock(B + 10)
+        db = mongomock.MongoClient().db
+        coord = Coord(db, f"w-{exc_kind}", now=clock)
+        pool = FailingMidwayPool(clock, fail_on_segments=exc)
+        with pytest.raises(type(exc)):
+            monitor.follow_live(
+                "canal",
+                tmp_path / f"out-{exc_kind}",
+                pool=pool,
+                coord=coord,
+                stream_id="901",
+                is_live=lambda _: True,
+                now=clock,
+                sleep=lambda d: setattr(clock, "t", clock.t + d),
+                capacity_fn=lambda _: {"cpus": 6, "score": 30},
+            )
+        doc = db.lives.find_one({"_id": "twitch:canal:901"})
+        assert doc["status"] == "live"
+        assert doc["owner"] is None
+        assert doc["lease_until"] is None
+
+    # start_on_demand failing after claim_live must also release with ended=False
+    clock_start = Clock(B + 10)
+    db_start = mongomock.MongoClient().db
+    coord_start = Coord(db_start, "w-start", now=clock_start)
+    with pytest.raises(RuntimeError):
+        monitor.follow_live(
+            "canal",
+            tmp_path / "out-start",
+            pool=FailingMidwayPool(clock_start, fail_start=True),
+            coord=coord_start,
+            stream_id="902",
+            is_live=lambda _: True,
+            now=clock_start,
+            sleep=lambda d: setattr(clock_start, "t", clock_start.t + d),
+            capacity_fn=lambda _: {"cpus": 6, "score": 30},
+        )
+    doc_start = db_start.lives.find_one({"_id": "twitch:canal:902"})
+    assert doc_start["status"] == "live"
+    assert doc_start["owner"] is None
+
+
