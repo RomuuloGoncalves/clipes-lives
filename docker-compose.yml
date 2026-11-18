@@ -47,7 +47,8 @@ services:
   bot:
     image: clipes-lives:latest
     user: "${UID:-1000}:${GID:-1000}"
-    restart: unless-stopped
+    profiles: ["bot"]
+    restart: on-failure:3
     mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
