@@ -49,6 +49,11 @@ while :; do
   printf '%s\n' "$t" > "$OUT_DIR/.temp.tmp.$$" && mv -f "$OUT_DIR/.temp.tmp.$$" "$OUT_DIR/.temp"
   if [ "$t" = "sem-sensor" ]; then
     echo "$(date +%T) sem-sensor pausado=$pausado" >> "$LOG"; sync "$LOG" 2>/dev/null
+    if [ "$pausado" = 1 ]; then
+      ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives)
+      [ -n "$ids" ] && docker unpause $ids >/dev/null 2>&1
+      pausado=0
+    fi
   else
     echo "$(date +%T) ${t}C pausado=$pausado" >> "$LOG"; sync "$LOG" 2>/dev/null
     ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives)
