@@ -159,15 +159,31 @@ def test_job_pendente_so_e_iniciado_por_um_pc(env):
     assert b.start_job(JOB) is False
 
 
-def test_terceira_tentativa_marca_failed(env):
-    clock, db, a, _ = env
+def test_ate_tres_tentativas_permite_terceira_e_marca_failed_apos_falha(env):
+    clock, db, a, b = env
     add(a)
     assert a.start_job(JOB) is True  # attempts 1
     assert a.start_job(JOB) is True  # attempts 2 (retomada pelo mesmo dono)
-    assert a.start_job(JOB) is False  # attempts 3 -> failed
+    assert a.start_job(JOB) is True  # attempts 3 (3ª execução real permitida)
+    # Enquanto a 3ª execução está no lease de A, outro worker não pode derrubá-la para failed.
+    assert b.start_job(JOB) is False
+    assert db.jobs.find_one({"_id": JOB})["status"] == "processing"
+    # Falhou a 3ª (não concluiu): próxima tentativa marca failed e recusa execução.
+    assert a.start_job(JOB) is False
     doc = db.jobs.find_one({"_id": JOB})
     assert (doc["status"], doc["attempts"]) == ("failed", 3)
     assert a.finish_job(JOB, "done", {}) is False
+
+
+def test_terceira_tentativa_pode_concluir_done(env):
+    _, db, a, _ = env
+    add(a)
+    assert a.start_job(JOB) is True
+    assert a.start_job(JOB) is True
+    assert a.start_job(JOB) is True
+    assert a.finish_job(JOB, "done", {"clips": 1}) is True
+    doc = db.jobs.find_one({"_id": JOB})
+    assert (doc["status"], doc["attempts"]) == ("done", 3)
 
 
 def test_start_job_de_id_inexistente_devolve_false(env):

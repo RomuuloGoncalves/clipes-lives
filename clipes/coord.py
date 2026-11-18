@@ -77,21 +77,22 @@ class Coord:
         return True
 
     def start_job(self, job_id: str) -> bool:
-        # ponytail: AC 8 ("atingir attempts >= 3") lido literal: a 3ª partida já marca failed (2 execuções reais).
+        now = self._dt()
+        owner_filter = {"$or": [{"owner": None}, {"owner": self.worker_id}, {"lease_until": {"$lt": now}}]}
         got = self.db.jobs.find_one_and_update(
-            {"_id": job_id, "status": {"$in": ["pending", "processing"]},
-             "$or": [{"owner": None}, {"owner": self.worker_id}, {"lease_until": {"$lt": self._dt()}}]},
+            {"_id": job_id, "status": {"$in": ["pending", "processing"]}, "attempts": {"$lt": 3}, **owner_filter},
             {"$inc": {"attempts": 1},
              "$set": {"status": "processing", "owner": self.worker_id,
-                      "lease_until": self._dt(self.lease_s), "updated_at": self._dt()}},
+                      "lease_until": self._dt(self.lease_s), "updated_at": now}},
             return_document=ReturnDocument.AFTER,
         )
-        if got is None:
-            return False
-        if got["attempts"] >= 3:
-            self.db.jobs.update_one({"_id": job_id}, {"$set": {"status": "failed", "updated_at": self._dt()}})
-            return False
-        return True
+        if got is not None:
+            return True
+        self.db.jobs.update_one(
+            {"_id": job_id, "status": {"$in": ["pending", "processing"]}, "attempts": {"$gte": 3}, **owner_filter},
+            {"$set": {"status": "failed", "updated_at": now}},
+        )
+        return False
 
     def finish_job(self, job_id: str, status: str, result: dict) -> bool:
         res = self.db.jobs.update_one(
