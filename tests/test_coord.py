@@ -1,5 +1,7 @@
 """Coordenação entre PCs (mongomock em memória; sem rede nem banco real)."""
 
+import threading
+
 import mongomock
 import pytest
 from pymongo.errors import DuplicateKeyError
@@ -104,7 +106,15 @@ def test_ensure_indexes_cria_os_indices_do_design(env):
     a.ensure_indexes()
     assert "status_1_lease_until_1" in db.lives.index_information()
     assert "status_1_priority_-1" in db.jobs.index_information()
-    assert "worker_id_1_status_1" in db.commands.index_information()
+    cmd_idx = db.commands.index_information()
+    assert "worker_id_1_status_1" in cmd_idx
+    assert cmd_idx["worker_id_1"]["unique"] is True
+    assert cmd_idx["worker_id_1"]["partialFilterExpression"] == {"status": "pending"}
+    db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "pending"})
+    with pytest.raises(DuplicateKeyError):
+        db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "pending"})
+    db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "feito"})
+    db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "feito"})
 
 
 def test_mask_uri():
@@ -159,15 +169,31 @@ def test_job_pendente_so_e_iniciado_por_um_pc(env):
     assert b.start_job(JOB) is False
 
 
-def test_terceira_tentativa_marca_failed(env):
-    clock, db, a, _ = env
+def test_ate_tres_tentativas_permite_terceira_e_marca_failed_apos_falha(env):
+    clock, db, a, b = env
     add(a)
     assert a.start_job(JOB) is True  # attempts 1
     assert a.start_job(JOB) is True  # attempts 2 (retomada pelo mesmo dono)
-    assert a.start_job(JOB) is False  # attempts 3 -> failed
+    assert a.start_job(JOB) is True  # attempts 3 (3ª execução real permitida)
+    # Enquanto a 3ª execução está no lease de A, outro worker não pode derrubá-la para failed.
+    assert b.start_job(JOB) is False
+    assert db.jobs.find_one({"_id": JOB})["status"] == "processing"
+    # Falhou a 3ª (não concluiu): próxima tentativa marca failed e recusa execução.
+    assert a.start_job(JOB) is False
     doc = db.jobs.find_one({"_id": JOB})
     assert (doc["status"], doc["attempts"]) == ("failed", 3)
     assert a.finish_job(JOB, "done", {}) is False
+
+
+def test_terceira_tentativa_pode_concluir_done(env):
+    _, db, a, _ = env
+    add(a)
+    assert a.start_job(JOB) is True
+    assert a.start_job(JOB) is True
+    assert a.start_job(JOB) is True
+    assert a.finish_job(JOB, "done", {"clips": 1}) is True
+    doc = db.jobs.find_one({"_id": JOB})
+    assert (doc["status"], doc["attempts"]) == ("done", 3)
 
 
 def test_start_job_de_id_inexistente_devolve_false(env):
@@ -203,7 +229,7 @@ def test_claim_sem_dono_anterior_ou_do_proprio_dono_nao_marca_lost(env):
 
 # ---- T8: heartbeat do PC ----
 
-CAP = {"cpus": 3, "ram_gb": 2.6, "disco_livre_gb": 15.1, "temp_c": 78, "gpu": None, "score": 3}
+CAP = {"cpus": 3, "cpu_pct": 42.5, "ram_gb": 2.6, "disco_livre_gb": 15.1, "temp_c": 78, "gpu": None, "score": 3}
 
 
 def test_181_batidas_deixam_180_no_historico(env):
@@ -226,6 +252,7 @@ def test_beat_grava_campos_do_design_e_nada_alem_deles(env):
         "PC-1", CAP, "job-x", 2, 0.5)
     assert doc["heartbeat_at"] == a._dt()
     assert set(doc["history"][0]) == {"t", "cpu_pct", "temp_c"}
+    assert doc["history"][0]["cpu_pct"] == 42.5
     assert doc["history"][0]["temp_c"] == 78
 
 
@@ -294,3 +321,102 @@ def test_mark_command_nao_mexe_em_comando_de_outro_worker(env):
     i = cmd(db, "w-b")
     a.mark_command(i, "feito")
     assert db.commands.find_one({"_id": i})["status"] == "pending"
+
+
+# ---- #10: corrida concorrente em threads ----
+
+
+def test_corrida_dois_workers_em_threads_so_um_reivindica_cada_live(env):
+    """Corrida com 2 threads sincronizadas por barreira em N lives.
+
+    Nota: mongomock roda em memória e não prova atomicidade de rede/wiredtiger;
+    a atomicidade real vem do `find_one_and_update` único no MongoDB.
+    """
+    _, db, a, b = env
+    live_ids = [f"twitch:canal_{i}:100{i}" for i in range(20)]
+    for lid in live_ids:
+        a.ensure_live(lid, channel="canal", platform="twitch")
+
+    barrier = threading.Barrier(2)
+    wins: dict[str, set[str]] = {"w-a": set(), "w-b": set()}
+    errors: list[BaseException] = []
+
+    def worker(coord: Coord) -> None:
+        try:
+            for lid in live_ids:
+                barrier.wait(timeout=5)
+                if coord.claim_live(lid):
+                    wins[coord.worker_id].add(lid)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(a,)), threading.Thread(target=worker, args=(b,))]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert not errors
+    assert wins["w-a"].isdisjoint(wins["w-b"])
+    assert wins["w-a"] | wins["w-b"] == set(live_ids)
+    for lid in live_ids:
+        expected_owner = "w-a" if lid in wins["w-a"] else "w-b"
+        assert db.lives.find_one({"_id": lid})["owner"] == expected_owner
+
+
+def test_corrida_dois_workers_em_threads_so_um_inicia_e_cria_cada_job(env):
+    """Corrida com 2 threads em `add_job` e `start_job`: só um vence cada job."""
+    _, db, a, b = env
+    job_ids = [f"{LIVE}:{1763416800 + i * 300}" for i in range(20)]
+    barrier_add = threading.Barrier(2)
+    barrier_start = threading.Barrier(2)
+    add_wins: dict[str, set[str]] = {"w-a": set(), "w-b": set()}
+    start_wins: dict[str, set[str]] = {"w-a": set(), "w-b": set()}
+    errors: list[BaseException] = []
+
+    def racer_add(coord: Coord) -> None:
+        try:
+            for i, jid in enumerate(job_ids):
+                end = 1763416800 + i * 300
+                barrier_add.wait(timeout=5)
+                if coord.add_job(jid, LIVE, (end - 600, end), 5.0):
+                    add_wins[coord.worker_id].add(jid)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads_add = [threading.Thread(target=racer_add, args=(a,)), threading.Thread(target=racer_add, args=(b,))]
+    for t in threads_add:
+        t.start()
+    for t in threads_add:
+        t.join(timeout=10)
+
+    assert not errors
+    assert add_wins["w-a"].isdisjoint(add_wins["w-b"])
+    assert add_wins["w-a"] | add_wins["w-b"] == set(job_ids)
+    assert db.jobs.count_documents({}) == len(job_ids)
+
+    # Libera owner para que A e B possam disputar start_job em igualdade.
+    db.jobs.update_many({}, {"$set": {"owner": None}})
+
+    def racer_start(coord: Coord) -> None:
+        try:
+            for jid in job_ids:
+                barrier_start.wait(timeout=5)
+                if coord.start_job(jid):
+                    start_wins[coord.worker_id].add(jid)
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads_start = [threading.Thread(target=racer_start, args=(a,)), threading.Thread(target=racer_start, args=(b,))]
+    for t in threads_start:
+        t.start()
+    for t in threads_start:
+        t.join(timeout=10)
+
+    assert not errors
+    assert start_wins["w-a"].isdisjoint(start_wins["w-b"])
+    assert start_wins["w-a"] | start_wins["w-b"] == set(job_ids)
+    for jid in job_ids:
+        doc = db.jobs.find_one({"_id": jid})
+        expected_owner = "w-a" if jid in start_wins["w-a"] else "w-b"
+        assert (doc["status"], doc["attempts"], doc["owner"]) == ("processing", 1, expected_owner)

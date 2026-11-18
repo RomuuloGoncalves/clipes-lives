@@ -69,6 +69,24 @@ def _read_mem_available_bytes(proc: Path) -> int | None:
     return None
 
 
+def _read_cpu_pct(proc: Path, cpus: int) -> float | None:
+    load1: float | None = None
+    try:
+        parts = (proc / "loadavg").read_text(encoding="utf-8").strip().split()
+        if parts:
+            load1 = float(parts[0])
+    except (OSError, ValueError):
+        load1 = None
+    if load1 is None and proc == Path("/proc"):
+        try:
+            load1 = os.getloadavg()[0]
+        except OSError:
+            load1 = None
+    if load1 is None or load1 < 0:
+        return None
+    return round(min(100.0, (load1 / max(1, cpus)) * 100.0), 1)
+
+
 def _read_temp_c(out_dir: Path) -> int | None:
     temp_file = out_dir / ".temp"
     try:
@@ -134,6 +152,7 @@ def capacity(
     proc_path = Path(proc)
 
     cpus = cpu_threads(sysfs=sysfs_path)
+    cpu_pct = _read_cpu_pct(proc_path, cpus)
     mem_candidates = [
         v for v in (_read_cgroup_memory_bytes(sysfs_path), _read_mem_available_bytes(proc_path))
         if v is not None
@@ -146,6 +165,7 @@ def capacity(
 
     return {
         "cpus": cpus,
+        "cpu_pct": cpu_pct,
         "ram_gb": ram_gb,
         "disco_livre_gb": disco_livre_gb,
         "temp_c": temp_c,

@@ -53,6 +53,40 @@ def test_comando_codigos(db):
     assert _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)[0] == 409
     docs = list(db.commands.find())
     assert len(docs) == 1 and docs[0]["acao"] == "liberar" and docs[0]["status"] == "pending"
+    # Após concluir o comando pendente, outro pode ser criado.
+    db.commands.update_one({"_id": docs[0]["_id"]}, {"$set": {"status": "feito"}})
+    assert _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)[0] == 202
+
+
+def test_comando_409_atomico_em_corrida_e_duplicate_key(db, monkeypatch):
+    from pymongo.errors import DuplicateKeyError
+
+    db.commands.create_index([("worker_id", 1)], unique=True, partialFilterExpression={"status": "pending"})
+    barrier = threading.Barrier(4)
+    codes: list[int] = []
+    lock = threading.Lock()
+
+    def worker():
+        barrier.wait(timeout=5)
+        code, _ = _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)
+        with lock:
+            codes.append(code)
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+
+    assert sorted(codes) == [202, 409, 409, 409]
+    assert db.commands.count_documents({"worker_id": "w-1", "status": "pending"}) == 1
+
+    # DuplicateKeyError em corrida real no Mongo devolve 409 sem erro 500.
+    def boom(*args, **kwargs):
+        raise DuplicateKeyError("dup pending")
+
+    monkeypatch.setattr(db.commands, "update_one", boom)
+    assert _nucleo.criar_comando(db, "w-2", "LIBERAR", NOW) == (409, {"erro": "comando ja pendente"})
 
 
 def test_autorizado():
@@ -69,15 +103,27 @@ def test_status_sem_uri_nem_host(db):
     assert "mongodb" not in txt and "://" not in txt
 
 
+@pytest.fixture(autouse=True)
+def _limpar_falhas_auth():
+    _nucleo._FALHAS_AUTH.clear()
+    yield
+    _nucleo._FALHAS_AUTH.clear()
+
+
 # ---- T18/T19: handlers
-def chamar(mod, db, metodo, path_auth=None, corpo=None):
+def chamar(mod, db, metodo, path_auth=None, corpo=None, headers=None, raw_body=None):
     h = type("H", (mod.handler,), {"client": {"clipes": db}})
     srv = HTTPServer(("127.0.0.1", 0), h)
     threading.Thread(target=srv.handle_request, daemon=True).start()
-    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/", method=metodo,
-                                 data=json.dumps(corpo).encode() if corpo is not None else None)
+    data = raw_body if raw_body is not None else (json.dumps(corpo).encode() if corpo is not None else None)
+    req = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/", method=metodo, data=data)
     if path_auth:
         req.add_header("Authorization", path_auth)
+    if corpo is not None and (not headers or "Content-Type" not in headers):
+        req.add_header("Content-Type", "application/json")
+    for k, v in (headers or {}).items():
+        if v is not None:
+            req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, dict(r.headers), r.read()
@@ -118,6 +164,88 @@ def test_comando_405_401_202_409(db, env):
     assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 202
     assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 409
     assert db.commands.count_documents({}) == 1
+
+
+def test_comando_exige_content_type_json_e_confere_origin(db, env):
+    # Content-Type ausente ou form -> 415
+    assert chamar(comando, db, "POST", basic("s3"), raw_body=b"worker_id=w-1")[0] == 415
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )[0] == 415
+    # charset junto de application/json é aceito
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-2", "confirmar": "LIBERAR"},
+        headers={"Content-Type": "application/json; charset=utf-8"},
+    )[0] == 202
+    # Origin cruzado ou null -> 403
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        headers={"Origin": "https://atacante.invalid"},
+    )[0] == 403
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        headers={"Origin": "null"},
+    )[0] == 403
+    # Origin compatível com Host -> 202
+    assert chamar(
+        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        headers={"Host": "painel.local", "Origin": "https://painel.local"},
+    )[0] == 202
+
+
+def test_limite_tentativas_senha_429(db, env, monkeypatch):
+    t = [1000.0]
+    monkeypatch.setattr(_nucleo.time, "monotonic", lambda: t[0])
+
+    for _ in range(_nucleo.MAX_TENTATIVAS_SENHA):
+        code, _, _ = chamar(status_fn, db, "GET", basic("errada"), headers={"X-Real-IP": "198.51.100.10"})
+        assert code == 401
+
+    # Mesmo com a senha certa, o cliente bloqueado recebe 429 até expirar a janela.
+    code, hdr, _ = chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})
+    assert code == 429 and int(hdr["Retry-After"]) > 0
+
+    # Outro IP continua normal.
+    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.11"})[0] == 200
+
+    # Passada a janela de bloqueio, volta a aceitar.
+    t[0] += _nucleo.JANELA_BLOQUEIO_S + 1
+    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})[0] == 200
+
+
+def test_abrir_reutiliza_client_lazy_com_max_pool_size_1(monkeypatch):
+    import pymongo
+
+    criados = []
+
+    class FakeClient:
+        def __init__(self, uri, **kwargs):
+            self.uri = uri
+            self.kwargs = kwargs
+            self.closed = False
+            criados.append(self)
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(pymongo, "MongoClient", FakeClient)
+    monkeypatch.setattr(_nucleo, "_CLIENT", None)
+    monkeypatch.setattr(_nucleo, "_CLIENT_URI", None)
+
+    assert _nucleo._CLIENT is None
+    c1 = _nucleo._abrir("mongodb://um.invalid")
+    c2 = _nucleo._abrir("mongodb://um.invalid")
+    assert c1 is c2
+    assert len(criados) == 1
+    assert c1.kwargs["maxPoolSize"] == 1
+    assert not c1.closed
+
+    c3 = _nucleo._abrir("mongodb://dois.invalid")
+    assert c3 is not c1
+    assert c1.closed is True
+    assert len(criados) == 2
+    assert c3.kwargs["maxPoolSize"] == 1
 
 
 # ---- T20: pagina do painel

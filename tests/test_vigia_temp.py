@@ -197,3 +197,45 @@ def test_loop_pausa_a_86_e_retoma_a_74_atualizando_dot_temp(tmp_path):
     log_text = log_file.read_text(encoding="utf-8")
     assert "86C pausado=0" in log_text
     assert "74C pausado=1" in log_text
+
+
+def test_sensor_que_some_com_conteiner_pausado_despausa(tmp_path):
+    sysfs = tmp_path / "sys"
+    name_file = sysfs / "class/hwmon/hwmon0/name"
+    temp_input = sysfs / "class/hwmon/hwmon0/temp1_input"
+    _write_file(name_file, "k10temp\n")
+    _write_file(temp_input, "86000\n")
+
+    bin_dir, docker_calls = _setup_fake_bin(tmp_path, container_id="cid123")
+    env = _base_env(tmp_path, sysfs, bin_dir)
+    env["CLIPES_TEMP_MAX"] = "85"
+    env["CLIPES_TEMP_MIN"] = "75"
+
+    temp_file = Path(env["OUT_DIR"]) / ".temp"
+    log_file = Path(env["LOG"])
+
+    proc = subprocess.Popen([str(VIGIA_PATH)], env=env)
+    try:
+        _wait_until(
+            lambda: docker_calls.exists()
+            and "pause cid123" in docker_calls.read_text(encoding="utf-8")
+            and temp_file.exists()
+            and temp_file.read_text(encoding="utf-8").strip() == "86"
+        )
+
+        # Sensor desaparece enquanto pausado=1.
+        temp_input.unlink()
+        _wait_until(
+            lambda: "unpause cid123" in docker_calls.read_text(encoding="utf-8")
+            and temp_file.read_text(encoding="utf-8").strip() == "sem-sensor"
+            and "sem-sensor pausado=0" in log_file.read_text(encoding="utf-8")
+        )
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+
+    lines = docker_calls.read_text(encoding="utf-8").splitlines()
+    assert lines.index("pause cid123") < lines.index("unpause cid123")
+    log_text = log_file.read_text(encoding="utf-8")
+    assert "sem-sensor pausado=1" in log_text
+    assert "sem-sensor pausado=0" in log_text

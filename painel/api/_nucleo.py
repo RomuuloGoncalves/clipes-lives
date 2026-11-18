@@ -3,10 +3,20 @@ import base64
 import json
 import os
 import secrets
+import threading
+import time
 from datetime import timedelta
+from urllib.parse import urlsplit
 
 BEAT_S = int(os.environ.get("CLIPES_BEAT_S", "20"))
 SEM_CONFIG = (500, {"erro": "painel nao configurado"})
+MAX_TENTATIVAS_SENHA = 5
+JANELA_BLOQUEIO_S = 60.0
+_FALHAS_AUTH: dict[str, list[float]] = {}
+_AUTH_LOCK = threading.Lock()
+_CLIENT = None
+_CLIENT_URI: str | None = None
+_CLIENT_LOCK = threading.Lock()
 
 
 def autorizado(header, senha):
@@ -47,15 +57,78 @@ def status(db, now, beat_s=BEAT_S):
 
 def criar_comando(db, worker_id, confirmar, now):
     """Devolve (codigo_http, corpo)."""
+    from pymongo.errors import DuplicateKeyError
+
     if confirmar != "LIBERAR":
         return 400, {"erro": "confirmacao invalida"}
     if not worker_id or not db.workers.find_one({"_id": worker_id}):
         return 404, {"erro": "worker inexistente"}
-    if db.commands.find_one({"worker_id": worker_id, "status": "pending"}):
+    try:
+        res = db.commands.update_one(
+            {"worker_id": worker_id, "status": "pending"},
+            {"$setOnInsert": {
+                "worker_id": worker_id,
+                "acao": "liberar",
+                "status": "pending",
+                "criado_em": now,
+                "executado_em": None,
+            }},
+            upsert=True,
+        )
+    except DuplicateKeyError:
         return 409, {"erro": "comando ja pendente"}
-    db.commands.insert_one({"worker_id": worker_id, "acao": "liberar", "status": "pending",
-                            "criado_em": now, "executado_em": None})
+    if res.upserted_id is None:
+        return 409, {"erro": "comando ja pendente"}
     return 202, {"ok": True}
+
+
+def _chave_cliente(h):
+    for hdr in ("X-Real-IP", "X-Forwarded-For"):
+        val = (h.headers.get(hdr) or "").split(",")[0].strip()
+        if val:
+            return val
+    addr = getattr(h, "client_address", None)
+    return str(addr[0]) if addr else "global"
+
+
+def _auth_bloqueada(chave, agora_mono):
+    corte = agora_mono - JANELA_BLOQUEIO_S
+    with _AUTH_LOCK:
+        recentes = [t for t in _FALHAS_AUTH.get(chave, ()) if t > corte]
+        if recentes:
+            _FALHAS_AUTH[chave] = recentes
+        else:
+            _FALHAS_AUTH.pop(chave, None)
+        return len(recentes) >= MAX_TENTATIVAS_SENHA
+
+
+def _registrar_falha_auth(chave, agora_mono):
+    corte = agora_mono - JANELA_BLOQUEIO_S
+    with _AUTH_LOCK:
+        recentes = [t for t in _FALHAS_AUTH.get(chave, ()) if t > corte]
+        recentes.append(agora_mono)
+        _FALHAS_AUTH[chave] = recentes
+
+
+def _limpar_falhas_auth(chave):
+    with _AUTH_LOCK:
+        _FALHAS_AUTH.pop(chave, None)
+
+
+def _origem_valida(h):
+    origin = (h.headers.get("Origin") or "").strip()
+    alvo = origin or (h.headers.get("Referer") or "").strip()
+    if not alvo:
+        return True
+    parsed = urlsplit(alvo)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return False
+    hosts = {
+        v.strip().lower()
+        for v in (h.headers.get("Host"), h.headers.get("X-Forwarded-Host"))
+        if v and v.strip()
+    }
+    return bool(hosts) and parsed.netloc.lower() in hosts
 
 
 def tratar(h, metodo, now=None):
@@ -64,8 +137,25 @@ def tratar(h, metodo, now=None):
     senha, uri = os.environ.get("PAINEL_SENHA"), os.environ.get("PAINEL_MONGO_URI")
     if not senha or not uri:
         return _enviar(h, *SEM_CONFIG)
+    chave = _chave_cliente(h)
+    agora_mono = time.monotonic()
+    if _auth_bloqueada(chave, agora_mono):
+        return _enviar(
+            h,
+            429,
+            {"erro": "muitas tentativas"},
+            {"Retry-After": str(int(JANELA_BLOQUEIO_S))},
+        )
     if not autorizado(h.headers.get("Authorization"), senha):
+        _registrar_falha_auth(chave, agora_mono)
         return _enviar(h, 401, {"erro": "nao autorizado"}, {"WWW-Authenticate": 'Basic realm="painel"'})
+    _limpar_falhas_auth(chave)
+    if metodo == "comando":
+        if not _origem_valida(h):
+            return _enviar(h, 403, {"erro": "origem nao permitida"})
+        ctype = (h.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            return _enviar(h, 415, {"erro": "Content-Type deve ser application/json"})
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     try:
         client = h.client or _abrir(uri)
@@ -84,8 +174,19 @@ def tratar(h, metodo, now=None):
 
 
 def _abrir(uri):
-    from pymongo import MongoClient
-    return MongoClient(uri, maxPoolSize=1, serverSelectionTimeoutMS=5000)
+    global _CLIENT, _CLIENT_URI
+    with _CLIENT_LOCK:
+        if _CLIENT is None or _CLIENT_URI != uri:
+            if _CLIENT is not None:
+                try:
+                    _CLIENT.close()
+                except Exception:
+                    pass
+                _CLIENT = None
+            from pymongo import MongoClient
+            _CLIENT = MongoClient(uri, maxPoolSize=1, serverSelectionTimeoutMS=5000)
+            _CLIENT_URI = uri
+        return _CLIENT
 
 
 def _enviar(h, codigo, corpo, extra=None):
