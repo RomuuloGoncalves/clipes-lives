@@ -133,3 +133,12 @@ def test_bench_live_routes_to_perfil_medir_and_returns_zero(tmp_path, monkeypatc
     assert saved["cpus"] == 4
     assert saved["razao"] == pytest.approx(0.1, rel=1e-6)
 
+
+
+def test_max_lives_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "3")
+    assert perfil.max_lives(tmp_path, cpus=3) == 3
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "0")
+    assert perfil.max_lives(tmp_path, cpus=3) == 1
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "abc")
+    assert perfil.max_lives(tmp_path, cpus=3) == 1

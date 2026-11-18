@@ -79,7 +79,10 @@ def medir(
 
 
 def max_lives(out_dir: Path | str, cpus: int | None = None) -> int:
-    """Compute max_lives = max(1, floor(0.6 / razao)) from .perfil.json; 1 if missing or cpus changed."""
+    """CLIPES_MAX_LIVES (>=1) wins; else max(1, floor(0.6 / razao)) from .perfil.json; 1 if missing or cpus changed."""
+    raw = os.environ.get("CLIPES_MAX_LIVES", "").strip()
+    if raw.isdigit() and int(raw) >= 1:
+        return int(raw)
     perfil_path = Path(out_dir) / ".perfil.json"
     try:
         data = json.loads(perfil_path.read_text(encoding="utf-8"))
