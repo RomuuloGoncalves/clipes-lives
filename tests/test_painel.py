@@ -112,7 +112,7 @@ def _limpar_falhas_auth():
 
 # ---- T18/T19: handlers
 def chamar(mod, db, metodo, path_auth=None, corpo=None, headers=None, raw_body=None):
-    h = type("H", (mod.handler,), {"client": {"clipes": db}})
+    h = type("H", (mod.handler,), {"client": {"clipes_lives": db}})
     srv = HTTPServer(("127.0.0.1", 0), h)
     threading.Thread(target=srv.handle_request, daemon=True).start()
     data = raw_body if raw_body is not None else (json.dumps(corpo).encode() if corpo is not None else None)
