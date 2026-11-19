@@ -55,6 +55,9 @@ class _SplitStyle:
     hook_on_cam: bool
 
 
+# B-14: estilo/geometria do caminho de render por filter_complex (render_clip/preview, via _SPLIT_STYLES).
+# Diverge de layout.VARIANTES (name_y, etc.) de proposito: layout.py e a tabela do recorte split_layout (cam/jogo);
+# unificar mudaria o visual dos clipes, por isso as duas tabelas ficam separadas (adiado).
 _SPLIT_STYLES: dict[str, _SplitStyle] = {
     "split-cheio": _SplitStyle(
         bar_bg="",

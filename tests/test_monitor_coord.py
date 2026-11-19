@@ -551,7 +551,7 @@ def test_heartbeat_3_ciclos_chama_3_beat_e_3_renew_e_renew_falso_para_gravador(t
 
     db = mongomock.MongoClient().db
     coord = Coord(db, "w-hb", now=clock, lease_s=90)
-    other = Coord(db, "w-outro", now=clock, lease_s=90)
+    Coord(db, "w-outro", now=clock, lease_s=90)
 
     beats: list[tuple] = []
     renews: list[tuple[str, bool]] = []

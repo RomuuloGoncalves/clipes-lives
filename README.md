@@ -4,6 +4,7 @@ Gerador gratuito e 100% CPU-only de clipes verticais (`1080x1920`, H.264/AAC) co
 
 ## Requisitos
 
+- Roda apenas em Linux/Docker (as travas de arquivo usam `fcntl`); no Windows use Docker/WSL2.
 - Apenas **Docker** e **Docker Compose** (nada instalado no host, sem GPU; chaves de API como `GEMINI_API_KEYS`, Discord, YouTube, TikTok e Twitch são opcionais).
 
 ## Início rápido (Docker)

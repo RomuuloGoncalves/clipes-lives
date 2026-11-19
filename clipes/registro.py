@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import fcntl
 import hashlib
 import json
 import math
@@ -20,6 +19,13 @@ from pathlib import Path
 from typing import Any
 
 from .ingest import sanitize_id
+
+try:  # travas de arquivo so existem em Linux/Docker (B-03)
+    import fcntl
+except ImportError:  # Windows nativo: importar funciona, usar a trava falha com mensagem clara
+    fcntl = None  # type: ignore[assignment]
+
+FCNTL_AUSENTE_MSG = "clipes requer Linux/Docker para travas de arquivo (fcntl)"
 
 VERSAO = 1
 SCHEMA_REGISTRO = 1
@@ -57,6 +63,8 @@ def _locked_path(path: Path) -> Iterator[None]:
     resolved = path.resolve()
     with _PATH_LOCKS_GUARD:
         lock = _PATH_LOCKS.setdefault(resolved, threading.Lock())
+    if fcntl is None:
+        raise RuntimeError(FCNTL_AUSENTE_MSG)
     with lock:
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.with_name(f".{path.name}.lock")

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from clipes.layout import (
     CANVAS_H,
-    CANVAS_W,
     DEFAULT_VARIANTE,
     VARIANTES,
     Layout,

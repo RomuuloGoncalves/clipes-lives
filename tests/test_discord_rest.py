@@ -8,6 +8,7 @@ import json
 import urllib.error
 from email.message import Message
 from pathlib import Path
+from typing import Any
 
 import pytest
 

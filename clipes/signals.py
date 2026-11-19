@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 import re
 import wave
-from collections import Counter
 from pathlib import Path
 from typing import Any
 

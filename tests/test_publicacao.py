@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -568,7 +568,6 @@ def test_run_pending_default_refresh_uses_oauth_without_injected_refreshers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """B1: real _default_refresh -> oauth.refresh_google / refresh_tiktok -> urlopen path."""
-    import io
     import urllib.parse
     import urllib.request
 

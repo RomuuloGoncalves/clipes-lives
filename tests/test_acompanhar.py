@@ -276,7 +276,7 @@ def test_live_session_backlog_lost_avisa_discord(tmp_path, monkeypatch, capsys):
         aviso_fn=avisos.append,
     )
     sup.run()
-    assert f"janela perdida gaules (fila cheia)" in avisos
+    assert "janela perdida gaules (fila cheia)" in avisos
 
 
 # ---- T7: Limite, aguardando, recusa visível, offline, policy, recorder error ----------------------

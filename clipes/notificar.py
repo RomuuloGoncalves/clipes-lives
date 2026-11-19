@@ -703,7 +703,6 @@ def post_aviso(
         from .discord_rest import DiscordRest
 
         client = DiscordRest(token)
-    supports_components = _post_supports_components(client)
     try:
         client.post(target_channel, texto[:2000])
     except Exception as exc:

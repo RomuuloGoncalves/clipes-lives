@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any
 
 import mongomock
-import pytest
 from pymongo.errors import ServerSelectionTimeoutError
 
 from clipes import monitor

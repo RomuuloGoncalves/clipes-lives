@@ -6,7 +6,6 @@ import mongomock
 import pytest
 from pymongo.errors import DuplicateKeyError
 
-from clipes import coord as coord_mod
 from clipes.coord import Coord, mask_uri
 
 LIVE = "twitch:canal_exemplo:123"

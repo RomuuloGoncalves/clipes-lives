@@ -115,7 +115,7 @@ def test_build_video_filter_split_variants_logo_hook_and_full_parity(tmp_path: P
     )
     assert map_a == "[v_out]"
     assert "[0:v]split=2[c0][g0]" in fc_a_hook
-    assert f"scale=1080:768,setsar=1,drawbox=x=0:y=0:w=1080:h=768:color=black@0.5:t=fill:enable='lt(t,5.4)'[cam]" in fc_a_hook
+    assert "scale=1080:768,setsar=1,drawbox=x=0:y=0:w=1080:h=768:color=black@0.5:t=fill:enable='lt(t,5.4)'[cam]" in fc_a_hook
     assert "scale=1080:1152,setsar=1[game]" in fc_a_hook
     assert "[cam][game]vstack=inputs=2[v_base]" in fc_a_hook
     assert "scale=140:140" in fc_a_hook

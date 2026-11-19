@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, time as dt_time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
@@ -15,7 +14,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import config
 from .monitor import ChannelPolicy, load_policy
-from .registro import Registro, _atomic_write_json, _json_default, _locked_path, _read_json
+from .registro import Registro, _atomic_write_json, _locked_path, _read_json
 
 PLATFORMS: tuple[str, ...] = ("youtube", "tiktok")
 DEFAULT_DAILY_QUOTAS: dict[str, int] = {"youtube": 6, "tiktok": 5}
@@ -790,6 +789,26 @@ def _adapt_store(store: Any) -> LocalStore | MongoStore:
     return MongoStore(store)
 
 
+def _candidate_clips_paths(root: Path, reg_rec: dict[str, Any] | None) -> Iterator[Path]:
+    """clips.json ao lado do mp4 apontado pelo registro primeiro; rglob (lazy) so se nao achar (A-07)."""
+    hinted: Path | None = None
+    arquivo = str((reg_rec or {}).get("arquivo") or "").strip()
+    if arquivo:
+        cand = (root / arquivo).parent / "clips.json"
+        try:
+            cand_res = cand.resolve()
+            dentro = cand_res.is_relative_to(root.resolve())
+        except OSError:
+            dentro = False
+        if dentro and cand.is_file():  # arquivo absoluto ou com '..' fora de out_root: ignora
+            hinted = cand_res
+            yield cand
+    for path in sorted(root.rglob("clips.json")):
+        if hinted is not None and path.resolve() == hinted:
+            continue
+        yield path
+
+
 def find_clip(out_root: Path | str | None, clip_id: str, *, store: Any = None) -> dict[str, Any] | None:
     """Locate `clip_id` across `clips.json`, `registro.json`, and optional Mongo store."""
     cid = (clip_id or "").strip()
@@ -805,7 +824,7 @@ def find_clip(out_root: Path | str | None, clip_id: str, *, store: Any = None) -
     if root is not None and root.is_dir():
         jobs_by_dir = _load_done_jobs_by_output_dir(root)
         default_owner = _local_worker_id(root)
-        for clips_path in sorted(root.rglob("clips.json")):
+        for clips_path in _candidate_clips_paths(root, reg_rec):
             manifest = _read_json(clips_path, None)
             if not isinstance(manifest, dict):
                 continue

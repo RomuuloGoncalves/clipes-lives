@@ -20,7 +20,6 @@ import urllib.request
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -29,13 +28,7 @@ import numpy as np
 from . import config
 from .executor_publicacao import PublishLoop
 from .ingest import BOT_AUTHORS, _compact_chat_rows, js_runtime_args, probe_duration, probe_metadata, sanitize_id
-from .janelas import filter_emitted, owns, window_end
-from .notificar import (
-    _format_clip_discord_message,
-    _policy_status_text,
-    _write_json_atomic,
-    notify_discord,
-)
+from .notificar import notify_discord
 
 MAX_CHANNELS = 80
 HELIX_MIN_INTERVAL_S = 60.0
@@ -421,6 +414,8 @@ class RollingRecorderPool:
         self.source_cmd = source_cmd
         self.recordings: dict[str, _Recording] = {}
         self.holds: dict[str, float] = {}  # channel -> oldest timestamp cleanup must keep
+        self._gate = threading.Lock()  # serializa start x freeze (liberar roda em outra thread)
+        self.frozen = False  # liberar: nenhum gravador novo depois do stop_all
 
     def _start(self, channel: str, on_demand: bool) -> None:
         if not (CHANNEL_RE.fullmatch(channel) or _YT_KEY_RE.fullmatch(channel)):
@@ -498,21 +493,26 @@ class RollingRecorderPool:
             shutil.rmtree(rec.seg_dir, ignore_errors=True)
 
     def _try_start(self, channel: str, on_demand: bool) -> bool:
-        try:
-            self._start(channel, on_demand)
-        except (OSError, ValueError) as exc:  # streamlink/ffmpeg missing, bad name
-            print(f"[monitor] recorder for {channel} failed to start: {exc}", flush=True)
-            return False
-        return True
+        with self._gate:
+            if self.frozen:
+                return False
+            try:
+                self._start(channel, on_demand)
+            except (OSError, ValueError) as exc:  # streamlink/ffmpeg missing, bad name
+                print(f"[monitor] recorder for {channel} failed to start: {exc}", flush=True)
+                return False
+            return True
 
     def set_hot(self, ranked_channels: list[str]) -> None:
         """Keep recorders only for the `max_hot` most active channels; drop (and delete) the rest.
 
         Hot channels with an in-flight capture (hold) keep their slot whatever their rank.
         """
-        held = [c for c, r in self.recordings.items() if not r.on_demand and c in self.holds]
+        if self.frozen:
+            return
+        held = [c for c, r in list(self.recordings.items()) if not r.on_demand and c in self.holds]
         wanted = (held + [c for c in ranked_channels if c not in held])[: self.max_hot]
-        for channel in [c for c, r in self.recordings.items() if not r.on_demand and c not in wanted]:
+        for channel in [c for c, r in list(self.recordings.items()) if not r.on_demand and c not in wanted]:
             self._stop(channel, remove_buffer=True)
         for channel in wanted:
             rec = self.recordings.get(channel)
@@ -528,7 +528,7 @@ class RollingRecorderPool:
         """True when `channel` is being recorded (already, or via the free on-demand slot)."""
         if channel in self.recordings:
             return True
-        if sum(1 for r in self.recordings.values() if r.on_demand) >= self.max_on_demand:
+        if sum(1 for r in list(self.recordings.values()) if r.on_demand) >= self.max_on_demand:
             return False
         return self._try_start(channel, on_demand=True)
 
@@ -554,6 +554,12 @@ class RollingRecorderPool:
         for channel in list(self.recordings):
             self._stop(channel, remove_buffer=True)
 
+    def freeze(self) -> None:
+        """Para tudo e impede novos gravadores (tick_loop/capturas em voo nao religam durante o liberar)."""
+        with self._gate:
+            self.frozen = True
+        self.stop_all()  # fora do lock: nao trava o event loop; _start em curso ja registrou em recordings
+
     def stop_channel(self, channel: str) -> None:
         self.release_hold(channel)
         if channel in self.recordings:
@@ -567,7 +573,7 @@ class RollingRecorderPool:
     def cleanup(self, now: float | None = None) -> None:
         """Delete segments older than the buffer, except those held for an in-flight job."""
         now = time.time() if now is None else now
-        for channel in {c for c in self.recordings} | set(self.holds):
+        for channel in set(list(self.recordings)) | set(list(self.holds)):
             hold_from = self.holds.get(channel)
             for start, path in self.segments(channel):
                 if hold_from is not None and start + SEGMENT_S > hold_from:
@@ -1392,7 +1398,12 @@ WORKER_JOIN_S = 60.0  # espera maxima pela thread do worker no encerramento
 
 def _lock_worker(queue_root: Path):
     """Exclusive flock on queue_root/.worker.lock: a second monitor on the same queue fails fast."""
-    import fcntl
+    from .registro import FCNTL_AUSENTE_MSG
+
+    try:
+        import fcntl
+    except ImportError:
+        raise RuntimeError(FCNTL_AUSENTE_MSG) from None
 
     lock = open(queue_root / ".worker.lock", "w")
     try:
@@ -1742,6 +1753,8 @@ async def run_monitor(
                     hot_targets = active
                     if coord_session is not None and coord_session.configured:
                         unleased.update(c for c in active if c not in owned_lives)
+                if cancel.is_set():  # liberar chegou durante os awaits acima
+                    continue
                 pool.set_hot(hot_targets)
                 if coord_session is not None and coord_session.active is not None:
                     for c in list(owned_lives):
@@ -1784,7 +1797,7 @@ async def run_monitor(
         """Comando `liberar` do painel: cancela o job em andamento (volta a pending), para gravadores e filhos."""
         cancel.set()
         if pool is not None:
-            pool.stop_all()
+            pool.freeze()
         child_killer()
 
     def publish_once() -> None:
