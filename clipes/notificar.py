@@ -258,6 +258,25 @@ def _run_liberar(
         print(f"[notificar] falha ao liberar arquivos ({_format_safe_err(exc)})", flush=True)
 
 
+def _clip_match_key(clip: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Chave estavel para cruzar clipes de result['clips'] com os do clips.json (A-04)."""
+    cid = clip.get("clip_id")
+    if cid:
+        return ("clip_id", str(cid))
+    idx = clip.get("index")
+    if idx is not None and not isinstance(idx, bool):
+        try:
+            return ("index", int(idx))
+        except (TypeError, ValueError):
+            pass
+    if "start" in clip and "end" in clip:
+        return ("span", clip.get("file"), clip["start"], clip["end"])
+    file_rel = clip.get("file")
+    if file_rel:
+        return ("file", str(file_rel))
+    return None
+
+
 def notify_discord(
     out_dir: Path | str | None,
     *,
@@ -278,20 +297,38 @@ def notify_discord(
     clips_json_path = (out_path / "clips.json") if out_path is not None else None
 
     manifest: dict[str, Any] | None = None
+    manifest_clips: list[dict[str, Any]] | None = None
     if clips_json_path is not None and clips_json_path.is_file():
         try:
             loaded = json.loads(clips_json_path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 manifest = loaded
-                clips = list(manifest.get("clips") or [])
+                manifest_clips = list(manifest.get("clips") or [])
             else:
                 print(f"[notificar] clips.json invalido em {clips_json_path}", flush=True)
-                clips = list((result or {}).get("clips") or [])
         except Exception as exc:
             print(f"[notificar] falha ao ler clips.json ({_format_safe_err(exc)})", flush=True)
-            clips = list((result or {}).get("clips") or [])
+
+    result_clips = result.get("clips") if isinstance(result, dict) else None
+    if manifest_clips is not None:
+        if isinstance(result_clips, list):
+            # A-04: prioriza result["clips"], preservando os dicts do manifest (estado discord ja gravado)
+            by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+            for mc in manifest_clips:
+                if isinstance(mc, dict):
+                    mk = _clip_match_key(mc)
+                    if mk is not None and mk not in by_key:
+                        by_key[mk] = mc
+            clips = []
+            for rc in result_clips:
+                if not isinstance(rc, dict):
+                    continue
+                rk = _clip_match_key(rc)
+                clips.append(by_key[rk] if (rk is not None and rk in by_key) else rc)
+        else:
+            clips = manifest_clips
     else:
-        clips = list((result or {}).get("clips") or [])
+        clips = list(result_clips or [])
 
     if not clips:
         return

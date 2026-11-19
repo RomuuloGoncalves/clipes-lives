@@ -407,7 +407,10 @@ def test_slash_publicar_covers_happy_not_found_policy_idempotency_quota_and_offl
     inter_q = _FakeInteraction(user_id=ALLOWED_USER)
     asyncio.run(pub_cmd.callback(inter_q, "q_vid_c01"))
     assert "cota diaria atingida (youtube)" in inter_q.response.messages[0][0]
-    assert db.publish_requests.find_one({"_id": "q_vid_c01:youtube"})["status"] == "adiado"
+    # onda 3: cota cheia nao cria mais `adiado` terminal; o pedido fica pending agendado para o proximo dia
+    doc_q = db.publish_requests.find_one({"_id": "q_vid_c01:youtube"})
+    assert doc_q["status"] == "pending"
+    assert doc_q["agendar_para"] > datetime.fromtimestamp(T0, timezone.utc).replace(tzinfo=None)
 
 
 # --- Slash `/listar` ---

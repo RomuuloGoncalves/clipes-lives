@@ -20,9 +20,10 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import monitor
+from .executor_publicacao import PublishLoop
 from .ingest import sanitize_id
 from .janelas import filter_emitted, owns, window_end
-from .notificar import post_aviso
+from .notificar import _write_json_atomic, post_aviso
 from .perfil import max_lives as perfil_max_lives
 
 _YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,32}")
@@ -243,6 +244,7 @@ class LiveSession:
         disk_usage: Callable[[Any], Any],
         step: int = monitor.LIVE_STEP_S,
         max_dur: float = 60.0,
+        min_dur: float | None = None,
         min_free_gb: float | None = None,
         coord_getter: Callable[[], Any | None] | None = None,
         on_mongo_error: Callable[[BaseException], None] | None = None,
@@ -263,7 +265,9 @@ class LiveSession:
         self.now = now
         self.disk_usage = disk_usage
         self.step = step
-        self.pad = max_dur / 2
+        self.max_dur = float(max_dur)
+        self.min_dur = float(min_dur) if min_dur is not None else None
+        self.pad = self.max_dur / 2
         self.min_free = float(os.environ.get("CLIPES_MIN_FREE_GB", "5") if min_free_gb is None else min_free_gb)
         self.coord_getter = coord_getter or (lambda: None)
         self.on_mongo_error = on_mongo_error or (lambda _exc: None)
@@ -334,7 +338,20 @@ class LiveSession:
             if owns(vs + (c["start"] + c["end"]) / 2, job["window_start"], job["window_end"], self.step, self.pad, job["last"])
         ]
         keep = filter_emitted([(vs + c["start"], vs + c["end"]) for c in mine], self.emitted_path)
-        return {**result, "clips": [c for c, ok in zip(mine, keep) if ok]}
+        filtered = [c for c, ok in zip(mine, keep) if ok]
+        # A-04: reescreve clips.json com a lista filtrada (atomico) para Discord, registro e bot verem so os donos
+        out_dir_raw = result.get("output_dir")
+        if out_dir_raw:
+            clips_json_path = Path(out_dir_raw) / "clips.json"
+            if clips_json_path.is_file():
+                try:
+                    manifest = json.loads(clips_json_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    manifest = None
+                if isinstance(manifest, dict):
+                    manifest["clips"] = filtered
+                    _write_json_atomic(clips_json_path, manifest)
+        return {**result, "clips": filtered}
 
     def fechar_janela(self, e: float, last: bool) -> None:
         if self.lease_lost:
@@ -360,7 +377,10 @@ class LiveSession:
                 "window_end": e,
                 "last": last,
                 "video_start": start_ts,
+                "max_dur": self.max_dur,
             }
+            if self.min_dur is not None:
+                job["min_dur"] = self.min_dur
             duration = 0.0
             try:
                 job["video_start"] = self.pool.video_start_ts(self.key, start_ts, e)
@@ -606,6 +626,7 @@ class Supervisor:
         disk_usage: Callable[[Any], Any] = shutil.disk_usage,
         step: int = monitor.LIVE_STEP_S,
         max_dur: float = 60.0,
+        min_dur: float | None = None,
         min_free_gb: float | None = None,
         policy: monitor.ChannelPolicy | None = None,
         stream_id: str | None = None,
@@ -616,6 +637,8 @@ class Supervisor:
         reraise_start_error: bool = False,
         beat_s: float | None = None,
         kill_children: Callable[[], None] | None = None,
+        run_pending_fn: Callable[..., Any] | None = None,
+        discord_client: Any | None = None,
     ) -> None:
         self.alvos = dedup_alvos(alvos)
         self.out_root = Path(out_root)
@@ -630,6 +653,7 @@ class Supervisor:
         self.disk_usage = disk_usage
         self.step = step
         self.max_dur = max_dur
+        self.min_dur = min_dur
         self.min_free_gb = min_free_gb
         self.policy = policy or monitor.ChannelPolicy()
         self.stream_id = stream_id
@@ -640,6 +664,8 @@ class Supervisor:
         self.reraise_start_error = reraise_start_error
         self.beat_s = beat_s
         self.kill_children = kill_children
+        self.run_pending_fn = run_pending_fn
+        self.discord_client = discord_client
 
         self._lock = threading.Lock()
         self._active: dict[str, LiveSession] = {}
@@ -872,6 +898,7 @@ class Supervisor:
             disk_usage=self.disk_usage,
             step=self.step,
             max_dur=self.max_dur,
+            min_dur=self.min_dur,
             min_free_gb=self.min_free_gb,
             coord_getter=self._coord_active,
             on_mongo_error=self._on_mongo_err,
@@ -1106,12 +1133,15 @@ class Supervisor:
         pool: Any | None = self.pool
         stop_hb: threading.Event | None = None
         hb_thread: threading.Thread | None = None
+        publish_loop: PublishLoop | None = None
 
         def _stop_keepalive() -> None:
             if stop_hb is not None:
                 stop_hb.set()
             if hb_thread is not None and hb_thread.is_alive():
                 hb_thread.join(timeout=5.0)
+            if publish_loop is not None:
+                publish_loop.stop(timeout=10.0)
 
         try:
             with _exit_signals_to_kb():
@@ -1212,6 +1242,44 @@ class Supervisor:
                     hb_thread = threading.Thread(target=_keepalive, daemon=True)
                     hb_thread.start()
 
+                    # A-05: executor periodico de publicacao (thread propria, fora do heartbeat)
+                    def _publish_once() -> None:
+                        c = self._coord_active()
+                        if c is None:
+                            return
+                        runner = self.run_pending_fn
+                        if runner is None:
+                            from . import publicacao
+
+                            runner = publicacao.run_pending
+                        dc = self.discord_client
+                        discord_post = (
+                            (lambda tid, msg, _dc=dc: _dc.post(tid, msg))
+                            if dc is not None
+                            else None
+                        )
+                        try:
+                            runner(
+                                c,
+                                getattr(c, "worker_id", None),
+                                out_root=self.out_root,
+                                now=self.now,
+                                policy=self.policy,
+                                discord_post=discord_post,
+                            )
+                        except Exception as exc:
+                            if monitor._is_mongo_error(exc):
+                                self._on_mongo_err(exc)
+                            else:
+                                uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
+                                print(
+                                    f"[publicar] erro na publicacao ({monitor._sanitize_error(exc, uri)})",
+                                    flush=True,
+                                )
+
+                    publish_loop = PublishLoop(_publish_once, beat_interval, name="publicacao")
+                    publish_loop.start()
+
                 def _liberar() -> None:
                     # M-03: para gravadores, mata filhos e solta leases sem marcar ended
                     _stop_keepalive()
@@ -1288,6 +1356,8 @@ class Supervisor:
                             if cmd_action == "liberar":
                                 print("[comando] liberar recursos", flush=True)
                                 raise SystemExit(75)
+                            if publish_loop is not None:
+                                publish_loop.run_now()
 
                     c_replay = self._coord_active()
                     if c_replay is not None and self._need_replay:
@@ -1378,10 +1448,14 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--queue-dir", type=Path, default=None, help="Padrao: <out-dir>/queue")
     p.add_argument("--policy-file", type=Path, default=None, help="Padrao: policy.json ao lado de channels.txt")
     p.add_argument("--max-dur", type=float, default=60.0, help="Duracao maxima de cada clipe em segundos")
+    p.add_argument("--min-dur", type=float, default=None, help="Duracao minima de cada clipe em segundos")
     args = p.parse_args(argv)
 
     if args.max_dur <= 0:
         print("[acompanhar] --max-dur deve ser > 0", file=sys.stderr, flush=True)
+        return 2
+    if args.min_dur is not None and args.min_dur <= 0:
+        print("[acompanhar] --min-dur deve ser > 0", file=sys.stderr, flush=True)
         return 2
 
     parsed: list[Alvo] = []
@@ -1404,6 +1478,7 @@ def main(argv: list[str] | None = None) -> int:
                 out_root,
                 queue_root=queue_root,
                 max_dur=args.max_dur,
+                min_dur=args.min_dur,
                 policy=policy,
                 coord=coord,
             )

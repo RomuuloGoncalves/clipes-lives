@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import threading
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ import discord
 from discord import app_commands
 
 from . import publicacao
+from .executor_publicacao import PublishLoop
 from .publicacao import LocalStore, MongoStore
 from .registro import Registro
 
@@ -341,6 +343,7 @@ class ClipesBot(discord.Client):
         now: Callable[[], float] | float | None = None,
         run_local: bool = False,
         run_pending_fn: Callable[..., Any] | None = None,
+        local_poll_s: float = 60.0,
     ) -> None:
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
@@ -355,6 +358,13 @@ class ClipesBot(discord.Client):
         self.now = now
         self.run_local = run_local
         self.run_pending_fn = run_pending_fn or publicacao.run_pending
+        self.local_poll_s = float(local_poll_s)
+        self._local_run_lock = threading.Lock()
+        self._publish_loop: PublishLoop | None = (
+            PublishLoop(self._run_local_once, self.local_poll_s, name="bot-publicacao")
+            if self.run_local
+            else None
+        )
 
     async def setup_hook(self) -> None:
         if self.guild_id is not None:
@@ -363,6 +373,13 @@ class ClipesBot(discord.Client):
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
+        if self._publish_loop is not None:
+            self._publish_loop.start()
+
+    async def close(self) -> None:
+        if self._publish_loop is not None:
+            await asyncio.to_thread(self._publish_loop.stop, 10.0)
+        await super().close()
 
     async def _maybe_notify_thread(self, clip_id: str, result: str, current_channel_id: Any) -> None:
         if "publicacao enfileirada" not in result:
@@ -381,19 +398,33 @@ class ClipesBot(discord.Client):
             except Exception:
                 pass
 
+    def _run_local_once(self, *, wait: bool = False) -> None:
+        """Executa uma rodada local de run_pending fora do event loop (A-05)."""
+        if not self._local_run_lock.acquire(blocking=wait):
+            return
+        try:
+            self.run_pending_fn(
+                self.store,
+                None,
+                out_root=self.out_root,
+                now=self.now,
+                policy_path=self.policy_path,
+                tokens_path=self.tokens_path,
+                quota_path=self.quota_path,
+            )
+        except Exception as exc:
+            token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+            msg = f"{type(exc).__name__}: {exc}"
+            if token:
+                msg = msg.replace(token, "***")
+            print(f"[bot] erro na publicacao local ({msg})", flush=True)
+        finally:
+            self._local_run_lock.release()
+
     async def _maybe_run_local(self, result: str) -> None:
         if not self.run_local or "publicacao enfileirada" not in result:
             return
-        await asyncio.to_thread(
-            self.run_pending_fn,
-            self.store,
-            None,
-            out_root=self.out_root,
-            now=self.now,
-            policy_path=self.policy_path,
-            tokens_path=self.tokens_path,
-            quota_path=self.quota_path,
-        )
+        await asyncio.to_thread(self._run_local_once, wait=True)
 
     def _request_publish(
         self,
@@ -598,6 +629,7 @@ def make_bot(
     now: Callable[[], float] | float | None = None,
     run_local: bool = False,
     run_pending_fn: Callable[..., Any] | None = None,
+    local_poll_s: float = 60.0,
 ) -> ClipesBot:
     """Create the Discord bot with `message_content` intent, `/publicar`, `/listar`, and `publicar <id>`."""
     resolved_root = _resolve_out_root(store, out_root)
@@ -620,6 +652,7 @@ def make_bot(
         now=now,
         run_local=run_local,
         run_pending_fn=run_pending_fn,
+        local_poll_s=local_poll_s,
     )
 
     @bot.tree.command(name="publicar", description="Publica um clipe como privado no YouTube e no TikTok")

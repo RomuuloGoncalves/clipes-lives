@@ -164,6 +164,7 @@ def test_publish_youtube_resumes_after_put_drop_and_succeeds(tmp_path: Path):
         "tok",
         fake_urlopen,
         probe_duration_fn=lambda _: 50.0,
+        sleep=lambda _: None,
     )
 
     assert res["status"] == "ok"
@@ -198,10 +199,11 @@ def test_publish_youtube_fails_after_4_put_drops_without_leaking_secrets(tmp_pat
         secret_token,
         fake_urlopen,
         probe_duration_fn=lambda _: 40.0,
+        sleep=lambda _: None,
     )
 
     assert res["status"] == "erro"
-    assert put_attempts == 4  # 1 inicial + 3 retomadas
+    assert put_attempts == 6  # 1 inicial + 5 retomadas (M-13)
     serialized = json.dumps(res)
     assert secret_token not in serialized
     assert secret_upload_url not in serialized

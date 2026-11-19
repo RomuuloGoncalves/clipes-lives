@@ -15,6 +15,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable
 
+from .registro import _locked_path
+
 DEFAULT_TOKENS_PATH = Path("/config/tokens.json")
 DEFAULT_OAUTH_HOST = "127.0.0.1"
 DEFAULT_OAUTH_PORT = 8765
@@ -53,9 +55,7 @@ def load_tokens(path: Path | None = None) -> dict[str, Any]:
     return data
 
 
-def save_tokens(tokens: dict[str, Any], path: Path | None = None) -> Path:
-    """Atomically write tokens JSON with mode 0600."""
-    target = resolve_tokens_path(path)
+def _write_tokens_unlocked(tokens: dict[str, Any], target: Path) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(tokens, indent=2, ensure_ascii=False) + "\n"
 
@@ -72,6 +72,33 @@ def save_tokens(tokens: dict[str, Any], path: Path | None = None) -> Path:
     finally:
         tmp_path.unlink(missing_ok=True)
     return target
+
+
+def save_tokens(tokens: dict[str, Any], path: Path | None = None) -> Path:
+    """Atomically write tokens JSON with mode 0600 under file lock."""
+    target = resolve_tokens_path(path)
+    with _locked_path(target):
+        return _write_tokens_unlocked(tokens, target)
+
+
+def _update_platform_tokens(
+    path: Path | None,
+    plataforma: str,
+    updates: dict[str, Any],
+    *,
+    replace: bool = False,
+) -> Path:
+    """Read-modify-write de uma plataforma em tokens.json sob lock de arquivo."""
+    target = resolve_tokens_path(path)
+    with _locked_path(target):
+        current = load_tokens(target)
+        if replace:
+            current[plataforma] = dict(updates)
+        else:
+            entry = dict(current.get(plataforma) or {})
+            entry.update(updates)
+            current[plataforma] = entry
+        return _write_tokens_unlocked(current, target)
 
 
 def _scrub(text: str, secrets_list: list[str]) -> str:
@@ -142,7 +169,7 @@ def _tiktok_creds(client_key: str | None, client_secret: str | None) -> tuple[st
     return ckey, csec
 
 
-def refresh_google(
+def refresh_google_tokens(
     refresh_token: str | None = None,
     *,
     client_id: str | None = None,
@@ -150,8 +177,8 @@ def refresh_google(
     tokens_path: Path | None = None,
     urlopen: Callable[..., Any] | None = None,
     timeout: float = 30.0,
-) -> str:
-    """Exchange Google refresh_token for a new access_token."""
+) -> dict[str, str]:
+    """Exchange Google refresh_token and return access_token (+ rotated refresh_token if any)."""
     opener = urlopen if urlopen is not None else urllib.request.urlopen
     tokens = load_tokens(tokens_path) if refresh_token is None else None
     rtok = (refresh_token or (tokens or {}).get("youtube", {}).get("refresh_token") or "").strip()
@@ -177,16 +204,35 @@ def refresh_google(
 
     new_refresh = str(data.get("refresh_token") or "").strip()
     if new_refresh and new_refresh != rtok:
-        current = load_tokens(tokens_path)
-        yt_entry = dict(current.get("youtube") or {})
-        yt_entry["refresh_token"] = new_refresh
-        current["youtube"] = yt_entry
-        save_tokens(current, tokens_path)
+        _update_platform_tokens(tokens_path, "youtube", {"refresh_token": new_refresh})
 
-    return access_token
+    out: dict[str, str] = {"access_token": access_token}
+    if new_refresh:
+        out["refresh_token"] = new_refresh
+    return out
 
 
-def refresh_tiktok(
+def refresh_google(
+    refresh_token: str | None = None,
+    *,
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    tokens_path: Path | None = None,
+    urlopen: Callable[..., Any] | None = None,
+    timeout: float = 30.0,
+) -> str:
+    """Exchange Google refresh_token for a new access_token."""
+    return refresh_google_tokens(
+        refresh_token,
+        client_id=client_id,
+        client_secret=client_secret,
+        tokens_path=tokens_path,
+        urlopen=urlopen,
+        timeout=timeout,
+    )["access_token"]
+
+
+def refresh_tiktok_tokens(
     refresh_token: str | None = None,
     *,
     client_key: str | None = None,
@@ -194,8 +240,8 @@ def refresh_tiktok(
     tokens_path: Path | None = None,
     urlopen: Callable[..., Any] | None = None,
     timeout: float = 30.0,
-) -> str:
-    """Exchange TikTok refresh_token for a new access_token and persist rotated refresh_token."""
+) -> dict[str, str]:
+    """Exchange TikTok refresh_token, persist rotated refresh_token under lock, and return tokens."""
     opener = urlopen if urlopen is not None else urllib.request.urlopen
     tokens = load_tokens(tokens_path) if refresh_token is None else None
     rtok = (refresh_token or (tokens or {}).get("tiktok", {}).get("refresh_token") or "").strip()
@@ -221,17 +267,40 @@ def refresh_tiktok(
 
     new_refresh = str(data.get("refresh_token") or "").strip()
     open_id = str(data.get("open_id") or "").strip()
-    if new_refresh or open_id:
-        current = load_tokens(tokens_path)
-        tt_entry = dict(current.get("tiktok") or {})
-        if new_refresh:
-            tt_entry["refresh_token"] = new_refresh
-        if open_id:
-            tt_entry["open_id"] = open_id
-        current["tiktok"] = tt_entry
-        save_tokens(current, tokens_path)
+    updates: dict[str, str] = {}
+    if new_refresh:
+        updates["refresh_token"] = new_refresh
+    if open_id:
+        updates["open_id"] = open_id
+    if updates:
+        _update_platform_tokens(tokens_path, "tiktok", updates)
 
-    return access_token
+    out: dict[str, str] = {"access_token": access_token}
+    if new_refresh:
+        out["refresh_token"] = new_refresh
+    if open_id:
+        out["open_id"] = open_id
+    return out
+
+
+def refresh_tiktok(
+    refresh_token: str | None = None,
+    *,
+    client_key: str | None = None,
+    client_secret: str | None = None,
+    tokens_path: Path | None = None,
+    urlopen: Callable[..., Any] | None = None,
+    timeout: float = 30.0,
+) -> str:
+    """Exchange TikTok refresh_token for a new access_token and persist rotated refresh_token."""
+    return refresh_tiktok_tokens(
+        refresh_token,
+        client_key=client_key,
+        client_secret=client_secret,
+        tokens_path=tokens_path,
+        urlopen=urlopen,
+        timeout=timeout,
+    )["access_token"]
 
 
 def _parse_callback_result(raw: Any) -> dict[str, str]:
@@ -402,8 +471,6 @@ def auth_flow(
         if open_id:
             entry["open_id"] = open_id
 
-    tokens = load_tokens(tokens_path)
-    tokens[plat] = entry
-    saved = save_tokens(tokens, tokens_path)
+    saved = _update_platform_tokens(tokens_path, plat, entry, replace=True)
     printer("token salvo")
     return saved

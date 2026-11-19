@@ -873,7 +873,27 @@ def run_local_pipeline(job_dir: Path, out_root: Path) -> dict[str, Any]:
         ingested["result"] = ingest_local(job_dir, out_root, enable_chat)
         return ingested["result"]
 
-    args = cli.build_parser().parse_args([job_dir.name, "--out-dir", str(out_root)])
+    cli_args = [job_dir.name, "--out-dir", str(out_root)]
+    job_path = job_dir / "job.json"
+    if job_path.is_file():
+        try:
+            job_meta = _read_job(job_dir)
+        except (OSError, ValueError):
+            job_meta = {}
+        if isinstance(job_meta, dict):
+            # M-16: repassa max_dur/min_dur gravados no job.json (jobs antigos sem o campo usam o padrao do CLI)
+            for key, flag in (("max_dur", "--max-dur"), ("min_dur", "--min-dur")):
+                raw_dur = job_meta.get(key)
+                if raw_dur is None or isinstance(raw_dur, bool):
+                    continue
+                try:
+                    dur_val = float(raw_dur)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(dur_val) and dur_val > 0:
+                    cli_args.extend([flag, str(dur_val)])
+
+    args = cli.build_parser().parse_args(cli_args)
     original_ingest = cli.ingest
     cli.ingest = ingest_job
     try:

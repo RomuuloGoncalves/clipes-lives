@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import http.client
 import json
+import random
 import re
+import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
@@ -18,12 +20,16 @@ YOUTUBE_UPLOAD_URL = (
     "?uploadType=resumable&part=snippet,status"
 )
 MAX_SHORT_DURATION_S = 180.0
-MAX_RESUMES = 3
+MAX_RESUMES = 5  # 1 tentativa inicial + 5 retentativas = 6 tentativas (faixa 5..8)
+BACKOFF_BASE_S = 1.0
+BACKOFF_MAX_S = 60.0
 PRIVACY_STATUS = "private"
 CATEGORY_ID = "20"
 
 _RANGE_RE = re.compile(r"bytes=0-(\d+)")
-_TRANSIENT_HTTP = frozenset({500, 502, 503, 504})
+_QUOTA_REASONS = frozenset({"quotaExceeded", "uploadLimitExceeded"})
+_RETRYABLE_403_REASONS = frozenset({"rateLimitExceeded", "userRateLimitExceeded", "backendError"})
+_NETWORK_ERRORS = (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException)
 
 
 def _resolve_token(token: str | Callable[[], str]) -> str:
@@ -117,6 +123,25 @@ def _auth_error() -> dict[str, Any]:
     return {"status": "erro_auth", "erro": "refaca clipes auth youtube"}
 
 
+def _quota_error(reason: str) -> dict[str, Any]:
+    return {"status": "erro", "erro": f"youtube HTTP 403: {reason}", "quota_esgotada": True}
+
+
+def _is_quota_error(code: int, reason: str) -> bool:
+    return code == 403 and reason in _QUOTA_REASONS
+
+
+def _is_retryable_http(code: int, reason: str = "") -> bool:
+    return (500 <= code < 600) or code == 429 or (code == 403 and reason in _RETRYABLE_403_REASONS)
+
+
+def _backoff_delay(attempt: int, rand: Callable[[], float] = random.random) -> float:
+    """Backoff exponencial com jitter limitado a [1.0, 60.0] segundos."""
+    base = min(BACKOFF_MAX_S, BACKOFF_BASE_S * (2 ** attempt))
+    jitter = max(0.0, min(1.0, float(rand())))
+    return min(BACKOFF_MAX_S, max(BACKOFF_BASE_S, base * (1.0 + 0.5 * jitter)))
+
+
 def publish(
     mp4: Path | str,
     title: str,
@@ -126,6 +151,8 @@ def publish(
     *,
     refresh: Callable[[], str] | None = None,
     probe_duration_fn: Callable[[Path], float] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    rand: Callable[[], float] = random.random,
 ) -> dict[str, Any]:
     """Upload an MP4 clip as a private YouTube Short using resumable upload."""
     mp4_path = Path(mp4)
@@ -164,6 +191,7 @@ def publish(
         return bool(access_token)
 
     upload_url = ""
+    init_retries = 0
     while True:
         init_req = urllib.request.Request(
             YOUTUBE_UPLOAD_URL,
@@ -177,18 +205,34 @@ def publish(
             method="POST",
         )
         try:
-            _, headers, _ = _send(init_req, urlopen, timeout=30)
-            upload_url = str((headers.get("Location") or headers.get("location") or "") if headers else "")
-            break
+            status, headers, _ = _send(init_req, urlopen, timeout=30)
+            if status in (200, 201):
+                upload_url = str((headers.get("Location") or headers.get("location") or "") if headers else "")
+                break
+            if _is_retryable_http(status) and init_retries < MAX_RESUMES:
+                sleep(_backoff_delay(init_retries, rand))
+                init_retries += 1
+                continue
+            return {"status": "erro", "erro": f"youtube HTTP {status}"}
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and try_refresh():
                 continue
             if exc.code == 401:
                 return _auth_error()
             reason = _extract_api_reason(exc.read() if exc.fp else b"")
+            if _is_quota_error(exc.code, reason):
+                return _quota_error(reason)
             detail = f"youtube HTTP {exc.code}" + (f": {reason}" if reason else "")
+            if _is_retryable_http(exc.code, reason) and init_retries < MAX_RESUMES:
+                sleep(_backoff_delay(init_retries, rand))
+                init_retries += 1
+                continue
             return {"status": "erro", "erro": detail}
-        except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
+        except _NETWORK_ERRORS as exc:
+            if init_retries < MAX_RESUMES:
+                sleep(_backoff_delay(init_retries, rand))
+                init_retries += 1
+                continue
             return {"status": "erro", "erro": f"youtube falha ao iniciar sessao: {type(exc).__name__}"}
 
     if not upload_url:
@@ -208,46 +252,63 @@ def publish(
                 resumes_used += 1
                 offset = _parse_range_offset(headers)
                 continue
-            return {"status": "erro", "erro": f"youtube HTTP {status}"}
+            if not _is_retryable_http(status):
+                return {"status": "erro", "erro": f"youtube HTTP {status}"}
         except urllib.error.HTTPError as exc:
             if exc.code == 401 and try_refresh():
                 continue
             if exc.code == 401:
                 return _auth_error()
-            if exc.code not in _TRANSIENT_HTTP:
-                reason = _extract_api_reason(exc.read() if exc.fp else b"")
+            reason = _extract_api_reason(exc.read() if exc.fp else b"")
+            if _is_quota_error(exc.code, reason):
+                return _quota_error(reason)
+            if not _is_retryable_http(exc.code, reason):
                 detail = f"youtube HTTP {exc.code}" + (f": {reason}" if reason else "")
                 return {"status": "erro", "erro": detail}
-        except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException):
+        except _NETWORK_ERRORS:
             pass
 
         if resumes_used >= MAX_RESUMES:
             return {"status": "erro", "erro": f"youtube upload falhou apos {MAX_RESUMES} retomadas"}
+        sleep(_backoff_delay(resumes_used, rand))
         resumes_used += 1
 
-        status_req = urllib.request.Request(
-            upload_url,
-            data=b"",
-            headers={
-                "Authorization": f"Bearer {access_token}",
-                "Content-Length": "0",
-                "Content-Range": f"bytes */{total_size}",
-            },
-            method="PUT",
-        )
-        try:
-            st_code, st_headers, st_body = _send(status_req, urlopen, timeout=30)
-            if st_code in (200, 201):
-                return _ok_result(st_body)
-            if st_code == 308:
-                offset = _parse_range_offset(st_headers)
-        except urllib.error.HTTPError as exc:
-            if exc.code == 401 and try_refresh():
-                continue
-            if exc.code == 401:
-                return _auth_error()
-            if exc.code not in _TRANSIENT_HTTP:
-                return {"status": "erro", "erro": f"youtube HTTP {exc.code}"}
-        except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException):
-            # Status check also dropped; next loop iteration attempts resume from last known offset
-            pass
+        while True:
+            status_req = urllib.request.Request(
+                upload_url,
+                data=b"",
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Length": "0",
+                    "Content-Range": f"bytes */{total_size}",
+                },
+                method="PUT",
+            )
+            try:
+                st_code, st_headers, st_body = _send(status_req, urlopen, timeout=30)
+                if st_code in (200, 201):
+                    return _ok_result(st_body)
+                if st_code == 308:
+                    offset = _parse_range_offset(st_headers)
+                    break
+                if not _is_retryable_http(st_code):
+                    return {"status": "erro", "erro": f"youtube HTTP {st_code}"}
+            except urllib.error.HTTPError as exc:
+                if exc.code == 401 and try_refresh():
+                    continue
+                if exc.code == 401:
+                    return _auth_error()
+                reason = _extract_api_reason(exc.read() if exc.fp else b"")
+                if _is_quota_error(exc.code, reason):
+                    return _quota_error(reason)
+                if not _is_retryable_http(exc.code, reason):
+                    detail = f"youtube HTTP {exc.code}" + (f": {reason}" if reason else "")
+                    return {"status": "erro", "erro": detail}
+            except _NETWORK_ERRORS:
+                # Consulta de status caiu; aguarda backoff antes de repetir
+                pass
+
+            if resumes_used >= MAX_RESUMES:
+                return {"status": "erro", "erro": f"youtube upload falhou apos {MAX_RESUMES} retomadas"}
+            sleep(_backoff_delay(resumes_used, rand))
+            resumes_used += 1
