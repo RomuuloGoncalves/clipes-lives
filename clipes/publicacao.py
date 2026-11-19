@@ -28,6 +28,24 @@ _HTTP_401_RE = re.compile(r"(?:^|\b(?:http(?:/[\d.]+)?|status|code|erro|error)\s
 _ACTIVE_REQUEST_STATUSES: tuple[str, ...] = ("ok", "pending", "running")
 _AGENDA_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 _UNSET = object()
+DEFAULT_PUB_LEASE_S = 1800.0
+DEFAULT_PUB_MAX_POR_CICLO = 3
+
+
+def _pub_lease_s() -> float:
+    try:
+        v = float(os.environ.get("CLIPES_PUB_LEASE_S", ""))
+    except ValueError:
+        return DEFAULT_PUB_LEASE_S
+    return v if v > 0 else DEFAULT_PUB_LEASE_S
+
+
+def _pub_max_por_ciclo() -> int:
+    try:
+        v = int(os.environ.get("CLIPES_PUB_MAX_POR_CICLO", ""))
+    except ValueError:
+        return DEFAULT_PUB_MAX_POR_CICLO
+    return v if v > 0 else DEFAULT_PUB_MAX_POR_CICLO
 
 
 def _now_ts(now: Callable[[], float] | float | None) -> float:
@@ -384,8 +402,14 @@ class LocalStore:
             if r.get("status") in ("pending", "running") and r.get("clip_id")
         }
 
-    def claim_request(self, req_id: str, worker_id: str | None = None) -> dict[str, Any] | None:
-        """Atomically transition a `pending` request to `running`, returning it or None."""
+    def claim_request(
+        self,
+        req_id: str,
+        worker_id: str | None = None,
+        now: Callable[[], float] | float | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically transition a `pending` request to `running` (with lease), returning it or None."""
+        now_ts = _now_ts(now)
         with _locked_path(self.path):
             data = self._load()
             existing = data["requests"].get(req_id)
@@ -394,8 +418,31 @@ class LocalStore:
             if worker_id is not None and existing.get("owner") != worker_id:
                 return None
             existing["status"] = "running"
+            existing["iniciado_em"] = _dt(now_ts)
+            existing["lease_until"] = _dt(now_ts + _pub_lease_s())
             self._save(data)
             return dict(existing)
+
+    def release_expired(self, worker_id: str | None, now: Callable[[], float] | float | None = None) -> int:
+        """Devolve a `pending` pedidos `running` com lease vencida (ou legados sem lease)."""
+        now_ts = _now_ts(now)
+        n = 0
+        with _locked_path(self.path):
+            data = self._load()
+            for r in data["requests"].values():
+                if r.get("status") != "running":
+                    continue
+                if worker_id is not None and r.get("owner") != worker_id:
+                    continue
+                lease_ts = _parse_ts(r.get("lease_until"))
+                if lease_ts is not None and lease_ts >= now_ts:
+                    continue
+                r["status"] = "pending"
+                r.pop("lease_until", None)
+                n += 1
+            if n:
+                self._save(data)
+        return n
 
     def update_request(self, req_id: str, fields: dict[str, Any]) -> None:
         with _locked_path(self.path):
@@ -488,18 +535,47 @@ class MongoStore:
         )
         return {str(d["clip_id"]) for d in docs if d.get("clip_id")}
 
-    def claim_request(self, req_id: str, worker_id: str | None = None) -> dict[str, Any] | None:
-        """Atomically transition a `pending` request to `running`, returning it or None."""
+    def claim_request(
+        self,
+        req_id: str,
+        worker_id: str | None = None,
+        now: Callable[[], float] | float | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically transition a `pending` request to `running` (with lease), returning it or None."""
         from pymongo import ReturnDocument
 
+        now_ts = _now_ts(now)
         query: dict[str, Any] = {"_id": req_id, "status": "pending"}
         if worker_id is not None:
             query["owner"] = worker_id
         return self.db.publish_requests.find_one_and_update(
             query,
-            {"$set": {"status": "running"}},
+            {"$set": {
+                "status": "running",
+                "iniciado_em": _dt(now_ts),
+                "lease_until": _dt(now_ts + _pub_lease_s()),
+            }},
             return_document=ReturnDocument.AFTER,
         )
+
+    def release_expired(self, worker_id: str | None, now: Callable[[], float] | float | None = None) -> int:
+        """Devolve a `pending` pedidos `running` com lease vencida (ou legados sem lease)."""
+        now_dt = _dt(_now_ts(now))
+        query: dict[str, Any] = {
+            "status": "running",
+            "$or": [
+                {"lease_until": {"$exists": False}},
+                {"lease_until": None},
+                {"lease_until": {"$lt": now_dt}},
+            ],
+        }
+        if worker_id is not None:
+            query["owner"] = worker_id
+        res = self.db.publish_requests.update_many(
+            query,
+            {"$set": {"status": "pending"}, "$unset": {"lease_until": ""}},
+        )
+        return int(getattr(res, "modified_count", 0) or 0)
 
     def update_request(self, req_id: str, fields: dict[str, Any]) -> None:
         self.db.publish_requests.update_one({"_id": req_id}, {"$set": fields})
@@ -1063,8 +1139,12 @@ def run_pending(
     save_tokens_fn: Callable[[dict[str, Any], Path | str | None], None] | None = None,
     discord_post: Callable[[str, str], Any] | None = None,
     discord_client: Any | None = None,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Execute pending publish requests owned by `worker_id` and reply in the clip thread."""
+    """Execute pending publish requests owned by `worker_id` and reply in the clip thread.
+
+    Processa no maximo `limit` pedidos por chamada (padrao `CLIPES_PUB_MAX_POR_CICLO`, 3).
+    """
     adapted = _adapt_store(store)
     root = Path(out_root) if out_root is not None else getattr(adapted, "out_root", None)
     pol = _resolve_policy(policy, policy_path, root)
@@ -1074,6 +1154,10 @@ def run_pending(
     outcomes: list[dict[str, Any]] = []
 
     now_fn_ts = _now_ts(now)
+    max_n = limit if limit is not None and limit > 0 else _pub_max_por_ciclo()
+    release_fn = getattr(adapted, "release_expired", None)
+    if callable(release_fn):
+        release_fn(worker_id, now=now_fn_ts)
     if isinstance(adapted, (LocalStore, MongoStore)):
         pending_reqs = adapted.find_pending(worker_id=worker_id, now=now_fn_ts)
     else:
@@ -1082,7 +1166,10 @@ def run_pending(
         except TypeError:
             pending_reqs = adapted.find_pending(worker_id=worker_id)
 
+    processed = 0
     for req in pending_reqs:
+        if processed >= max_n:
+            break
         now_ts = _now_ts(now)
         sched_ts = _parse_ts(req.get("agendar_para"))
         if sched_ts is not None and sched_ts > now_ts:
@@ -1094,8 +1181,13 @@ def run_pending(
 
         claim_fn = getattr(adapted, "claim_request", None)
         if callable(claim_fn):
-            if claim_fn(req_id, worker_id=worker_id) is None:
+            if isinstance(adapted, (LocalStore, MongoStore)):
+                claimed = claim_fn(req_id, worker_id=worker_id, now=now_ts)
+            else:
+                claimed = claim_fn(req_id, worker_id=worker_id)
+            if claimed is None:
                 continue
+        processed += 1
 
         def finish(status: str, resultado: dict[str, Any], reply: str) -> None:
             adapted.update_request(req_id, {
@@ -1113,101 +1205,60 @@ def run_pending(
                 "message": reply,
             })
 
-        found = find_clip(root, clip_id, store=adapted)
-        eff_thread_id = thread_id or (found.get("thread_id") if found else None)
-
-        if not quota_ok(plat, now_ts, quota_path=quota_path, out_root=root):
-            finish("adiado", {"erro": "cota_diaria"}, f"[{plat}] adiado: cota diaria atingida ({plat})")
-            continue
-
-        if found is None:
-            finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
-            continue
-
-        channel = found.get("channel") or ""
-        if not pol.permits(channel):
-            finish("erro", {"erro": "bloqueado pela politica"}, f"[{plat}] erro: bloqueado pela politica")
-            continue
-
-        ready_at = _effective_ready_at(found, pol)
-        if ready_at is not None and now_ts < ready_at:
-            adapted.update_request(req_id, {"status": "pending"})
-            continue
-
-        mp4_raw = found.get("mp4_path")
-        mp4_path = Path(mp4_raw) if mp4_raw is not None else None
-        tmp_dl: Path | None = None
-        if mp4_path is None or not mp4_path.is_file():
-            tmp_dl, dl_err, dl_reply = _download_from_discord(
-                found=found,
-                root=root,
-                clip_id=clip_id,
-                plat=plat,
-                discord_client=discord_client,
-                reg=reg,
-            )
-            if tmp_dl is None:
-                finish("erro_arquivo", {"erro": dl_err or "arquivo_ausente"}, dl_reply or f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
-                continue
-            mp4_path = tmp_dl
-
+        eff_thread_id = thread_id
+        secrets: list[str] = []
+        raw_prev = req.get("resultado")
+        prev: dict[str, Any] = raw_prev if isinstance(raw_prev, dict) else {}
+        partial: dict[str, Any] = dict(prev) if (prev.get("video_id") or prev.get("publish_id")) else {}
         try:
-            tok_map = _load_tokens(tokens, tokens_path)
-            plat_tok = dict(tok_map.get(plat) or {})
-            secrets = _secret_values(tok_map)
-
-            def do_refresh() -> str:
-                ref_fn = (refreshers or {}).get(plat) or (
-                    lambda p, t: _default_refresh(p, t, tokens_path=tokens_path)
-                )
-                refreshed = ref_fn(plat, plat_tok)
-                if isinstance(refreshed, str):
-                    new_access = refreshed
-                    new_refresh = ""
-                elif isinstance(refreshed, dict):
-                    new_access = str(refreshed.get("access_token") or "")
-                    new_refresh = str(refreshed.get("refresh_token") or "")
-                else:
-                    new_access = ""
-                    new_refresh = ""
-                if not new_access:
-                    raise RuntimeError("refresh returned no access_token")
-                plat_tok["access_token"] = new_access
-                if new_refresh:
-                    plat_tok["refresh_token"] = new_refresh
-                    tok_map[plat] = plat_tok
-                    save_fn(tok_map, tokens_path)
-                else:
-                    tok_map[plat] = plat_tok
-                secrets.extend(_secret_values(tok_map))
-                return str(new_access)
-
-            access_token = plat_tok.get("access_token")
-            if not access_token:
-                if not plat_tok.get("refresh_token"):
-                    finish("erro_auth", {"erro": "sem_token"}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
-                    continue
+            found = find_clip(root, clip_id, store=adapted)
+            eff_thread_id = thread_id or (found.get("thread_id") if found else None)
+            if partial:
+                # ja subiu numa tentativa anterior (crash antes do finish): nao reenviar, so a contabilidade
+                prev_id = str(partial.get("video_id") or partial.get("publish_id"))
+                prev_url = str(partial.get("url") or "")
+                priv = str(partial.get("privacidade") or ("private" if plat == "youtube" else "SELF_ONLY"))
                 try:
-                    access_token = do_refresh()
+                    _record_clip_publication(
+                        (found or {}).get("clips_json_path"),
+                        clip_id,
+                        {"plataforma": plat, "id": prev_id, "privacidade": priv, **({"url": prev_url} if prev_url else {})},
+                    )
                 except Exception as exc:
-                    safe_err = _sanitize_text(str(exc), secrets)
-                    finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
-                    continue
+                    print(f"[publicacao] falha ao atualizar clips.json de {clip_id} ({type(exc).__name__})", flush=True)
+                if reg is not None:
+                    try:
+                        reg.registrar_publicacao(clip_id, plat, {"id": prev_id, "url": prev_url, "em": now_ts})
+                    except Exception as exc:
+                        print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({type(exc).__name__})", flush=True)
+                finish("ok", dict(partial), f"[{plat}] ok: {prev_url or prev_id}")
+                continue
 
-            pub_fn = (publishers or {}).get(plat)
-            clip_entry = found["clip"]
+            if not quota_ok(plat, now_ts, quota_path=quota_path, out_root=root):
+                finish("adiado", {"erro": "cota_diaria"}, f"[{plat}] adiado: cota diaria atingida ({plat})")
+                continue
 
-            def invoke(tok: str) -> dict[str, Any]:
-                if pub_fn is not None:
-                    return _call_publisher(pub_fn, plat, mp4_path, clip_entry, tok)
-                return _default_publish(plat, mp4_path, clip_entry, tok, refresh=do_refresh)
+            if found is None:
+                finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
+                continue
 
-            try:
-                res = invoke(str(access_token))
-            except FileNotFoundError:
-                if tmp_dl is not None:
-                    finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
-                    continue
+            channel = found.get("channel") or ""
+            if not pol.permits(channel):
+                finish("erro", {"erro": "bloqueado pela politica"}, f"[{plat}] erro: bloqueado pela politica")
+                continue
+
+            ready_at = _effective_ready_at(found, pol)
+            if ready_at is not None and now_ts < ready_at:
+                adapted.update_request(
+                    req_id, {"status": "pending", "lease_until": None, "iniciado_em": None}
+                )
+                processed -= 1  # nao tomado de fato: nao consome o limit
+                continue
+
+            mp4_raw = found.get("mp4_path")
+            mp4_path = Path(mp4_raw) if mp4_raw is not None else None
+            tmp_dl: Path | None = None
+            if mp4_path is None or not mp4_path.is_file():
                 tmp_dl, dl_err, dl_reply = _download_from_discord(
                     found=found,
                     root=root,
@@ -1215,16 +1266,106 @@ def run_pending(
                     plat=plat,
                     discord_client=discord_client,
                     reg=reg,
-                    secrets=secrets,
                 )
                 if tmp_dl is None:
                     finish("erro_arquivo", {"erro": dl_err or "arquivo_ausente"}, dl_reply or f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
                     continue
                 mp4_path = tmp_dl
+
+            try:
+                tok_map = _load_tokens(tokens, tokens_path)
+                plat_tok = dict(tok_map.get(plat) or {})
+                secrets = _secret_values(tok_map)
+
+                def do_refresh() -> str:
+                    ref_fn = (refreshers or {}).get(plat) or (
+                        lambda p, t: _default_refresh(p, t, tokens_path=tokens_path)
+                    )
+                    refreshed = ref_fn(plat, plat_tok)
+                    if isinstance(refreshed, str):
+                        new_access = refreshed
+                        new_refresh = ""
+                    elif isinstance(refreshed, dict):
+                        new_access = str(refreshed.get("access_token") or "")
+                        new_refresh = str(refreshed.get("refresh_token") or "")
+                    else:
+                        new_access = ""
+                        new_refresh = ""
+                    if not new_access:
+                        raise RuntimeError("refresh returned no access_token")
+                    plat_tok["access_token"] = new_access
+                    if new_refresh:
+                        plat_tok["refresh_token"] = new_refresh
+                        tok_map[plat] = plat_tok
+                        save_fn(tok_map, tokens_path)
+                    else:
+                        tok_map[plat] = plat_tok
+                    secrets.extend(_secret_values(tok_map))
+                    return str(new_access)
+
+                access_token = plat_tok.get("access_token")
+                if not access_token:
+                    if not plat_tok.get("refresh_token"):
+                        finish("erro_auth", {"erro": "sem_token"}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                        continue
+                    try:
+                        access_token = do_refresh()
+                    except Exception as exc:
+                        safe_err = _sanitize_text(str(exc), secrets)
+                        finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                        continue
+
+                pub_fn = (publishers or {}).get(plat)
+                clip_entry = found["clip"]
+
+                def invoke(tok: str) -> dict[str, Any]:
+                    if pub_fn is not None:
+                        return _call_publisher(pub_fn, plat, mp4_path, clip_entry, tok)
+                    return _default_publish(plat, mp4_path, clip_entry, tok, refresh=do_refresh)
+
                 try:
                     res = invoke(str(access_token))
-                except Exception as exc_retry:
-                    if _is_401_error(exc_retry):
+                except FileNotFoundError:
+                    if tmp_dl is not None:
+                        finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
+                        continue
+                    tmp_dl, dl_err, dl_reply = _download_from_discord(
+                        found=found,
+                        root=root,
+                        clip_id=clip_id,
+                        plat=plat,
+                        discord_client=discord_client,
+                        reg=reg,
+                        secrets=secrets,
+                    )
+                    if tmp_dl is None:
+                        finish("erro_arquivo", {"erro": dl_err or "arquivo_ausente"}, dl_reply or f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
+                        continue
+                    mp4_path = tmp_dl
+                    try:
+                        res = invoke(str(access_token))
+                    except Exception as exc_retry:
+                        if _is_401_error(exc_retry):
+                            try:
+                                access_token = do_refresh()
+                                res = invoke(access_token)
+                            except Exception as exc2:
+                                safe_err = _sanitize_text(str(exc2), secrets)
+                                if _is_account_error(exc2):
+                                    finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                                else:
+                                    finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                                continue
+                        elif _is_account_error(exc_retry):
+                            safe_err = _sanitize_text(str(exc_retry), secrets)
+                            finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                            continue
+                        else:
+                            safe_err = _sanitize_text(str(exc_retry), secrets)
+                            finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
+                            continue
+                except Exception as exc:
+                    if _is_401_error(exc):
                         try:
                             access_token = do_refresh()
                             res = invoke(access_token)
@@ -1235,90 +1376,86 @@ def run_pending(
                             else:
                                 finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
                             continue
-                    elif _is_account_error(exc_retry):
-                        safe_err = _sanitize_text(str(exc_retry), secrets)
+                    elif _is_account_error(exc):
+                        safe_err = _sanitize_text(str(exc), secrets)
                         finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
                         continue
                     else:
-                        safe_err = _sanitize_text(str(exc_retry), secrets)
+                        safe_err = _sanitize_text(str(exc), secrets)
                         finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
                         continue
-            except Exception as exc:
-                if _is_401_error(exc):
-                    try:
-                        access_token = do_refresh()
-                        res = invoke(access_token)
-                    except Exception as exc2:
-                        safe_err = _sanitize_text(str(exc2), secrets)
-                        if _is_account_error(exc2):
-                            finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
-                        else:
-                            finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
-                        continue
-                elif _is_account_error(exc):
-                    safe_err = _sanitize_text(str(exc), secrets)
-                    finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
-                    continue
-                else:
-                    safe_err = _sanitize_text(str(exc), secrets)
-                    finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
+
+                if isinstance(res, dict) and res.get("status") in ("erro_conta", "erro_auth", "erro"):
+                    st = str(res["status"])
+                    safe_err = _sanitize_text(str(res.get("error") or res.get("erro") or st), secrets)
+                    if st == "erro_conta":
+                        msg = f"[{plat}] erro_conta: deixe a conta do TikTok como privada"
+                    elif st == "erro_auth":
+                        msg = f"[{plat}] erro_auth: refaca clipes auth {plat}"
+                    else:
+                        msg = f"[{plat}] erro: {safe_err}"
+                    finish(st, {"erro": safe_err}, msg)
                     continue
 
-            if isinstance(res, dict) and res.get("status") in ("erro_conta", "erro_auth", "erro"):
-                st = str(res["status"])
-                safe_err = _sanitize_text(str(res.get("error") or res.get("erro") or st), secrets)
-                if st == "erro_conta":
-                    msg = f"[{plat}] erro_conta: deixe a conta do TikTok como privada"
-                elif st == "erro_auth":
-                    msg = f"[{plat}] erro_auth: refaca clipes auth {plat}"
-                else:
-                    msg = f"[{plat}] erro: {safe_err}"
-                finish(st, {"erro": safe_err}, msg)
-                continue
-
-            try:
-                _record_quota(plat, now_ts, quota_path=quota_path, out_root=root)
-            except Exception as exc:
-                safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
-                print(f"[publicacao] falha ao registrar cota de {clip_id} ({safe_err})", flush=True)
-            pub_id = str(res.get("video_id") or res.get("publish_id") or res.get("id") or "")
-            if plat == "youtube":
-                priv = "private"
-                url = str(res.get("url") or (f"https://youtube.com/shorts/{pub_id}" if pub_id else ""))
-                resultado: dict[str, Any] = {"video_id": pub_id, "privacidade": priv}
-                if url:
-                    resultado["url"] = url
-            else:
-                priv = "SELF_ONLY"
-                url = str(res.get("url") or "")
-                resultado = {"publish_id": pub_id, "privacidade": priv}
-                if url:
-                    resultado["url"] = url
-
-            try:
-                _record_clip_publication(
-                    found.get("clips_json_path"),
-                    clip_id,
-                    {"plataforma": plat, "id": pub_id, "privacidade": priv, **({"url": url} if url else {})},
-                )
-            except Exception as exc:
-                safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
-                print(f"[publicacao] falha ao atualizar clips.json de {clip_id} ({safe_err})", flush=True)
-            if reg is not None:
                 try:
-                    reg.registrar_publicacao(
+                    _record_quota(plat, now_ts, quota_path=quota_path, out_root=root)
+                except Exception as exc:
+                    safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+                    print(f"[publicacao] falha ao registrar cota de {clip_id} ({safe_err})", flush=True)
+                pub_id = str(res.get("video_id") or res.get("publish_id") or res.get("id") or "")
+                if plat == "youtube":
+                    priv = "private"
+                    url = str(res.get("url") or (f"https://youtube.com/shorts/{pub_id}" if pub_id else ""))
+                    resultado: dict[str, Any] = {"video_id": pub_id, "privacidade": priv}
+                    if url:
+                        resultado["url"] = url
+                else:
+                    priv = "SELF_ONLY"
+                    url = str(res.get("url") or "")
+                    resultado = {"publish_id": pub_id, "privacidade": priv}
+                    if url:
+                        resultado["url"] = url
+
+                if pub_id:
+                    # grava o id ja publicado: se cair antes do finish, a retomada nao reenvia
+                    try:
+                        adapted.update_request(req_id, {"resultado": dict(resultado)})
+                        partial = dict(resultado)
+                    except Exception as exc:
+                        if type(exc).__module__.split(".")[0] in ("pymongo", "mongomock"):
+                            raise
+                        print(f"[publicacao] falha ao gravar resultado parcial de {clip_id}", flush=True)
+                try:
+                    _record_clip_publication(
+                        found.get("clips_json_path"),
                         clip_id,
-                        plat,
-                        {"id": pub_id, "url": url, "em": now_ts},
+                        {"plataforma": plat, "id": pub_id, "privacidade": priv, **({"url": url} if url else {})},
                     )
                 except Exception as exc:
                     safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
-                    print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({safe_err})", flush=True)
-            link_or_id = url or pub_id
-            reply = _sanitize_text(f"[{plat}] ok: {link_or_id}", secrets)
-            finish("ok", resultado, reply)
-        finally:
-            if tmp_dl is not None:
-                tmp_dl.unlink(missing_ok=True)
+                    print(f"[publicacao] falha ao atualizar clips.json de {clip_id} ({safe_err})", flush=True)
+                if reg is not None:
+                    try:
+                        reg.registrar_publicacao(
+                            clip_id,
+                            plat,
+                            {"id": pub_id, "url": url, "em": now_ts},
+                        )
+                    except Exception as exc:
+                        safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+                        print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({safe_err})", flush=True)
+                link_or_id = url or pub_id
+                reply = _sanitize_text(f"[{plat}] ok: {link_or_id}", secrets)
+                finish("ok", resultado, reply)
+            finally:
+                if tmp_dl is not None:
+                    tmp_dl.unlink(missing_ok=True)
+
+        except Exception as exc:
+            if type(exc).__module__.split(".")[0] in ("pymongo", "mongomock"):
+                raise
+            safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+            print(f"[publicacao] falha inesperada em {req_id} ({safe_err})", flush=True)
+            finish("erro", {**partial, "erro": safe_err}, f"[{plat}] erro: {safe_err}")
 
     return outcomes

@@ -421,9 +421,12 @@ def test_follow_live_e_monitor_logam_not_claimed(tmp_path, capsys):
             "ensure_indexes": lambda *a: None,
             "ensure_live": lambda *a, **k: None,
             "claim_live": lambda *a: False,
-            "beat": lambda *a: None,
+            "count_owned_live": lambda *a, **k: 0,
+            "release_expired_own": lambda *a: 0,
+            "beat": lambda *a, **k: None,
             "renew": lambda *a: True,
             "pending_command": lambda *a: None,
+            "run_pending_command": lambda *a, **k: None,
         },
     )()
     asyncio.run(monitor.run_monitor(

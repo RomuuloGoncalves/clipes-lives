@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -187,7 +188,23 @@ def worker_id(out_dir: str | Path) -> str:
         pass
 
     wid = f"w-{uuid.uuid4().hex[:12]}"
-    tmp_file = out_path / f".worker_id.tmp.{os.getpid()}"
-    tmp_file.write_text(wid, encoding="utf-8")
-    tmp_file.replace(id_file)
+    # criacao atomica: se outro processo criou primeiro, usa o id dele
+    try:
+        fd = os.open(id_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        for _ in range(20):
+            try:
+                other = id_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                other = ""
+            if other:
+                return other
+            time.sleep(0.05)
+        # arquivo vazio (crash entre O_EXCL e write): grava um id novo de forma atomica
+        tmp_file = out_path / f".worker_id.tmp.{os.getpid()}"
+        tmp_file.write_text(wid, encoding="utf-8")
+        os.replace(tmp_file, id_file)
+        return wid
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(wid)
     return wid

@@ -4,7 +4,7 @@ import json
 import threading
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from http.server import HTTPServer
 
 import mongomock
@@ -35,7 +35,8 @@ def test_online_pela_batida(db):
 
 
 def test_status_lives_e_jobs_24h(db):
-    db.lives.insert_many([{"_id": "a", "status": "live", "owner": "w-1", "channel": "c"},
+    db.lives.insert_many([{"_id": "a", "status": "live", "owner": "w-1", "channel": "c",
+                           "lease_until": NOW + timedelta(seconds=60)},
                           {"_id": "b", "status": "live", "owner": None},
                           {"_id": "c", "status": "ended", "owner": None}])
     db.jobs.insert_many([{"_id": "1", "status": "done", "updated_at": NOW - timedelta(hours=1)},
@@ -47,15 +48,15 @@ def test_status_lives_e_jobs_24h(db):
 
 
 def test_comando_codigos(db):
-    assert _nucleo.criar_comando(db, "w-1", "", NOW)[0] == 400
+    assert _nucleo.criar_comando(db, "w-2", "", NOW)[0] == 400
     assert _nucleo.criar_comando(db, "w-9", "LIBERAR", NOW)[0] == 404
-    assert _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)[0] == 202
-    assert _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)[0] == 409
+    assert _nucleo.criar_comando(db, "w-2", "LIBERAR", NOW)[0] == 202
+    assert _nucleo.criar_comando(db, "w-2", "LIBERAR", NOW)[0] == 409
     docs = list(db.commands.find())
     assert len(docs) == 1 and docs[0]["acao"] == "liberar" and docs[0]["status"] == "pending"
     # Após concluir o comando pendente, outro pode ser criado.
     db.commands.update_one({"_id": docs[0]["_id"]}, {"$set": {"status": "feito"}})
-    assert _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)[0] == 202
+    assert _nucleo.criar_comando(db, "w-2", "LIBERAR", NOW)[0] == 202
 
 
 def test_comando_409_atomico_em_corrida_e_duplicate_key(db, monkeypatch):
@@ -68,7 +69,7 @@ def test_comando_409_atomico_em_corrida_e_duplicate_key(db, monkeypatch):
 
     def worker():
         barrier.wait(timeout=5)
-        code, _ = _nucleo.criar_comando(db, "w-1", "LIBERAR", NOW)
+        code, _ = _nucleo.criar_comando(db, "w-2", "LIBERAR", NOW)
         with lock:
             codes.append(code)
 
@@ -79,7 +80,7 @@ def test_comando_409_atomico_em_corrida_e_duplicate_key(db, monkeypatch):
         t.join(timeout=10)
 
     assert sorted(codes) == [202, 409, 409, 409]
-    assert db.commands.count_documents({"worker_id": "w-1", "status": "pending"}) == 1
+    assert db.commands.count_documents({"worker_id": "w-2", "status": "pending"}) == 1
 
     # DuplicateKeyError em corrida real no Mongo devolve 409 sem erro 500.
     def boom(*args, **kwargs):
@@ -112,6 +113,8 @@ def _limpar_falhas_auth():
 
 # ---- T18/T19: handlers
 def chamar(mod, db, metodo, path_auth=None, corpo=None, headers=None, raw_body=None):
+    # o handler usa o relogio real: mantem os workers online para o comando
+    db.workers.update_many({}, {"$set": {"heartbeat_at": datetime.now(timezone.utc).replace(tzinfo=None)}})
     h = type("H", (mod.handler,), {"client": {"clipes_lives": db}})
     srv = HTTPServer(("127.0.0.1", 0), h)
     threading.Thread(target=srv.handle_request, daemon=True).start()

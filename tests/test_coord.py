@@ -420,3 +420,64 @@ def test_corrida_dois_workers_em_threads_so_um_inicia_e_cria_cada_job(env):
         doc = db.jobs.find_one({"_id": jid})
         expected_owner = "w-a" if jid in start_wins["w-a"] else "w-b"
         assert (doc["status"], doc["attempts"], doc["owner"]) == ("processing", 1, expected_owner)
+
+
+# ---- auditoria A-02 / M-03 / M-22: API nova do Coord ----
+
+def test_count_owned_live_ignora_lease_vencida_e_excluidos(env):
+    clock, db, a, _ = env
+    a.claim_live(LIVE)
+    a.ensure_live("twitch:outro:1")
+    a.claim_live("twitch:outro:1")
+    assert a.count_owned_live() == 2
+    assert a.count_owned_live(exclude={LIVE}) == 1
+    clock.t += 91  # crash: ninguem renovou
+    assert a.count_owned_live() == 0
+
+
+def test_release_expired_own_solta_so_as_vencidas_do_proprio_pc(env):
+    clock, db, a, b = env
+    a.claim_live(LIVE)
+    b.ensure_live("twitch:b:1")
+    b.claim_live("twitch:b:1")
+    clock.t += 91
+    a.ensure_live("twitch:viva:1")
+    a.claim_live("twitch:viva:1")
+    assert a.release_expired_own() == 1
+    assert db.lives.find_one({"_id": LIVE})["owner"] is None
+    assert db.lives.find_one({"_id": LIVE})["status"] == "live"  # nao marca ended
+    assert db.lives.find_one({"_id": "twitch:b:1"})["owner"] == "w-b"
+    assert db.lives.find_one({"_id": "twitch:viva:1"})["owner"] == "w-a"
+
+
+def test_beat_grava_beat_s_quando_informado(env):
+    _, db, a, _ = env
+    a.beat("PC-1", CAP, None, 1, 0.5, beat_s=30)
+    assert db.workers.find_one({"_id": "w-a"})["beat_s"] == 30.0
+
+
+def test_comando_expirado_vira_expirado_e_nao_e_devolvido(env):
+    from datetime import timedelta
+
+    _, db, a, _ = env
+    old = db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "pending", "criado_em": 1,
+                                  "expira_em": a._dt() - timedelta(seconds=1)}).inserted_id
+    assert a.pending_command() is None
+    assert db.commands.find_one({"_id": old})["status"] == "expirado"
+    novo = db.commands.insert_one({"worker_id": "w-a", "acao": "liberar", "status": "pending", "criado_em": 2,
+                                   "expira_em": a._dt() + timedelta(minutes=5)}).inserted_id
+    assert a.pending_command()["_id"] == novo
+
+
+def test_run_pending_command_liberar_marca_executando_chama_e_marca_feito(env):
+    _, db, a, _ = env
+    cid = cmd(db)
+    vistos = []
+
+    def liberar():
+        vistos.append(db.commands.find_one({"_id": cid})["status"])
+
+    assert a.run_pending_command(liberar) == "liberar"
+    assert vistos == ["executando"]
+    assert db.commands.find_one({"_id": cid})["status"] == "feito"
+    assert a.run_pending_command(liberar) is None

@@ -57,21 +57,31 @@ def status(db, now, beat_s=BEAT_S):
         })
     lives = [{"id": l["_id"], "channel": l.get("channel"), "owner": l["owner"],
               "lease_until": _iso(l.get("lease_until"))}
-             for l in db.lives.find({"status": "live", "owner": {"$ne": None}})]
+             for l in db.lives.find({"status": "live", "owner": {"$ne": None},
+                                     "lease_until": {"$gte": now}})]
     jobs = {}
     for j in db.jobs.find({"updated_at": {"$gte": now - timedelta(hours=24)}}):
         jobs[j["status"]] = jobs.get(j["status"], 0) + 1
     return {"workers": workers, "lives": lives, "jobs_24h": jobs}
 
 
-def criar_comando(db, worker_id, confirmar, now):
+def criar_comando(db, worker_id, confirmar, now, beat_s=BEAT_S):
     """Devolve (codigo_http, corpo)."""
     from pymongo.errors import DuplicateKeyError
 
     if confirmar != "LIBERAR":
         return 400, {"erro": "confirmacao invalida"}
-    if not worker_id or not db.workers.find_one({"_id": worker_id}):
+    w = db.workers.find_one({"_id": worker_id}) if worker_id else None
+    if not w:
         return 404, {"erro": "worker inexistente"}
+    hb = w.get("heartbeat_at")
+    if not hb or (now - hb).total_seconds() > 3 * beat_s:
+        return 409, {"erro": "worker offline"}
+    # comandos pendentes vencidos nao devem travar novos pedidos em 409
+    db.commands.update_many(
+        {"worker_id": worker_id, "status": "pending", "expira_em": {"$lt": now}},
+        {"$set": {"status": "expirado"}},
+    )
     try:
         res = db.commands.update_one(
             {"worker_id": worker_id, "status": "pending"},
@@ -80,6 +90,7 @@ def criar_comando(db, worker_id, confirmar, now):
                 "acao": "liberar",
                 "status": "pending",
                 "criado_em": now,
+                "expira_em": now + timedelta(minutes=10),
                 "executado_em": None,
             }},
             upsert=True,

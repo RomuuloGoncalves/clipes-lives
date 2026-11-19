@@ -171,6 +171,8 @@ def test_mongo_fora_continua_local_mascara_uri_e_reconecta_em_60s(tmp_path, monk
     """FILA-03 AC 11-12: ServerSelectionTimeoutError falls back to DiskQueue, masks URI in logs, retries after 60s."""
     clock = Clock()
     monkeypatch.setenv("CLIPES_MONGO_URI", SECRET_URI)
+    # o relogio simulado anda 1s por ms real; o fsync do _write_job (B-02) custa ms e faria o teste cruzar os 60s
+    monkeypatch.setattr(monitor.os, "fsync", lambda fd: None)
     out_root = tmp_path / "out"
     queue_root = tmp_path / "q"
 
@@ -215,10 +217,13 @@ def test_mongo_fora_continua_local_mascara_uri_e_reconecta_em_60s(tmp_path, monk
             self.finished.append((job_id, status))
             return True
 
-        def beat(self, alias, capacity, job_atual, max_lives, razao):
+        def beat(self, alias, capacity, job_atual, max_lives, razao, beat_s=None):
             pass
 
-        def pending_command(self):
+        def release_expired_own(self):
+            return 0
+
+        def run_pending_command(self, liberar):
             return None
 
     coord = FailingThenRecoveringCoord()
@@ -551,9 +556,9 @@ def test_heartbeat_3_ciclos_chama_3_beat_e_3_renew_e_renew_falso_para_gravador(t
     orig_beat = coord.beat
     orig_renew = coord.renew
 
-    def spy_beat(alias, cap, job_atual, max_lives, razao):
+    def spy_beat(alias, cap, job_atual, max_lives, razao, beat_s=None):
         beats.append((alias, cap, job_atual, max_lives, razao))
-        return orig_beat(alias, cap, job_atual, max_lives, razao)
+        return orig_beat(alias, cap, job_atual, max_lives, razao, beat_s=beat_s)
 
     def spy_renew(live_id):
         ok = orig_renew(live_id)
@@ -834,9 +839,9 @@ def test_follow_live_renova_lease_cria_jobs_e_para_ao_perder_lease(tmp_path, mon
     orig_beat = coord.beat
     orig_renew = coord.renew
 
-    def spy_beat(alias, cap, job_atual, max_lives, razao):
+    def spy_beat(alias, cap, job_atual, max_lives, razao, beat_s=None):
         beats.append((alias, cap, job_atual, max_lives, razao))
-        return orig_beat(alias, cap, job_atual, max_lives, razao)
+        return orig_beat(alias, cap, job_atual, max_lives, razao, beat_s=beat_s)
 
     def spy_renew(live_id):
         ok = orig_renew(live_id)

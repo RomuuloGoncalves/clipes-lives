@@ -69,6 +69,21 @@ class Coord:
             fields.update(status="ended", ended_at=self._dt())
         self.db.lives.update_one({"_id": live_id, "owner": self.worker_id}, {"$set": fields})
 
+    def count_owned_live(self, exclude: "set[str] | list[str] | tuple[str, ...]" = ()) -> int:
+        """Lives `live` deste PC com lease ainda válida (as órfãs de um crash não contam no max_lives)."""
+        q: dict = {"owner": self.worker_id, "status": "live", "lease_until": {"$gte": self._dt()}}
+        if exclude:
+            q["_id"] = {"$nin": list(exclude)}
+        return self.db.lives.count_documents(q)
+
+    def release_expired_own(self) -> int:
+        """Solta as lives deste PC com lease vencida (sobras de kill -9/OOM). Devolve quantas soltou."""
+        res = self.db.lives.update_many(
+            {"owner": self.worker_id, "status": "live", "lease_until": {"$lt": self._dt()}},
+            {"$set": {"owner": None, "lease_until": None}},
+        )
+        return res.modified_count
+
     # ---- jobs ----
 
     def add_job(self, job_id: str, live_id: str, window: tuple, priority: float) -> bool:
@@ -120,12 +135,16 @@ class Coord:
 
     # ---- heartbeat ----
 
-    def beat(self, alias: str, capacity: dict, job_atual: str | None, max_lives: int, razao: float) -> None:
+    def beat(self, alias: str, capacity: dict, job_atual: str | None, max_lives: int, razao: float,
+             beat_s: float | None = None) -> None:
         now = self._dt()
+        fields = {"alias": alias, "capacity": capacity, "job_atual": job_atual,
+                  "max_lives": max_lives, "razao": razao, "heartbeat_at": now}
+        if beat_s is not None:
+            fields["beat_s"] = float(beat_s)  # o painel calcula `online` com o intervalo real do worker
         self.db.workers.update_one(
             {"_id": self.worker_id},
-            {"$set": {"alias": alias, "capacity": capacity, "job_atual": job_atual,
-                      "max_lives": max_lives, "razao": razao, "heartbeat_at": now},
+            {"$set": fields,
              "$push": {"history": {"$each": [{"t": now, "cpu_pct": capacity.get("cpu_pct"),
                                               "temp_c": capacity.get("temp_c")}], "$slice": -180}}},
             upsert=True,
@@ -134,13 +153,34 @@ class Coord:
     # ---- comandos do painel ----
 
     def pending_command(self) -> dict | None:
-        """Comando `pending` mais antigo do próprio PC; ação fora da lista branca vira `rejeitado`."""
+        """Comando `pending` mais antigo do próprio PC; ação fora da lista branca vira `rejeitado`
+        e comando com `expira_em` no passado vira `expirado` (não dispara dias depois)."""
         while (c := self.db.commands.find_one({"worker_id": self.worker_id, "status": "pending"},
                                               sort=[("criado_em", 1)])) is not None:
-            if c.get("acao") in ACOES:
-                return c
-            self.mark_command(c["_id"], "rejeitado")
+            if c.get("acao") not in ACOES:
+                self.mark_command(c["_id"], "rejeitado")
+                continue
+            exp = c.get("expira_em")
+            if isinstance(exp, datetime) and exp.replace(tzinfo=None) < self._dt():
+                self.mark_command(c["_id"], "expirado")
+                continue
+            return c
         return None
+
+    def run_pending_command(self, liberar) -> str | None:
+        """Tratamento comum (monitor e acompanhar) do comando do painel.
+
+        Lê o comando pendente; para `liberar`, marca `executando`, chama `liberar()` (parar gravadores,
+        matar filhos, devolver o job em andamento) e marca `feito`. Devolve a ação executada ou None.
+        O chamador decide como sair (o monitor e o acompanhar saem com SystemExit(75)).
+        """
+        cmd = self.pending_command()
+        if not cmd or cmd.get("acao") != "liberar":
+            return None
+        self.mark_command(cmd["_id"], "executando")
+        liberar()
+        self.mark_command(cmd["_id"], "feito")
+        return "liberar"
 
     def mark_command(self, command_id, status: str) -> None:
         fields = {"status": status}
