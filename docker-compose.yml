@@ -48,12 +48,13 @@ services:
       CLIPES_MIN_FREE_GB: ${CLIPES_MIN_FREE_GB:-}
       CLIPES_BUFFER_CAP_GB: ${CLIPES_BUFFER_CAP_GB:-}
       CLIPES_LIVE_CAPTURA_MORTA_S: ${CLIPES_LIVE_CAPTURA_MORTA_S:-}
-      CLIPES_MAX_LIVES:
+      CLIPES_SLOTS: ${CLIPES_SLOTS:-}
       CLIPES_POLICY_FILE:
       TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID:-}
       TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET:-}
       DISCORD_BOT_TOKEN:
       DISCORD_CHANNEL_ID:
+      DISCORD_LOG_CHANNEL_ID: ${DISCORD_LOG_CHANNEL_ID:-}
       DISCORD_GUILD_ID:
       DISCORD_ALLOWED_USER_IDS:
       CLIPES_DISCORD_MAX_MB:
@@ -86,7 +87,7 @@ services:
     image: clipes-lives:latest
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     profiles: ["bot"]
-    restart: on-failure:3
+    restart: unless-stopped
     mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
@@ -98,6 +99,8 @@ services:
       CLIPES_MONGO_URI:
       CLIPES_ALIAS:
       CLIPES_POLICY_FILE: ${CLIPES_POLICY_FILE:-}
+      CLIPES_SLOTS: ${CLIPES_SLOTS:-}
+      DISCORD_LOG_CHANNEL_ID: ${DISCORD_LOG_CHANNEL_ID:-}
       DISCORD_BOT_TOKEN:
       DISCORD_CHANNEL_ID:
       DISCORD_GUILD_ID:

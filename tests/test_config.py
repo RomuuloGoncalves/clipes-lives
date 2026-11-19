@@ -61,3 +61,40 @@ def test_resolve_policy_path_env_out_dir_e_legado(monkeypatch, tmp_path, capsys)
     assert config.resolve_policy_path(out, legacy=legacy) == (out / "policy.json").resolve()
     monkeypatch.setenv("CLIPES_POLICY_FILE", str(tmp_path / "x.json"))
     assert config.resolve_policy_path(out, legacy=legacy) == (tmp_path / "x.json").resolve()
+
+
+def test_slots_padrao_sem_env_ou_vazia(monkeypatch):
+    monkeypatch.delenv("CLIPES_SLOTS", raising=False)
+    assert config.slots() == {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1}
+    monkeypatch.setenv("CLIPES_SLOTS", "   ")
+    assert config.slots() == {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1}
+
+
+def test_slots_sobrescrita_parcial_completa_e_zero(monkeypatch):
+    monkeypatch.setenv("CLIPES_SLOTS", "twitch=2,kick=0,busca=0")
+    assert config.slots() == {"twitch": 2, "kick": 0, "youtube": 1, "busca": 0}
+    monkeypatch.setenv("CLIPES_SLOTS", " Twitch = 3 , KICK = 1 , youtube = 0 , busca = 2 ")
+    assert config.slots() == {"twitch": 3, "kick": 1, "youtube": 0, "busca": 2}
+
+
+def test_slots_invalido_sai_codigo_2_com_trecho(monkeypatch, capsys):
+    import pytest
+
+    casos = [
+        ("tiktok=1", "tiktok=1"),
+        ("twitch=1,desconhecida=2", "desconhecida=2"),
+        ("twitch", "twitch"),
+        ("twitch=1.5", "twitch=1.5"),
+        ("twitch=-1", "twitch=-1"),
+        ("twitch=abc", "twitch=abc"),
+        ("twitch=", "twitch="),
+        ("twitch=1,,kick=1", ""),
+    ]
+    for raw, trecho in casos:
+        monkeypatch.setenv("CLIPES_SLOTS", raw)
+        with pytest.raises(SystemExit) as exc:
+            config.slots()
+        assert exc.value.code == 2
+        captured = capsys.readouterr()
+        msg = captured.err + captured.out
+        assert f"CLIPES_SLOTS invalido: {trecho}" in msg

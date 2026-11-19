@@ -54,7 +54,7 @@ POST_ROLL_MAX_S = 120
 MIN_CLIP_SOURCE_S = 25.0  # a source shorter than min_dur cannot yield a clip
 STREAMLINK_QUALITY = "720p60,720p,480p,best"
 CHANNEL_RE = re.compile(r"[a-z0-9_]{1,25}")
-_YT_KEY_RE = re.compile(r"(?:yt|kick)_[A-Za-z0-9_-]{1,64}")
+_YT_KEY_RE = re.compile(r"(?:yt|kick)[:_][A-Za-z0-9_-]{1,64}")
 
 # (game_id, limit) -> (monotonic timestamp of last Helix attempt, logins it returned); enforces >= 60s polling.
 _helix_cache: dict[tuple[str | None, int], tuple[float, list[str]]] = {}
@@ -362,14 +362,14 @@ async def irc_chat_loop(
 
 
 def streamlink_cmd(channel: str) -> list[str]:
-    return ["streamlink", "--quiet", "--stdout", f"twitch.tv/{channel}", STREAMLINK_QUALITY]
+    return ["streamlink", "--quiet", "--stdout", "--", f"twitch.tv/{channel}", STREAMLINK_QUALITY]
 
 
 def ytdlp_live_cmd(url: str) -> list[str]:
     return [
         "yt-dlp", "-q", "--no-progress", "--no-part", "-f", "b[height<=1080]/b",
         "--retries", "infinite", "--fragment-retries", "infinite", "--socket-timeout", "30",
-        "--hls-use-mpegts", *js_runtime_args(), "-o", "-", url,
+        "--hls-use-mpegts", *js_runtime_args(), "-o", "-", "--", url,
     ]
 
 
@@ -418,7 +418,7 @@ class RollingRecorderPool:
         self.frozen = False  # liberar: nenhum gravador novo depois do stop_all
 
     def _start(self, channel: str, on_demand: bool) -> None:
-        key_re = _YT_KEY_RE if channel.startswith(("yt_", "kick_")) else CHANNEL_RE
+        key_re = _YT_KEY_RE if channel.startswith(("yt_", "yt:", "kick_", "kick:")) else CHANNEL_RE
         if not key_re.fullmatch(channel):
             raise ValueError(f"invalid channel name: {channel!r}")
         seg_dir = self.buf_root / channel
@@ -709,6 +709,7 @@ async def capture_job(
                 "job_id": job_id,
                 "channel": channel,
                 "url": f"https://www.twitch.tv/{channel}",
+                "origem": "busca",
                 "peak_ts": event.peak_ts,
                 "count10": event.count10,
                 "unique_authors10": event.unique_authors,
@@ -719,6 +720,8 @@ async def capture_job(
                 "score": None,
                 "status": "pending",
             }
+            if live_id is not None:
+                job["live_id"] = live_id
             duration = 0.0
             try:
                 video_start = pool.video_start_ts(channel, start_ts, end_ts)
@@ -1468,6 +1471,27 @@ def _read_perfil_razao(out_root: Path, cpus: int | None) -> float:
     return 0.0
 
 
+EXCLUIR_CACHE_S = 15.0  # cache <= 20s de alvos_ativos() para exclusao da busca geral
+
+
+def _norm_excluded(items: Any) -> set[str]:
+    out: set[str] = set()
+    if not items:
+        return out
+    for raw in items:
+        if not isinstance(raw, str):
+            continue
+        s = raw.strip().lower()
+        if not s:
+            continue
+        out.add(s)
+        if ":" in s:
+            _, resto = s.split(":", 1)
+            if resto:
+                out.add(resto)
+    return out
+
+
 async def run_monitor(
     channels: list[str],
     out_root: Path,
@@ -1494,10 +1518,15 @@ async def run_monitor(
     discord_channel_id: str | None = None,
     preview_fn: Callable[..., Path | None] | None = None,
     run_pending_fn: Callable[..., list[dict[str, Any]]] | None = None,
+    worker: bool = True,
+    excluir: Callable[[], set[str]] | None = None,
+    coord_session: Any | None = None,
+    owned_lives_out: dict[str, str] | None = None,
 ) -> None:
     """IRC -> ChannelSpikeDetector -> rolling recorder -> capture_job -> DiskQueue, plus 1 sequential worker.
 
     dry_run only reads IRC and logs spikes: no recording, no queue, no worker.
+    worker=False runs in producer-only mode (no queue lock, no worker/heartbeat/PublishLoop).
     """
     stop = stop or asyncio.Event()
     try:
@@ -1510,7 +1539,7 @@ async def run_monitor(
     detectors = {c: ChannelSpikeDetector(c, float("inf") if real_irc else now()) for c in channels}
     capturing: set[str] = set()
     captures: set[asyncio.Task] = set()
-    owned_lives: dict[str, str] = {}
+    owned_lives: dict[str, str] = owned_lives_out if owned_lives_out is not None else {}
     claiming_tasks: dict[str, asyncio.Task[bool]] = {}
     claim_retry_at: dict[str, float] = {}
     lost_lives: set[str] = set()
@@ -1519,6 +1548,7 @@ async def run_monitor(
     cancel = threading.Event()  # liberar/encerramento: o job em andamento volta a pending em vez de rejected (M-04)
     worker_busy = threading.Lock()  # preso pela thread do worker enquanto roda um job
     publish_loop: PublishLoop | None = None
+    excl_cache: list[Any] = [float("-inf"), set()]  # [ts, set[str]] para alvos_ativos()
 
     def on_join(channel: str, t: float) -> None:
         detector = detectors.get(channel)
@@ -1534,9 +1564,10 @@ async def run_monitor(
         """Lives cujos jobs nao devem subir ao Mongo: perdidas ou com o claim ainda nao decidido."""
         return {*lost_lives, *(f"twitch:{c}" for c in unleased)}
 
-    queue = pool = lock = coord_session = None
+    queue = pool = lock = None
     cap_getter = capacity_fn
     max_lives_getter = max_lives_fn
+    busca_slot = config.slots()["busca"] if (not worker and max_lives_getter is None) else None
     worker_alias = alias or os.environ.get("CLIPES_ALIAS", "").strip()
     beat_interval = max(1.0, config.env_float("CLIPES_BEAT_S", 20.0, min_value=1.0) if beat_s is None else float(beat_s))
     child_killer = kill_children or _terminate_child_processes
@@ -1544,25 +1575,39 @@ async def run_monitor(
     if not dry_run:
         queue_root = queue_root or out_root / "queue"
         queue = DiskQueue(queue_root)
-        lock = _lock_worker(queue_root)
-        queue.recover_orphans()
+        if worker:
+            lock = _lock_worker(queue_root)
+            queue.recover_orphans()
         staging = queue_root / ".staging"  # same filesystem as the queue, so enqueue is an os.replace
         staging.mkdir(exist_ok=True)
-        shutil.rmtree(queue_root / ".buffer", ignore_errors=True)  # segments of a previous run are stale
-        pool = RollingRecorderPool(queue_root / ".buffer", max_hot=max(0, min(max_recorders, 3)), popen=popen)
-        coord_session = _CoordSession(
-            out_root, coord=coord, now=now, beat_s=beat_interval,
-            on_connect=lambda c: replay_unsynced_jobs(queue, c, skip_lives=_replay_skip(), out_root=out_root),
-        )
-        if coord_session.configured:
-            if cap_getter is None:
-                from .capacidade import capacity as cap_getter
-            if max_lives_getter is None:
-                from .perfil import max_lives as max_lives_getter
-            if not worker_alias:
-                from .capacidade import worker_id as get_worker_id
-                worker_alias = get_worker_id(out_root)
-            coord_session.connect()
+        buf_dir = queue_root / (".buffer" if worker else ".buffer_busca")
+        shutil.rmtree(buf_dir, ignore_errors=True)  # segments of a previous run are stale
+        hot_limit = max(0, min(max_recorders, 3))
+        on_demand_limit = 1
+        if busca_slot is not None:
+            hot_limit = max(0, min(hot_limit, busca_slot))
+            on_demand_limit = 1 if busca_slot > 0 else 0
+        pool = RollingRecorderPool(buf_dir, max_hot=hot_limit, max_on_demand=on_demand_limit, popen=popen)
+        if coord_session is None:
+            coord_session = _CoordSession(
+                out_root, coord=coord, now=now, beat_s=beat_interval,
+                on_connect=(
+                    (lambda c: replay_unsynced_jobs(queue, c, skip_lives=_replay_skip(), out_root=out_root))
+                    if worker
+                    else None
+                ),
+            )
+            if coord_session.configured:
+                if cap_getter is None:
+                    from .capacidade import capacity as cap_getter
+                if max_lives_getter is None and worker:
+                    from .perfil import max_lives as max_lives_getter
+                if not worker_alias:
+                    from .capacidade import worker_id as get_worker_id
+                    worker_alias = get_worker_id(out_root)
+                coord_session.connect()
+        elif coord_session.configured and cap_getter is None:
+            from .capacidade import capacity as cap_getter
 
     def over_limit(channel: str, ml: int) -> bool:
         """True se `channel` nao cabe no max_lives: lives donas + reservas que chegaram antes dele."""
@@ -1571,11 +1616,35 @@ async def run_monitor(
 
     def _current_limits() -> tuple[dict[str, Any], int]:
         cap = cap_getter(out_root) if cap_getter is not None else {"cpus": 1, "score": 1}
-        ml = max_lives_getter(out_root, cap.get("cpus")) if max_lives_getter is not None else 1
-        return cap, max(1, int(ml))
+        if max_lives_getter is not None:
+            ml = int(max_lives_getter(out_root, cap.get("cpus")))
+        elif busca_slot is not None:
+            ml = int(busca_slot)
+        else:
+            ml = 1
+        return cap, max(0 if not worker else 1, ml)
 
     async def _current_limits_async() -> tuple[dict[str, Any], int]:
         return await asyncio.to_thread(_current_limits)
+
+    def _get_excluded(t: float) -> set[str]:
+        out = _norm_excluded(excluir()) if excluir is not None else set()
+        active_coord = coord_session.active if coord_session is not None else None
+        if active_coord is not None:
+            alvos_fn = getattr(active_coord, "alvos_ativos", None)
+            if callable(alvos_fn):
+                if t - excl_cache[0] >= EXCLUIR_CACHE_S:
+                    try:
+                        excl_cache[1] = _norm_excluded(alvos_fn())
+                        excl_cache[0] = t
+                    except Exception as exc:
+                        if _is_mongo_error(exc):
+                            coord_session.mark_offline(exc)
+                out |= excl_cache[1]
+        return out
+
+    async def _get_excluded_async(t: float) -> set[str]:
+        return await asyncio.to_thread(_get_excluded, t)
 
     async def _claim_live(channel: str) -> bool:
         try:
@@ -1672,14 +1741,37 @@ async def run_monitor(
 
     async def capture_and_enqueue(event: SpikeEvent) -> None:
         try:
+            excluded = await _get_excluded_async(now())
+            if event.channel.lower() in excluded:
+                return
+            if not worker:
+                _, ml = await _current_limits_async()
+                if ml < 1:
+                    return
+                if (coord_session is None or not coord_session.configured) and event.channel not in pool.recordings and len(pool.recordings) >= ml:
+                    return
             if not await ensure_claimed(event.channel):
+                return
+            excluded_after = await _get_excluded_async(now())
+            if event.channel.lower() in excluded_after:
+                lid_drop = owned_lives.pop(event.channel, None)
+                if lid_drop and coord_session is not None and coord_session.active is not None:
+                    try:
+                        await asyncio.to_thread(coord_session.active.release, lid_drop, False)
+                    except Exception as exc:
+                        if _is_mongo_error(exc):
+                            coord_session.mark_offline(exc)
                 return
             job_dir = await capture_job(pool, detectors[event.channel], event, staging, now=now, sleep=sleep)
             if job_dir is None:
                 print(f"[monitor] no free recorder for {event.channel}; spike dropped", flush=True)
             else:
+                job = _read_job(job_dir)
+                changed = False
+                if job.get("origem") != "busca":
+                    job["origem"] = "busca"
+                    changed = True
                 if coord_session is not None and coord_session.configured:
-                    job = _read_job(job_dir)
                     channel = job["channel"]
                     live_id = owned_lives.get(channel) or job.get("live_id") or f"twitch:{channel}"
                     active_coord = coord_session.active
@@ -1702,10 +1794,12 @@ async def run_monitor(
                             job.update(live_id=live_id, mongo_job_id=mongo_job_id, coord_synced=False)
                         else:
                             job.update(live_id=live_id, mongo_job_id=mongo_job_id, coord_synced=True)
-                        _write_job(job_dir, job)
+                        changed = True
                     elif job.get("status") != "rejected":
                         job.update(live_id=live_id, coord_synced=False)  # replay_unsynced_jobs sobe quando der
-                        _write_job(job_dir, job)
+                        changed = True
+                if changed:
+                    _write_job(job_dir, job)
                 print(f"[monitor] queued {queue.enqueue(job_dir)}", flush=True)
         except Exception as exc:  # one failed capture must not stop the monitor
             print(f"[monitor] capture failed for {event.channel}: {type(exc).__name__}: {exc}", flush=True)
@@ -1714,6 +1808,7 @@ async def run_monitor(
 
     async def tick_loop() -> None:
         last_rank = float("-inf")
+        last_renew = float("-inf")
         while not stop.is_set():
             if cancel.is_set():  # liberar em curso: nao religa gravadores nem abre capturas
                 await sleep(1.0)
@@ -1721,9 +1816,12 @@ async def run_monitor(
             t = now()
             if coord_session is not None and coord_session.configured and not coord_session.online and t >= coord_session.next_retry:
                 await asyncio.to_thread(coord_session.maybe_reconnect)
+            excluded = await _get_excluded_async(t) if (pool is not None and (excluir is not None or (coord_session is not None and coord_session.active is not None))) else set()
             for detector in detectors.values():
                 event = detector.check_spike(t)
                 if event is None:
+                    continue
+                if event.channel.lower() in excluded:
                     continue
                 print(f"[monitor] spike {event.channel} count10={event.count10} authors={event.unique_authors} "
                       f"expected={event.expected:.1f} z={event.z_score:.2f}", flush=True)
@@ -1735,7 +1833,9 @@ async def run_monitor(
             if pool is not None and t - last_rank >= RANK_INTERVAL_S:
                 def recent(c: str) -> int:  # only the last 60s: an offline channel must not stay "hot" and re-arm its recorder
                     return sum(1 for m in detectors[c].messages if m[0] >= t - 60.0)
-                active = sorted((c for c in detectors if recent(c) > 0), key=lambda c: -recent(c))
+                active = sorted((c for c in detectors if recent(c) > 0 and c.lower() not in excluded), key=lambda c: -recent(c))
+                if excluded:
+                    unleased.difference_update(c for c in list(unleased) if c.lower() in excluded)
                 if coord_session is not None and coord_session.active is not None:
                     _, ml = await _current_limits_async()
                     for c in active:
@@ -1759,6 +1859,8 @@ async def run_monitor(
                 pool.set_hot(hot_targets)
                 if coord_session is not None and coord_session.active is not None:
                     for c in list(owned_lives):
+                        if c.lower() in excluded and c not in capturing:
+                            pool.stop_channel(c)
                         if c not in pool.recordings and c not in capturing:
                             live_id = owned_lives.pop(c)
                             try:
@@ -1770,6 +1872,24 @@ async def run_monitor(
                 pool.cleanup(t)
                 pool.enforce_cap(BUFFER_CAP_BYTES)
                 last_rank = t
+            if not worker and owned_lives and coord_session is not None and coord_session.active is not None and t - last_renew >= beat_interval:
+                last_renew = t
+                active_coord = coord_session.active
+                for ch, live_id in list(owned_lives.items()):
+                    try:
+                        ok = await asyncio.to_thread(active_coord.renew, live_id)
+                    except Exception as exc:
+                        if _is_mongo_error(exc):
+                            coord_session.mark_offline(exc)
+                            break
+                        raise
+                    if not ok:
+                        print(f"[fila] lease perdida {live_id}", flush=True)
+                        owned_lives.pop(ch, None)
+                        unleased.discard(ch)
+                        lost_lives.add(live_id)
+                        if pool is not None:
+                            pool.stop_channel(ch)
             await sleep(1.0)
 
     def worker_step_sync(active_coord: Any, on_err: Callable[[BaseException], None] | None) -> bool:
@@ -1832,7 +1952,7 @@ async def run_monitor(
                 uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
                 print(f"[publicar] erro na publicacao ({_sanitize_error(exc, uri)})", flush=True)
 
-    if not dry_run and coord_session is not None and coord_session.configured:
+    if not dry_run and worker and coord_session is not None and coord_session.configured:
         publish_loop = PublishLoop(publish_once, 0, name="publicacao")  # sem timer: o heartbeat dispara run_now()
 
     async def heartbeat_loop() -> None:
@@ -1883,7 +2003,7 @@ async def run_monitor(
 
     irc_call = irc(channels, on_message, stop=stop, on_join=on_join) if real_irc else irc(channels, on_message, stop=stop)
     coros = [irc_call, tick_loop()]
-    if not dry_run:
+    if not dry_run and worker:
         coros.append(worker_loop())
         if coord_session is not None and coord_session.configured:
             coros.append(heartbeat_loop())

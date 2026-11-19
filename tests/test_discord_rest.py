@@ -326,3 +326,127 @@ def test_post_and_download_wrap_raw_oserror_without_leaking_secrets(tmp_path: Pa
     assert isinstance(exc_dl.value.__cause__, ConnectionResetError)
     assert "signedsecret999" not in str(exc_dl.value)
     assert "hm=" not in str(exc_dl.value)
+
+
+def test_edit_patch_content_and_components():
+    token = "secret-discord-token-edit"
+    captured: list[Any] = []
+
+    def fake_urlopen(req, timeout=None):
+        captured.append(req)
+        return _FakeResponse(200, {"id": "msg_999", "content": "updated"})
+
+    rest = DiscordRest(token, urlopen=fake_urlopen, sleep=lambda _: None)
+
+    # Content only (omits components so existing components stay untouched)
+    card_text = "**gaules** — CS2\nClipes: 3\n🔴 ao vivo\nhttps://twitch.tv/gaules"
+    res1 = rest.edit("157241", "msg_999", card_text)
+    assert res1["id"] == "msg_999"
+    r1 = captured[0]
+    assert r1.get_method() == "PATCH"
+    assert r1.full_url.endswith("/channels/157241/messages/msg_999")
+    assert r1.get_header("Authorization") == f"Bot {token}"
+    assert r1.get_header("Content-type") == "application/json"
+    body1 = json.loads(r1.data.decode("utf-8"))
+    assert body1 == {"content": card_text}
+    assert "components" not in body1
+
+    # Explicit empty components=[] removes buttons (e.g., Descartar)
+    res2 = rest.edit("thr_777", "msg_clip_01", "🗑️ descartado · titulo", components=[])
+    assert res2["id"] == "msg_999"
+    r2 = captured[1]
+    assert r2.get_method() == "PATCH"
+    assert r2.full_url.endswith("/channels/thr_777/messages/msg_clip_01")
+    assert r2.get_header("Content-type") == "application/json"
+    assert json.loads(r2.data.decode("utf-8")) == {
+        "content": "🗑️ descartado · titulo",
+        "components": [],
+    }
+
+    # Explicit non-empty components list replaces components
+    comps = [
+        {"type": 1, "components": [{"type": 2, "style": 2, "label": "Descartar", "custom_id": "descartar:c01"}]}
+    ]
+    rest.edit(157241, 888, "🗓️ agendado 20:00", components=comps)
+    r3 = captured[2]
+    assert r3.get_method() == "PATCH"
+    assert r3.full_url.endswith("/channels/157241/messages/888")
+    assert json.loads(r3.data.decode("utf-8")) == {
+        "content": "🗓️ agendado 20:00",
+        "components": comps,
+    }
+
+
+def test_edit_429_retries_with_retry_after_and_exhaustion_hides_token():
+    token = "SUPER_SECRET_EDIT_429_TOKEN"
+    sleeps: list[float] = []
+    calls = 0
+
+    def fake_urlopen_recover(req, timeout=None):
+        nonlocal calls
+        calls += 1
+        assert req.get_method() == "PATCH"
+        if calls == 1:
+            raise urllib.error.HTTPError(
+                req.full_url,
+                429,
+                "Too Many Requests",
+                hdrs={},
+                fp=io.BytesIO(json.dumps({"retry_after": 0.3}).encode("utf-8")),
+            )
+        return _FakeResponse(200, {"id": "msg_edited"})
+
+    rest = DiscordRest(token, urlopen=fake_urlopen_recover, sleep=sleeps.append)
+    res = rest.edit("157241", "msg_edited", "✅ encerrada")
+    assert res == {"id": "msg_edited"}
+    assert calls == 2
+    assert sleeps == [0.3]
+
+    # Exhausting 429 retries raises DiscordRestError(status=429) without leaking token
+    exhaust_sleeps: list[float] = []
+    exhaust_calls = 0
+
+    def fake_urlopen_always_429(req, timeout=None):
+        nonlocal exhaust_calls
+        exhaust_calls += 1
+        raise urllib.error.HTTPError(
+            req.full_url,
+            429,
+            f"Rate limited {token}",
+            hdrs={},
+            fp=io.BytesIO(json.dumps({"retry_after": 0.15, "token": token}).encode("utf-8")),
+        )
+
+    rest_fail = DiscordRest(token, urlopen=fake_urlopen_always_429, sleep=exhaust_sleeps.append)
+    with pytest.raises(DiscordRestError) as exc_info:
+        rest_fail.edit("157241", "msg_edited", "✅ encerrada")
+    assert exhaust_calls == 4
+    assert exhaust_sleeps == [0.15, 0.15, 0.15]
+    assert exc_info.value.status == 429
+    assert token not in str(exc_info.value)
+
+
+def test_edit_404_raises_with_status_code_and_masks_token():
+    token = "SUPER_SECRET_EDIT_404_TOKEN"
+
+    def fake_urlopen_404(req, timeout=None):
+        assert req.get_method() == "PATCH"
+        raise urllib.error.HTTPError(
+            req.full_url,
+            404,
+            "Not Found",
+            hdrs={},
+            fp=io.BytesIO(
+                json.dumps({"code": 10008, "message": f"Unknown Message ({token})"}).encode("utf-8")
+            ),
+        )
+
+    rest = DiscordRest(token, urlopen=fake_urlopen_404, sleep=lambda _: None)
+    with pytest.raises(DiscordRestError) as exc_info:
+        rest.edit("157241", "msg_deleted", "novo texto")
+
+    assert exc_info.value.status == 404
+    assert exc_info.value.code == 10008
+    err_text = str(exc_info.value)
+    assert "404" in err_text
+    assert token not in err_text

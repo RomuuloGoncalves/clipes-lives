@@ -1,5 +1,7 @@
 # Plano de fechamento das Ondas A/B/C (para executar em outra máquina)
 
+> **Histórico (superado pela onda 4 `controle-discord`):** as referências a `./clipar monitor`, `acompanhar`, `--ate-acabar`, `bench-live` e `max_lives` descrevem a CLI antiga. Hoje a CLI tem `./clipar <url>`, `./clipar servico` e `auth`; os alvos vão pelo Discord (`/live`) e os limites são `CLIPES_SLOTS`. Veja o README.
+
 Estado: branch `onda-ab` no GitHub (`git fetch && git checkout onda-ab`). `master` continua em `c19c1f4`.
 Cada item = 1 commit atômico (Conventional Commits). Teste: `docker run --rm --network none clipes-lives:latest pytest -q <arquivos>` (o `docker compose` pode falhar por falta de sub-redes; limpe com `docker network prune`). Suíte global só no passo 6.
 

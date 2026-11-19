@@ -43,38 +43,76 @@ def _policy_status_text(policy: ChannelPolicy, channel: str, ready_at: Any) -> s
     return "liberado"
 
 
+_STATUS_EMOJIS = ("🟡", "🗓️", "✅", "🗑️")
+
+
+def set_clip_status_line(
+    content: str,
+    new_status: str,
+    *,
+    prepend_if_missing: bool = False,
+) -> str:
+    """Atualiza o prefixo de estado na primeira linha da mensagem de clipe."""
+    text = content or ""
+    if not text:
+        return new_status[:2000]
+    first, sep, rest = text.partition("\n")
+    has_emoji = any(first.startswith(em) for em in _STATUS_EMOJIS)
+    if has_emoji:
+        if " — " in first:
+            _, _, title_part = first.partition(" — ")
+            new_first = f"{new_status} — {title_part}"
+        else:
+            new_first = new_status
+    elif prepend_if_missing:
+        new_first = f"{new_status} — {first}"
+    else:
+        return text
+    return f"{new_first}{sep}{rest}"[:2000]
+
+
 def _format_clip_discord_message(
     clip: dict[str, Any],
     clip_id: str,
     policy_status: str,
     too_large_path: Path | None = None,
+    *,
+    estado: str = "🟡 pendente",
 ) -> str:
     title = str(clip.get("title") or clip_id)
     hook = str(clip.get("hook_top") or "-")
     score_val = clip.get("llm_score") if clip.get("llm_score") is not None else clip.get("score")
     score_txt = f"{score_val}" if score_val is not None else "-"
     ai_src = str(clip.get("title_source") or clip.get("description_source") or clip.get("llm_reason") or "-")
-    caption = str(clip.get("caption") or "-")
     desc_long = str(clip.get("description_long") or "-")
 
     head = (
-        f"**{title}** (`{clip_id}`)\n"
+        f"{estado} — **{title}**\n"
+        f"ID: `{clip_id}`\n"
         f"Gancho: {hook}\n"
-        f"Nota/IA: {score_txt} ({ai_src})\n"
-        f"Legenda: {caption}\n"
+        f"Nota: {score_txt} ({ai_src})\n"
     )
-    tail = f"Policy: {policy_status}\nPara publicar: `publicar {clip_id}`"
+    tail_lines: list[str] = []
     if too_large_path is not None:
-        tail = f"arquivo grande demais para o Discord: `{too_large_path}`\n" + tail
+        tail_lines.append(f"arquivo grande demais para o Discord: `{too_large_path}`")
+    if policy_status and policy_status != "liberado":
+        tail_lines.append(f"Policy: {policy_status}")
+    tail = "\n".join(tail_lines)
 
-    budget = 2000 - len(head) - len(tail) - len("Descricao: \n")
+    desc_prefix = "Descricao: "
+    extra_sep = 1 if tail else 0
+    budget = 2000 - len(head) - len(tail) - extra_sep - len(desc_prefix)
     if budget < 20:
         desc_part = ""
     elif len(desc_long) > budget:
-        desc_part = f"Descricao: {desc_long[: max(0, budget - 3)]}...\n"
+        desc_part = f"{desc_prefix}{desc_long[: max(0, budget - 3)]}..."
     else:
-        desc_part = f"Descricao: {desc_long}\n"
-    return (head + desc_part + tail)[:2000]
+        desc_part = f"{desc_prefix}{desc_long}"
+
+    body = head + desc_part
+    if tail:
+        body = f"{body}\n{tail}" if desc_part else f"{head}{tail}"
+    return body[:2000]
 
 
 def _normalize_policy_channel(raw: str) -> str:
@@ -129,6 +167,40 @@ def _is_attachment_error(exc: BaseException) -> bool:
     return isinstance(getattr(exc, "__cause__", None), OSError)
 
 
+def _is_404_error(exc: BaseException) -> bool:
+    if getattr(exc, "status", None) == 404 or getattr(exc, "code", None) == 10008:
+        return True
+    text = str(exc)
+    return "HTTP 404" in text or "code=10008" in text
+
+
+def _format_live_header(
+    channel_name: str,
+    live_title: str,
+    clip_count: int,
+    live_url: str,
+    *,
+    encerrada: bool = False,
+) -> str:
+    header_title = f"**{channel_name}** — {live_title}" if channel_name else f"**{live_title}**"
+    estado = "✅ encerrada" if encerrada else "🔴 ao vivo"
+    lines = [header_title, f"Clipes: {int(clip_count)}", estado]
+    if live_url:
+        lines.append(live_url)
+    return "\n".join(lines)[:2000]
+
+
+def _format_live_thread_name(channel_name: str, live_title: str, created_at: Any) -> str:
+    try:
+        date_str = datetime.fromtimestamp(float(created_at), timezone.utc).strftime("%Y-%m-%d")
+    except (TypeError, ValueError, OSError):
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    short_title = (live_title or channel_name or "live")[:60]
+    if channel_name:
+        return f"{channel_name} · {date_str} · {short_title}"[:100]
+    return f"{date_str} · {short_title}"[:100]
+
+
 def _approve_components(clip_id: str) -> list[dict[str, Any]]:
     return [
         {
@@ -162,6 +234,12 @@ def _approve_components(clip_id: str) -> list[dict[str, Any]]:
                     "style": 2,
                     "label": "Agendar: nao",
                     "custom_id": f"agendar:off:{clip_id}",
+                },
+                {
+                    "type": 2,
+                    "style": 4,
+                    "label": "Descartar",
+                    "custom_id": f"descartar:{clip_id}",
                 },
             ],
         },
@@ -505,14 +583,50 @@ def notify_discord(
             client = DiscordRest(token)
         supports_components = _post_supports_components(client)
 
+        live_id = (
+            str(
+                completed_job.get("live_id")
+                or job_dict.get("live_id")
+                or (manifest or {}).get("live_id")
+                or ""
+            ).strip()
+            or None
+        )
+        live_discord: dict[str, Any] = {}
+        live_ended = False  # live encerrada (coord.release): o cartao nao volta a "ao vivo" ao reusar
+        if live_id and mongo_db is not None and hasattr(mongo_db, "lives"):
+            try:
+                live_doc = mongo_db.lives.find_one({"_id": live_id})
+                if isinstance(live_doc, dict):
+                    live_ended = live_doc.get("status") == "ended"
+                if isinstance(live_doc, dict) and isinstance(live_doc.get("discord"), dict):
+                    live_discord = dict(live_doc["discord"])
+            except Exception as exc:
+                if _is_mongo_error(exc) or isinstance(exc, OSError):
+                    mongo_unreachable = True
+                else:
+                    print(
+                        f"[notificar] falha ao consultar live {live_id} ({_format_safe_err(exc, mongo_uri, token)})",
+                        flush=True,
+                    )
+
         thread_id = (
-            ((manifest or {}).get("discord") or {}).get("thread_id")
+            (live_discord.get("thread_id") if live_id else None)
+            or ((manifest or {}).get("discord") or {}).get("thread_id")
             or ((completed_job.get("discord") or {}).get("thread_id"))
             or next(
                 (c["discord"]["thread_id"] for c in clips if isinstance(c.get("discord"), dict) and c["discord"].get("thread_id")),
                 None,
             )
         )
+        header_msg_id = (
+            (live_discord.get("header_message_id") if live_id else None)
+            or ((manifest or {}).get("discord") or {}).get("header_message_id")
+            or ((completed_job.get("discord") or {}).get("header_message_id"))
+        )
+        created_live_header = False
+        # ponytail: thread legada (manifest/job sem doc em lives) tambem conta como reuso: o cartao vai para lives na 1a edicao
+        reused_live_header = bool(live_id and thread_id)
 
         def _record_error(exc: Exception) -> None:
             err_text = f"{type(exc).__name__}: {exc}".replace(token, "***")
@@ -527,16 +641,49 @@ def notify_discord(
                     )
             print(f"[discord] falha ao enviar previa ({err_text[-200:]})", flush=True)
 
+        def _save_live_discord(info: dict[str, Any]) -> None:
+            nonlocal mongo_unreachable
+            if not (live_id and mongo_db is not None and hasattr(mongo_db, "lives")):
+                return
+            try:
+                mongo_db.lives.update_one({"_id": live_id}, {"$set": {"discord": info}}, upsert=True)
+            except Exception as mexc:
+                if _is_mongo_error(mexc) or isinstance(mexc, OSError):
+                    mongo_unreachable = True
+                else:
+                    print(
+                        f"[notificar] falha ao gravar lives.discord ({_format_safe_err(mexc, mongo_uri, token)})",
+                        flush=True,
+                    )
+
         try:
             if not thread_id:
-                header_title = f"**{channel_name}** — {live_title}" if channel_name else f"**{live_title}**"
-                header = f"{header_title}\nClipes: {len(clips)}"
-                if live_url:
-                    header += f"\n{live_url}"
+                if live_id:
+                    header = _format_live_header(channel_name, live_title, len(clips), live_url, encerrada=live_ended)
+                    thread_name = _format_live_thread_name(channel_name, live_title, created_at)
+                else:
+                    header_title = f"**{channel_name}** — {live_title}" if channel_name else f"**{live_title}**"
+                    header = f"{header_title}\nClipes: {len(clips)}"
+                    if live_url:
+                        header += f"\n{live_url}"
+                    thread_name = f"{channel_name} · {live_title[:70]}" if channel_name else live_title[:70]
                 header_resp = client.post(target_channel, header[:2000])
                 header_msg_id = str(header_resp["id"])
-                thread_name = f"{channel_name} · {live_title[:70]}" if channel_name else live_title[:70]
                 thread_id = str(client.thread_from(target_channel, header_msg_id, thread_name, auto_archive_duration=1440))
+
+                if live_id:
+                    created_live_header = True
+                    live_discord = {
+                        "thread_id": thread_id,
+                        "header_message_id": header_msg_id,
+                        "header_channel_id": target_channel,
+                        "channel_id": target_channel,
+                        "clipes": len(clips),
+                        "channel": channel_name,
+                        "title": live_title,
+                        "url": live_url,
+                    }
+                    _save_live_discord(live_discord)
 
                 if manifest is not None and clips_json_path is not None:
                     manifest_discord = dict(manifest.get("discord") or {})
@@ -550,6 +697,7 @@ def notify_discord(
                     completed_job["discord"] = job_discord
                     _write_job(job_path, completed_job)
 
+            posted_now = 0
             for idx, clip in enumerate(clips, start=1):
                 try:
                     clip_id = str(clip.get("clip_id") or f"{video_id}_c{int(clip.get('index', idx)):02d}")
@@ -629,6 +777,7 @@ def notify_discord(
                         attach_path = None
 
                     msg_id = str(msg_resp["id"])  # type: ignore[index]
+                    posted_now += 1
                     clip["discord"] = {"thread_id": thread_id, "message_id": msg_id}
                     if manifest is not None and clips_json_path is not None:
                         manifest["clips"] = clips
@@ -639,6 +788,8 @@ def notify_discord(
                         job_clips = dict(job_discord.get("clips") or {})
                         job_clips[clip_id] = msg_id
                         job_discord["thread_id"] = thread_id
+                        if header_msg_id:
+                            job_discord["header_message_id"] = header_msg_id
                         job_discord["clips"] = job_clips
                         completed_job["discord"] = job_discord
                         _write_job(job_path, completed_job)
@@ -672,6 +823,60 @@ def notify_discord(
                             )
                 except Exception as exc:
                     _record_error(exc)
+
+            if live_id and posted_now > 0 and reused_live_header:
+                prev_count = int(live_discord.get("clipes") or 0)
+                new_total = prev_count + posted_now
+                card_ch = str(live_discord.get("header_channel_id") or live_discord.get("channel_id") or target_channel)
+                card_channel = str(live_discord.get("channel") or channel_name)
+                card_title = str(live_discord.get("title") or live_title)
+                card_url = str(live_discord.get("url") or live_url)
+                updated_header = _format_live_header(card_channel, card_title, new_total, card_url, encerrada=live_ended)
+                new_header_id = str(header_msg_id or "")
+                new_header_ch = card_ch
+                if new_header_id and hasattr(client, "edit"):
+                    try:
+                        client.edit(card_ch, new_header_id, updated_header)
+                    except Exception as eexc:
+                        if _is_404_error(eexc):
+                            resp_new = client.post(thread_id, updated_header)
+                            new_header_id = str(resp_new["id"])
+                            new_header_ch = thread_id
+                        else:
+                            _record_error(eexc)
+                elif not new_header_id:
+                    resp_new = client.post(thread_id, updated_header)
+                    new_header_id = str(resp_new["id"])
+                    new_header_ch = thread_id
+
+                live_discord.update({
+                    "thread_id": thread_id,
+                    "header_message_id": new_header_id,
+                    "header_channel_id": new_header_ch,
+                    "channel_id": live_discord.get("channel_id") or target_channel,
+                    "clipes": new_total,
+                    "channel": card_channel,
+                    "title": card_title,
+                    "url": card_url,
+                })
+                _save_live_discord(live_discord)
+                if manifest is not None and clips_json_path is not None:
+                    manifest_discord = dict(manifest.get("discord") or {})
+                    manifest_discord.update(thread_id=thread_id, header_message_id=new_header_id)
+                    manifest["discord"] = manifest_discord
+                    _write_json_atomic(clips_json_path, manifest)
+            elif live_id and created_live_header and posted_now != len(clips):
+                live_discord["clipes"] = posted_now
+                _save_live_discord(live_discord)
+                if header_msg_id and hasattr(client, "edit"):
+                    try:
+                        client.edit(
+                            target_channel,
+                            header_msg_id,
+                            _format_live_header(channel_name, live_title, posted_now, live_url, encerrada=False),
+                        )
+                    except Exception as eexc:
+                        _record_error(eexc)
         except Exception as exc:
             _record_error(exc)
 
@@ -685,17 +890,93 @@ def notify_discord(
                 pass
 
 
+def encerrar_cartao_live(
+    mongo_db: Any | None,
+    live_id: str | None,
+    *,
+    discord_client: Any | None = None,
+    discord_channel_id: str | None = None,
+) -> bool:
+    """Edita o cartao da live no Discord para '✅ encerrada' ao encerrar a live."""
+    if mongo_db is None or not live_id or not hasattr(mongo_db, "lives"):
+        return False
+    try:
+        doc = mongo_db.lives.find_one({"_id": live_id})
+    except Exception as exc:
+        print(f"[notificar] falha ao ler live {live_id} ({_format_safe_err(exc)})", flush=True)
+        return False
+    if not isinstance(doc, dict):
+        return False
+    d_info = doc.get("discord")
+    if not isinstance(d_info, dict) or not d_info.get("header_message_id"):
+        return False
+
+    token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+    client = discord_client
+    if client is None:
+        if not token:
+            return False
+        from .discord_rest import DiscordRest
+
+        client = DiscordRest(token)
+    if not hasattr(client, "edit"):
+        return False
+
+    target_ch = (
+        str(d_info.get("header_channel_id") or "").strip()
+        or str(d_info.get("channel_id") or "").strip()
+        or (discord_channel_id or "").strip()
+        or os.environ.get("DISCORD_CHANNEL_ID", "").strip()
+    )
+    if not target_ch:
+        return False
+
+    header_msg_id = str(d_info["header_message_id"])
+    thread_id = str(d_info.get("thread_id") or "")
+    channel_name = str(d_info.get("channel") or doc.get("channel") or "")
+    live_title = str(d_info.get("title") or doc.get("title") or live_id)
+    live_url = str(d_info.get("url") or doc.get("url") or "")
+    clipes = int(d_info.get("clipes") or 0)
+    text = _format_live_header(channel_name, live_title, clipes, live_url, encerrada=True)
+
+    try:
+        client.edit(target_ch, header_msg_id, text)
+        return True
+    except Exception as exc:
+        if _is_404_error(exc) and thread_id:
+            try:
+                resp = client.post(thread_id, text)
+                new_id = str(resp["id"])
+                mongo_db.lives.update_one(
+                    {"_id": live_id},
+                    {"$set": {
+                        "discord.header_message_id": new_id,
+                        "discord.header_channel_id": thread_id,
+                    }},
+                )
+                return True
+            except Exception as exc2:
+                print(f"[discord] falha ao recriar cartao encerrado ({_format_safe_err(exc2, token)})", flush=True)
+                return False
+        print(f"[discord] falha ao encerrar cartao ({_format_safe_err(exc, token)})", flush=True)
+        return False
+
+
 def post_aviso(
     texto: str,
     *,
     discord_client: Any | None = None,
     discord_channel_id: str | None = None,
 ) -> None:
-    """Post a short operational notice to DISCORD_CHANNEL_ID; no-op without env, logs errors safely."""
+    """Post a short operational notice to DISCORD_LOG_CHANNEL_ID (fallback DISCORD_CHANNEL_ID)."""
     token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
     if not token:
         return
-    target_channel = (discord_channel_id or os.environ.get("DISCORD_CHANNEL_ID", "")).strip()
+    target_channel = (
+        (discord_channel_id or "").strip()
+        or os.environ.get("DISCORD_LOG_CHANNEL_ID", "").strip()
+        or os.environ.get("DISCORD_CHANNEL_ID", "").strip()
+    )
     if not target_channel:
         return
     client = discord_client

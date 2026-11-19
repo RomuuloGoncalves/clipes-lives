@@ -137,8 +137,7 @@ def test_monitor_follow_dispatches_follow_live_with_policy_and_dirs(tmp_path, mo
     monkeypatch.setattr(monitor, "follow_live", fake_follow)
     monkeypatch.setattr(monitor, "run_monitor", fail_run_monitor)
 
-    rc = entry.main([
-        "monitor",
+    rc = monitor.main([
         "--follow", "https://www.twitch.tv/Gaules",
         "--policy-file", str(policy_path),
         "--out-dir", str(out_root),

@@ -200,3 +200,52 @@ def test_clipar_restarts_on_exit_75_and_stops_on_other_exit_code(tmp_path):
     assert res_1.returncode == 1
     assert len(log_1.read_text(encoding="utf-8").strip().splitlines()) == 1
     assert not sleep_log_1.exists()
+
+
+# ---- controle-discord T8: subcomando servico e comandos antigos removidos -----------------------
+
+
+def test_entry_main_servico_auth_bot_url_e_comandos_removidos(monkeypatch, capsys):
+    from clipes import __main__ as entry, acompanhar, bot, cli
+
+    # 1) servico roteia para acompanhar.main(argv[1:]) com prog "clipes servico"
+    seen_srv: list[list[str]] = []
+    monkeypatch.setattr(acompanhar, "main", lambda argv: (seen_srv.append(argv), 0)[1])
+    assert entry.main(["servico", "--out-dir", "/tmp/o"]) == 0
+    assert seen_srv == [["--out-dir", "/tmp/o"]]
+
+    monkeypatch.undo()
+    try:
+        entry.main(["servico", "--help"])
+    except SystemExit as exc:
+        assert exc.code == 0
+    help_out = capsys.readouterr().out
+    assert "clipes servico" in help_out
+
+    # 2) Comandos removidos saem com codigo 2 e mensagem exata
+    expected = "removido: use ./clipar servico (e /live adicionar no Discord)"
+    for cmd in (
+        ["monitor"],
+        ["monitor", "--follow", "gaules"],
+        ["acompanhar", "gaules"],
+        ["bench-live", "/tmp/job"],
+    ):
+        rc = entry.main(cmd)
+        cap = capsys.readouterr()
+        assert rc == 2, f"esperado codigo 2 para {cmd}"
+        assert expected in (cap.err + cap.out)
+
+    # 3) auth, bot e <url> continuam funcionando normalmente
+    seen_auth: list[list[str]] = []
+    seen_bot: list[list[str]] = []
+    seen_cli: list[list[str]] = []
+    monkeypatch.setattr(entry, "_auth", lambda argv: (seen_auth.append(argv), 0)[1])
+    monkeypatch.setattr(bot, "main", lambda argv: (seen_bot.append(argv), 0)[1])
+    monkeypatch.setattr(cli, "main", lambda argv: (seen_cli.append(argv), 0)[1])
+
+    assert entry.main(["auth", "youtube"]) == 0
+    assert seen_auth == [["youtube"]]
+    assert entry.main(["bot"]) == 0
+    assert seen_bot == [[]]
+    assert entry.main(["https://www.twitch.tv/videos/123"]) == 0
+    assert seen_cli == [["https://www.twitch.tv/videos/123"]]

@@ -108,7 +108,7 @@ def test_spike_is_captured_enqueued_and_processed_by_worker(tmp_path, monkeypatc
     assert job["status"] == "done" and job["score"] == 0.8
     assert job["ready_at"] == pytest.approx(job["created_at"] + 86400)
     assert processed == [job["job_id"]]
-    assert [p.cmd[3] for p in popen.pipelines()] == ["twitch.tv/canal"]  # rolling recorder on the chatty channel
+    assert [p.cmd[4] for p in popen.pipelines()] == ["twitch.tv/canal"]  # rolling recorder on the chatty channel
     assert all(p.returncode is not None for p in popen.procs)  # recorders stopped on shutdown
 
 
@@ -200,8 +200,8 @@ def test_python_m_clipes_monitor_dispatches_flags(tmp_path, fake_run_monitor):
     channels.write_text("gaules\nproibido\nalanzoka\n", encoding="utf-8")
     (tmp_path / "policy.json").write_text(json.dumps({"blocked": ["proibido"]}), encoding="utf-8")
 
-    code = entry.main([
-        "monitor", "--channels-file", str(channels), "--max-recorders", "2",
+    code = monitor.main([
+        "--channels-file", str(channels), "--max-recorders", "2",
         "--queue-dir", str(tmp_path / "fila"), "--out-dir", str(tmp_path / "out"), "--dry-run",
     ])
 
@@ -214,7 +214,7 @@ def test_python_m_clipes_monitor_dispatches_flags(tmp_path, fake_run_monitor):
 
 
 def test_monitor_without_channels_exits_2(tmp_path, fake_run_monitor):
-    assert entry.main(["monitor", "--channels-file", str(tmp_path / "nao_existe.txt")]) == 2
+    assert monitor.main(["--channels-file", str(tmp_path / "nao_existe.txt")]) == 2
     assert fake_run_monitor == []
 
 

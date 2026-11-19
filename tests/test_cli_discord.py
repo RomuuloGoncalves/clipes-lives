@@ -239,14 +239,15 @@ def test_cli_main_falha_discord_retorna_exit_0_sem_expor_token(tmp_path, monkeyp
     assert FAKE_TOKEN not in out
 
 
-def test_cli_ate_acabar_live_ativa_nao_chama_notify_do_cli(tmp_path, monkeypatch):
+def test_cli_ate_acabar_live_ativa_nao_chama_notify_do_cli(tmp_path, monkeypatch, capsys):
     calls: list[Any] = []
     monkeypatch.setattr(cli, "notify_discord", lambda *a, **kw: calls.append((a, kw)))
     monkeypatch.setattr(cli, "probe_metadata", lambda url: {"id": "live1", "is_live": True})
     monkeypatch.setattr(cli, "follow_live", lambda *a, **kw: {"status": "ended", "jobs": []})
 
     rc = cli.main(["https://www.twitch.tv/gaules", "--ate-acabar", "--out-dir", str(tmp_path / "out")])
-    assert rc == 0
+    assert rc == 2
+    assert "removido: use ./clipar servico (e /live adicionar no Discord)" in capsys.readouterr().err
     assert calls == []
 
 

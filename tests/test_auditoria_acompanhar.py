@@ -242,7 +242,7 @@ def test_a02_live_orfa_vencida_e_liberada_no_start_e_nao_bloqueia_max_lives(tmp_
 def test_a02_live_propria_com_lease_valida_continua_contando_no_max_lives(tmp_path, monkeypatch):
     clock = Clock(B + 10)
     monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
-    monkeypatch.setenv("CLIPES_MAX_LIVES", "1")
+    monkeypatch.setenv("CLIPES_SLOTS", "twitch=0,youtube=1")
 
     db = mongomock.MongoClient().db
     coord = Coord(db, "w-a02-v", now=clock.now, lease_s=90)
@@ -456,7 +456,7 @@ def test_m01_claim_negado_apos_reconexao_encerra_sessao_sem_marcar_ended(tmp_pat
 def test_m03_comando_liberar_para_pool_mata_filhos_solta_leases_e_sai_75(tmp_path, monkeypatch, capsys):
     clock = Clock(B + 10)
     monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
-    monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
+    monkeypatch.setenv("CLIPES_SLOTS", "twitch=2")
     monkeypatch.setenv("CLIPES_BEAT_S", "20")
 
     db = mongomock.MongoClient().db
@@ -753,7 +753,7 @@ def test_a03_perda_de_lease_durante_fechamento_de_janela_aborta_add_job_e_enqueu
 def test_m07_a03_multi_live_com_uma_lease_perdida_nao_processa_pending_da_perdida(tmp_path, monkeypatch):
     clock = Clock(B + 10)
     monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
-    monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
+    monkeypatch.setenv("CLIPES_SLOTS", "twitch=2")
     monkeypatch.setenv("CLIPES_BEAT_S", "20")
 
     db = mongomock.MongoClient().db

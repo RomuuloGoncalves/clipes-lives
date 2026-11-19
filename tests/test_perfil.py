@@ -102,7 +102,7 @@ def test_bench_live_short_source_exits_2_with_message(tmp_path, monkeypatch, cap
     short_dir = _make_job_dir(tmp_path, "short_cli")
     monkeypatch.setattr(perfil, "probe_duration", lambda p: 200.0)
 
-    rc = entry.main(["bench-live", str(short_dir)])
+    rc = entry._bench_live([str(short_dir)])
     captured = capsys.readouterr()
     assert rc == 2
     assert "300" in (captured.err + captured.out)
@@ -125,7 +125,7 @@ def test_bench_live_routes_to_perfil_medir_and_returns_zero(tmp_path, monkeypatc
     monkeypatch.setattr(monitor, "run_local_pipeline", fake_pipeline)
     monkeypatch.setattr(perfil.time, "perf_counter", lambda: clock_t[0])
 
-    rc = entry.main(["bench-live", str(job_dir)])
+    rc = entry._bench_live([str(job_dir)])
     captured = capsys.readouterr()
     assert rc == 0
     assert "max_lives=6" in captured.out

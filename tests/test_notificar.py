@@ -546,11 +546,17 @@ def test_notify_envia_botoes_publicar_com_custom_id_no_post_e_fallback_413(tmp_p
                         "label": "Agendar: nao",
                         "custom_id": f"agendar:off:{clip_id}",
                     },
+                    {
+                        "type": 2,
+                        "style": 4,
+                        "label": "Descartar",
+                        "custom_id": f"descartar:{clip_id}",
+                    },
                 ],
             },
         ]
 
-    # 413 fallback text post also keeps the 3 destination buttons + Agendar toggle
+    # 413 fallback text post also keeps the 3 destination buttons + Agendar toggle + Descartar
     class Client413(FakeDiscordClient):
         def post(self, channel_id, content, file=None, components=None):
             if file is not None:
@@ -580,7 +586,13 @@ def test_notify_envia_botoes_publicar_com_custom_id_no_post_e_fallback_413(tmp_p
             "style": 2,
             "label": "Agendar: nao",
             "custom_id": "agendar:off:vid413_c01",
-        }
+        },
+        {
+            "type": 2,
+            "style": 4,
+            "label": "Descartar",
+            "custom_id": "descartar:vid413_c01",
+        },
     ]
 
 
@@ -817,3 +829,180 @@ def test_notify_cabe_discord_false_nao_refaz_upload_e_oserror_faz_fallback(tmp_p
     assert man_rest["clips"][0]["cabe_discord"] is False
     assert man_rest["clips"][0]["discord"]["message_id"] == "msg-rest-4"
     assert rest_calls == [False, False, True, False]
+
+
+# --- T15: thread/cartao por live_id, cartao apagado (404), encerrada, mensagem enxuta e #bot-log ---
+
+
+def test_live_id_thread_unica_edita_cartao_404_e_encerra_no_release(tmp_path, monkeypatch):
+    import mongomock
+    from clipes.coord import Coord
+    from clipes.discord_rest import DiscordRestError
+
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+
+    class EditableDiscordClient(FakeDiscordClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.edits: list[dict[str, Any]] = []
+            self.fail_edit_404 = False
+
+        def edit(self, channel_id, message_id, content, components=None):
+            if self.fail_edit_404:
+                raise DiscordRestError("Discord HTTP 404: code=10008 Unknown Message", status=404, code=10008)
+            self.edits.append({
+                "channel_id": str(channel_id),
+                "message_id": str(message_id),
+                "content": content,
+                "components": components,
+            })
+            return {"id": str(message_id), "content": content}
+
+    db = mongomock.MongoClient().clipes_lives
+    coord = Coord(db, "w-pc1", now=lambda: 1_763_400_000.0)
+    live_id = "twitch:gaules:999001"
+    coord.ensure_live(live_id, channel="gaules", platform="twitch")
+    assert coord.claim_live(live_id) is True
+
+    client = EditableDiscordClient()
+    long_title = "Major de CS2 ao vivo com muita emocao e playoffs decisivos hoje a noite inteira"
+    created_ts = 1_763_400_000.0  # 2025-11-17 UTC
+
+    # Janela 1 (2 clipes) no PC-1 -> cria 1 cartao (🔴 ao vivo) + 1 thread e grava em lives.discord
+    w1_dir = _make_out_dir(
+        tmp_path / "w1",
+        [
+            {"index": 1, "clip_id": "w1_c01", "file": "c1.mp4", "title": "Clutch 1", "hook_top": "INSANO", "llm_score": 9.1, "title_source": "gemini", "caption": "Legenda removida", "hashtags": ["#cs2"], "description_long": "Descricao longa 1", "duration": 25.0},
+            {"index": 2, "clip_id": "w1_c02", "file": "c2.mp4", "title": "Clutch 2", "duration": 20.0},
+        ],
+    )
+    w1_man = json.loads((w1_dir / "clips.json").read_text(encoding="utf-8"))
+    w1_man["title"] = long_title
+    (w1_dir / "clips.json").write_text(json.dumps(w1_man, ensure_ascii=False), encoding="utf-8")
+    notify_discord(
+        w1_dir,
+        policy=ChannelPolicy(),
+        job={"job_id": "j1", "live_id": live_id, "channel": "gaules", "title": long_title, "url": "https://www.twitch.tv/gaules", "created_at": created_ts},
+        discord_client=client,
+        preview_fn=lambda s, d, c: s,
+        out_root=tmp_path / "w1",
+        mongo_db=db,
+    )
+
+    assert len(client.threads) == 1
+    assert client.threads[0]["name"] == f"gaules · 2025-11-17 · {long_title[:60]}"
+    assert len(client.posts) == 3
+    header_card = client.posts[0]["content"]
+    assert header_card == f"**gaules** — {long_title}\nClipes: 2\n🔴 ao vivo\nhttps://www.twitch.tv/gaules"
+
+    # Verifica mensagem enxuta na ordem exata e sem linhas proibidas (ORG-02 AC 1)
+    clip_msg = client.posts[1]["content"]
+    assert clip_msg.startswith("🟡 pendente — **Clutch 1**\n")
+    pos_estado = clip_msg.index("🟡 pendente")
+    pos_title = clip_msg.index("Clutch 1")
+    pos_id = clip_msg.index("`w1_c01`")
+    pos_hook = clip_msg.index("Gancho: INSANO")
+    pos_nota = clip_msg.index("Nota: 9.1 (gemini)")
+    pos_desc = clip_msg.index("Descricao: Descricao longa 1")
+    assert pos_estado < pos_title < pos_id < pos_hook < pos_nota < pos_desc
+    assert "Legenda:" not in clip_msg
+    assert "Legenda removida" not in clip_msg
+    assert "#cs2" not in clip_msg
+    assert "publicar w1_c01" not in clip_msg
+    assert "Policy:" not in clip_msg  # liberado nao polui
+
+    live_doc = db.lives.find_one({"_id": live_id})
+    assert live_doc["discord"]["thread_id"] == "thr-1"
+    assert live_doc["discord"]["header_message_id"] == "msg-1"
+    assert live_doc["discord"]["clipes"] == 2
+
+    # Janela 2 (1 clipe) de outro PC (outro diretorio, sem clips.json anterior) -> reutiliza thr-1 e edita cartao para Clipes: 3
+    w2_dir = _make_out_dir(
+        tmp_path / "w2",
+        [{"index": 1, "clip_id": "w2_c01", "file": "c3.mp4", "title": "Clutch 3", "duration": 22.0}],
+    )
+    notify_discord(
+        w2_dir,
+        policy=ChannelPolicy(),
+        job={"job_id": "j2", "live_id": live_id, "channel": "gaules", "url": "https://www.twitch.tv/gaules", "created_at": created_ts + 300},
+        discord_client=client,
+        preview_fn=lambda s, d, c: s,
+        out_root=tmp_path / "w2",
+        mongo_db=db,
+    )
+    assert len(client.threads) == 1  # nenhuma thread nova
+    assert client.posts[-1]["channel_id"] == "thr-1"
+    assert len(client.edits) == 1
+    assert client.edits[0]["channel_id"] == FAKE_CHANNEL
+    assert client.edits[0]["message_id"] == "msg-1"
+    assert "Clipes: 3" in client.edits[0]["content"]
+    assert "🔴 ao vivo" in client.edits[0]["content"]
+    assert db.lives.find_one({"_id": live_id})["discord"]["clipes"] == 3
+
+    # Janela 3 com cartao original apagado (404 no edit) -> posta novo cartao na mesma thread e atualiza header_message_id
+    client.fail_edit_404 = True
+    w3_dir = _make_out_dir(
+        tmp_path / "w3",
+        [{"index": 1, "clip_id": "w3_c01", "file": "c4.mp4", "title": "Clutch 4", "duration": 22.0}],
+    )
+    notify_discord(
+        w3_dir,
+        policy=ChannelPolicy(),
+        job={"job_id": "j3", "live_id": live_id, "channel": "gaules", "url": "https://www.twitch.tv/gaules", "created_at": created_ts + 600},
+        discord_client=client,
+        preview_fn=lambda s, d, c: s,
+        out_root=tmp_path / "w3",
+        mongo_db=db,
+    )
+    assert len(client.threads) == 1
+    new_card_post = client.posts[-1]
+    assert new_card_post["channel_id"] == "thr-1"
+    assert "Clipes: 4" in new_card_post["content"]
+    live_doc3 = db.lives.find_one({"_id": live_id})
+    assert live_doc3["discord"]["header_message_id"] == new_card_post["id"]
+    assert live_doc3["discord"]["clipes"] == 4
+
+    # Encerramento da live via Coord.release(live_id, ended=True) edita o novo cartao para ✅ encerrada
+    client.fail_edit_404 = False
+    coord.release(live_id, True, discord_client=client)
+    assert len(client.edits) == 2
+    assert client.edits[-1]["channel_id"] == "thr-1"
+    assert client.edits[-1]["message_id"] == new_card_post["id"]
+    assert "✅ encerrada" in client.edits[-1]["content"]
+    assert "🔴 ao vivo" not in client.edits[-1]["content"]
+    assert "Clipes: 4" in client.edits[-1]["content"]
+
+    # Janela que chega depois do encerramento (ainda na fila) reusa o cartao, mas ele continua encerrado
+    w4_dir = _make_out_dir(
+        tmp_path / "w4",
+        [{"index": 1, "clip_id": "w4_c01", "file": "c5.mp4", "title": "Clutch 5", "duration": 22.0}],
+    )
+    notify_discord(
+        w4_dir,
+        policy=ChannelPolicy(),
+        job={"job_id": "j4", "live_id": live_id, "channel": "gaules", "url": "https://www.twitch.tv/gaules", "created_at": created_ts + 900},
+        discord_client=client,
+        preview_fn=lambda s, d, c: s,
+        out_root=tmp_path / "w4",
+        mongo_db=db,
+    )
+    assert len(client.edits) == 3
+    assert "✅ encerrada" in client.edits[-1]["content"]
+    assert "🔴 ao vivo" not in client.edits[-1]["content"]
+    assert "Clipes: 5" in client.edits[-1]["content"]
+
+
+def test_post_aviso_usa_discord_log_channel_id_com_fallback(monkeypatch):
+    client = FakeDiscordClient()
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    monkeypatch.setenv("DISCORD_LOG_CHANNEL_ID", "777777777")
+
+    post_aviso("aviso no log", discord_client=client)
+    assert client.posts[-1]["channel_id"] == "777777777"
+
+    # Sem DISCORD_LOG_CHANNEL_ID (ou vazia) cai para DISCORD_CHANNEL_ID
+    monkeypatch.setenv("DISCORD_LOG_CHANNEL_ID", "   ")
+    post_aviso("aviso fallback", discord_client=client)
+    assert client.posts[-1]["channel_id"] == FAKE_CHANNEL

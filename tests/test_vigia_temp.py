@@ -239,3 +239,60 @@ def test_sensor_que_some_com_conteiner_pausado_despausa(tmp_path):
     log_text = log_file.read_text(encoding="utf-8")
     assert "sem-sensor pausado=1" in log_text
     assert "sem-sensor pausado=0" in log_text
+
+
+def test_vigia_temp_filtra_somente_service_clipes_sem_pausar_bot(tmp_path):
+    sysfs = tmp_path / "sys"
+    _write_file(sysfs / "class/hwmon/hwmon0/name", "k10temp\n")
+    _write_file(sysfs / "class/hwmon/hwmon0/temp1_input", "88000\n")
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    ps_log = tmp_path / "docker_ps.log"
+    docker_calls = tmp_path / "docker_calls.log"
+    _write_file(
+        bin_dir / "docker",
+        f"""#!/bin/sh
+cmd="$1"
+shift
+if [ "$cmd" = "ps" ]; then
+  echo "$*" >> "{ps_log}"
+  case "$*" in
+    *"label=com.docker.compose.service=clipes"*)
+      echo "cid_clipes"
+      ;;
+    *)
+      echo "cid_clipes cid_bot"
+      ;;
+  esac
+  exit 0
+fi
+echo "$cmd $*" >> "{docker_calls}"
+""",
+        mode=0o755,
+    )
+    _write_file(bin_dir / "sleep", "#!/bin/sh\n/bin/sleep 0.05\n", mode=0o755)
+
+    env = _base_env(tmp_path, sysfs, bin_dir)
+    env["CLIPES_TEMP_MAX"] = "85"
+    env["CLIPES_TEMP_MIN"] = "75"
+
+    proc = subprocess.Popen([str(VIGIA_PATH)], env=env)
+    try:
+        _wait_until(
+            lambda: docker_calls.exists()
+            and "pause cid_clipes" in docker_calls.read_text(encoding="utf-8")
+        )
+    finally:
+        proc.send_signal(signal.SIGTERM)
+        proc.wait(timeout=5)
+
+    ps_lines = ps_log.read_text(encoding="utf-8").splitlines()
+    assert ps_lines
+    for line in ps_lines:
+        assert "label=com.docker.compose.project=clipes-lives" in line
+        assert "label=com.docker.compose.service=clipes" in line
+    calls = docker_calls.read_text(encoding="utf-8")
+    assert "cid_bot" not in calls
+    assert "pause cid_clipes" in calls
+    assert "unpause cid_clipes" in calls

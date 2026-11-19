@@ -48,8 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-dur", type=float, default=65.0, help="Duração máxima do clipe em s (padrão: 65)")
     p.add_argument("--live-minutes", type=float, default=20.0,
                    help="Minutos a gravar se a URL for uma live ativa (padrão: 20)")
-    p.add_argument("--ate-acabar", action="store_true",
-                   help="Se a URL for uma live ativa, clipa em janelas contínuas até ela acabar")
+    p.add_argument("--ate-acabar", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--chat", action=argparse.BooleanOptionalAction, default=True,
                    help="Usar sinal de chat replay quando disponível (padrão: --chat)")
     p.add_argument("--whisper-model", default=None,
@@ -315,6 +314,9 @@ def _apply_speech_gate(clips: list[Any], words: list[Word]) -> list[Any]:
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
+    if getattr(args, "ate_acabar", False):
+        print("removido: use ./clipar servico (e /live adicionar no Discord)", file=sys.stderr, flush=True)
+        return 2
     if args.min_dur <= 0 or args.max_dur <= args.min_dur:
         print("Erro: --min-dur deve ser > 0 e menor que --max-dur.", file=sys.stderr)
         return 2
@@ -324,28 +326,6 @@ def run_pipeline(args: argparse.Namespace) -> int:
 
     out_root = config.resolve_out_dir(args.out_dir)
     cloud_llm.set_out_dir(out_root)
-    if getattr(args, "ate_acabar", False):
-        meta = probe_metadata(args.url)
-        if bool(meta.get("is_live")):
-            out_root.mkdir(parents=True, exist_ok=True)
-            print(f"[live] Live ativa detectada; acompanhando até acabar: {args.url}", flush=True)
-            follow_kwargs: dict[str, Any] = {}
-            sig_params = inspect.signature(follow_live).parameters
-            has_varkw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values())
-            if has_varkw or "max_dur" in sig_params:
-                follow_kwargs["max_dur"] = args.max_dur
-            if (has_varkw or "stream_id" in sig_params) and isinstance(meta, dict) and meta.get("id"):
-                follow_kwargs["stream_id"] = str(meta["id"])
-            if has_varkw or "coord" in sig_params:
-                if os.environ.get("CLIPES_MONGO_URI", "").strip():
-                    from .monitor import _connect_coord_for_follow
-
-                    follow_kwargs["coord"] = _connect_coord_for_follow(out_root)
-                else:
-                    follow_kwargs["coord"] = None
-            follow_live(args.url, out_root, **follow_kwargs)
-            args._followed_live = True
-            return 0
 
     timings: dict[str, float] = {}
 

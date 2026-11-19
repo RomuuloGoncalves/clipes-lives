@@ -1,4 +1,4 @@
-"""Tests for --ate-acabar CLI option (T26 / LIVE-02)."""
+"""Tests for removed --ate-acabar CLI option and intact VOD / --live-minutes flows (UNI-01 AC 4)."""
 
 from __future__ import annotations
 
@@ -9,6 +9,8 @@ import numpy as np
 
 from clipes import cli
 from clipes.models import IngestResult
+
+REMOVED_MSG = "removido: use ./clipar servico (e /live adicionar no Discord)"
 
 
 def _make_ing(tmp_path: Path, video_id: str = "vod1") -> IngestResult:
@@ -38,61 +40,49 @@ def _make_ing(tmp_path: Path, video_id: str = "vod1") -> IngestResult:
     )
 
 
-def test_parser_has_ate_acabar_and_preserves_live_minutes():
-    default_args = cli.build_parser().parse_args(["https://www.twitch.tv/gaules"])
+def test_parser_esconde_ate_acabar_na_ajuda_e_preserva_live_minutes():
+    parser = cli.build_parser()
+    assert "--ate-acabar" not in parser.format_help()
+
+    default_args = parser.parse_args(["https://www.twitch.tv/gaules"])
     assert default_args.ate_acabar is False
     assert default_args.live_minutes == 20.0
 
-    args = cli.build_parser().parse_args([
-        "https://www.twitch.tv/gaules", "--ate-acabar", "--live-minutes", "15",
-    ])
-    assert args.ate_acabar is True
+    args = parser.parse_args(["https://www.twitch.tv/gaules", "--live-minutes", "15"])
     assert args.live_minutes == 15.0
 
 
-def test_ate_acabar_with_active_live_delegates_to_follow_live(tmp_path: Path, monkeypatch):
-    out_root = tmp_path / "out"
-    probed: list[str] = []
-    followed: list[dict] = []
+def test_ate_acabar_sai_codigo_2_sem_chamar_follow_live_nem_ingest(tmp_path: Path, monkeypatch, capsys):
+    def fail_probe(url: str):
+        raise AssertionError("probe_metadata must not be called when --ate-acabar is removed")
 
-    def fake_probe(url: str):
-        probed.append(url)
-        return {"id": "live1", "is_live": True}
-
-    def fake_follow(url: str, root: Path, **kwargs):
-        followed.append({"url": url, "out_root": root, "kwargs": kwargs})
-        return {"status": "ended", "jobs": ["gaules_100"]}
+    def fail_follow(*args, **kwargs):
+        raise AssertionError("follow_live must not be called when --ate-acabar is removed")
 
     def fail_ingest(**kwargs):
-        raise AssertionError("ingest must not be called when --ate-acabar handles an active live")
+        raise AssertionError("ingest must not be called when --ate-acabar is removed")
 
-    monkeypatch.setattr(cli, "probe_metadata", fake_probe)
-    monkeypatch.setattr(cli, "follow_live", fake_follow)
+    monkeypatch.setattr(cli, "probe_metadata", fail_probe)
+    monkeypatch.setattr(cli, "follow_live", fail_follow)
     monkeypatch.setattr(cli, "ingest", fail_ingest)
 
     rc = cli.main([
         "https://www.twitch.tv/gaules",
         "--ate-acabar",
-        "--out-dir", str(out_root),
-        "--max-dur", "55",
+        "--out-dir", str(tmp_path / "out"),
     ])
 
-    assert rc == 0
-    assert probed == ["https://www.twitch.tv/gaules"]
-    assert len(followed) == 1
-    assert followed[0]["url"] == "https://www.twitch.tv/gaules"
-    assert followed[0]["out_root"] == out_root.resolve()
-    assert followed[0]["kwargs"].get("max_dur") == 55.0
+    cap = capsys.readouterr()
+    assert rc == 2
+    assert REMOVED_MSG in (cap.err + cap.out)
 
 
-def test_ate_acabar_without_active_live_runs_normal_pipeline(tmp_path: Path, monkeypatch):
+def test_vod_sem_ate_acabar_roda_pipeline_normal(tmp_path: Path, monkeypatch):
     ing = _make_ing(tmp_path)
     ingest_calls: list[dict] = []
 
-    monkeypatch.setattr(cli, "probe_metadata", lambda url: {"id": "vod1", "is_live": False})
-
     def fail_follow(*args, **kwargs):
-        raise AssertionError("follow_live must not be called when stream is not live")
+        raise AssertionError("follow_live must not be called for VOD")
 
     monkeypatch.setattr(cli, "follow_live", fail_follow)
     monkeypatch.setattr(cli, "ingest", lambda **kwargs: (ingest_calls.append(kwargs), ing)[1])
@@ -101,7 +91,6 @@ def test_ate_acabar_without_active_live_runs_normal_pipeline(tmp_path: Path, mon
 
     rc = cli.main([
         "https://www.twitch.tv/videos/123",
-        "--ate-acabar",
         "--out-dir", str(tmp_path / "out"),
         "--no-llm",
         "--skip-render",
@@ -145,61 +134,17 @@ def test_without_ate_acabar_keeps_live_minutes_flow_intact(tmp_path: Path, monke
     assert (ing.out_dir / "clips.json").is_file()
 
 
-def test_ate_acabar_invalid_duration_exits_2_before_probing(monkeypatch):
+def test_ate_acabar_com_min_dur_invalido_sai_2_sem_probing(monkeypatch, capsys):
     monkeypatch.setattr(
         cli, "probe_metadata",
-        lambda url: (_ for _ in ()).throw(AssertionError("probe_metadata must not run on invalid args")),
+        lambda url: (_ for _ in ()).throw(AssertionError("probe_metadata must not run")),
     )
     monkeypatch.setattr(
         cli, "follow_live",
-        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("follow_live must not run on invalid args")),
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("follow_live must not run")),
     )
 
     rc = cli.main(["https://www.twitch.tv/gaules", "--ate-acabar", "--min-dur", "0"])
+    cap = capsys.readouterr()
     assert rc == 2
-
-
-def test_ate_acabar_com_uri_passa_coord_para_follow_live_e_sem_uri_segue_local(tmp_path: Path, monkeypatch):
-    """Achado 1: `--ate-acabar` builds Coord when CLIPES_MONGO_URI is set, and never imports pymongo without URI."""
-    import os
-    import subprocess
-    import sys
-
-    import mongomock
-    import pymongo
-
-    from clipes.coord import Coord
-
-    client = mongomock.MongoClient()
-    monkeypatch.setenv("CLIPES_MONGO_URI", "mongodb+srv://user:secret@cluster0.example.mongodb.net/clipes_lives")
-    monkeypatch.setattr(pymongo, "MongoClient", lambda *a, **kw: client)
-    monkeypatch.setattr(cli, "probe_metadata", lambda url: {"id": "live777", "is_live": True})
-
-    seen: list[dict] = []
-
-    def fake_follow(url: str, root: Path, **kwargs):
-        seen.append(kwargs)
-        return {"status": "ended", "jobs": []}
-
-    monkeypatch.setattr(cli, "follow_live", fake_follow)
-
-    rc = cli.main(["https://www.twitch.tv/gaules", "--ate-acabar", "--out-dir", str(tmp_path / "out")])
-    assert rc == 0
-    assert len(seen) == 1
-    assert isinstance(seen[0].get("coord"), Coord)
-    assert seen[0].get("stream_id") == "live777"
-
-    script = (
-        "import sys, tempfile\n"
-        "from clipes import cli\n"
-        "seen = []\n"
-        "cli.probe_metadata = lambda url: {'id': 'live1', 'is_live': True}\n"
-        "cli.follow_live = lambda url, out, **kw: (seen.append(kw), {'status': 'ended', 'jobs': []})[1]\n"
-        "with tempfile.TemporaryDirectory() as td:\n"
-        "    rc = cli.main(['https://www.twitch.tv/gaules', '--ate-acabar', '--out-dir', td])\n"
-        "assert rc == 0 and len(seen) == 1 and seen[0].get('coord') is None\n"
-        "assert 'pymongo' not in sys.modules\n"
-    )
-    env = {k: v for k, v in os.environ.items() if k != "CLIPES_MONGO_URI"}
-    res = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, check=False)
-    assert res.returncode == 0, res.stderr + res.stdout
+    assert REMOVED_MSG in (cap.err + cap.out)

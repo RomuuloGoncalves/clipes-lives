@@ -449,7 +449,7 @@ def test_max_lives_1_com_uma_live_propria_nao_reivindica_outra(tmp_path):
     assert claimed_calls == ["twitch:canal1:111"]
     assert db.lives.find_one({"_id": "twitch:canal1:111"})["status"] == "live"
     assert db.lives.find_one({"_id": "twitch:canal2:222"}) is None
-    assert [p.cmd[3] for p in popen.pipelines()] == ["twitch.tv/canal1"]
+    assert [p.cmd[4] for p in popen.pipelines()] == ["twitch.tv/canal1"]
 
 
 def test_espera_proporcional_a_1_sobre_score_antes_do_claim(tmp_path):
@@ -1263,6 +1263,152 @@ def test_run_monitor_chama_capacity_fora_do_event_loop(tmp_path):
         coord=coord, capacity_fn=slow_cap,
     ))
     assert cap_threads and all(tid != main_tid for tid in cap_threads)
+
+
+# ---- controle-discord T5: worker=False, slots["busca"], origem="busca" e exclusao <= 30s --------
+
+
+def test_t5_worker_false_sem_lock_sem_worker_heartbeat_publish_e_respeita_slots_busca(tmp_path, monkeypatch):
+    clock = Clock()
+    monkeypatch.setenv("CLIPES_SLOTS", "twitch=0,kick=0,youtube=0,busca=1")
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-prod", now=clock, lease_s=90)
+    coord.ensure_indexes()
+
+    beat_calls: list = []
+    orig_beat = coord.beat
+    coord.beat = lambda *a, **k: (beat_calls.append((a, k)), orig_beat(*a, **k))[1]
+
+    out_root = tmp_path / "out"
+    queue_root = tmp_path / "q"
+    monitor.DiskQueue(queue_root)
+    # Lock ja detido pelo Supervisor: worker=False NAO pode tentar adquirir _lock_worker
+    held_lock = monitor._lock_worker(queue_root)
+
+    async def fake_capture(pool, detector, event, staging_root, *, now, sleep):
+        return make_staged_job(staging_root, channel=event.channel, peak=int(event.peak_ts))
+
+    monkeypatch.setattr(monitor, "capture_job", fake_capture)
+
+    async def irc(channels, on_message, stop):
+        while clock() < T0 + 70:
+            await clock.sleep(1)
+        for i in range(12):
+            on_message("canal_a", clock(), f"u{i % 6}", "KKKK")
+        # canal_b tambem ativo no chat, mas busca=1 nao deve clamar segunda live
+        for i in range(5):
+            on_message("canal_b", clock(), f"v{i % 3}", "oi")
+        await stop.wait()
+
+    pipe_calls: list[str] = []
+    pub_calls: list[int] = []
+    pending_dir = queue_root / "pending"
+    try:
+        asyncio.run(run_until(
+            lambda: pending_dir.is_dir() and len(list(pending_dir.iterdir())) >= 1 and clock() >= T0 + 95,
+            channels=["canal_a", "canal_b"],
+            out_root=out_root,
+            policy=monitor.ChannelPolicy(),
+            queue_root=queue_root,
+            irc=irc,
+            popen=FakePopen(),
+            pipeline=lambda j, o: (pipe_calls.append(j.name), {"clips": []})[1],
+            now=clock,
+            sleep=clock.sleep,
+            coord=coord,
+            stream_ids={"canal_a": "101", "canal_b": "202"},
+            capacity_fn=lambda _: {"cpus": 4, "score": 30},
+            run_pending_fn=lambda *a, **k: (pub_calls.append(1), [])[1],
+            worker=False,
+        ))
+    finally:
+        held_lock.close()
+
+    assert pipe_calls == []  # worker_loop nao rodou
+    assert beat_calls == []  # heartbeat_loop nao rodou
+    assert pub_calls == []   # PublishLoop nao rodou
+    pending_jobs = list(pending_dir.iterdir())
+    assert len(pending_jobs) == 1
+    job = monitor._read_job(pending_jobs[0])
+    assert job["origem"] == "busca"
+    assert job["live_id"] == "twitch:canal_a:101"
+    # canal_b nao foi reclamado pois busca=1 estava ocupado
+    assert db.lives.find_one({"_id": "twitch:canal_b:202"}) is None
+
+
+def test_t5_excluir_ignora_pico_e_solta_canal_quente_em_ate_30s(tmp_path, monkeypatch):
+    clock = Clock()
+    monkeypatch.setenv("CLIPES_SLOTS", "twitch=1,kick=0,youtube=0,busca=2")
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-busca-excl", now=clock, lease_s=90)
+    coord.ensure_indexes()
+
+    captured_channels: list[str] = []
+
+    async def fake_capture(pool, detector, event, staging_root, *, now, sleep):
+        captured_channels.append(event.channel)
+        return make_staged_job(staging_root, channel=event.channel, peak=int(event.peak_ts))
+
+    monkeypatch.setattr(monitor, "capture_job", fake_capture)
+
+    excl_local: set[str] = {"canal_ignorado"}
+    added_at = [None]
+    released_at = [None]
+
+    async def irc(channels, on_message, stop):
+        # Mantem canal_quente ativo no chat para virar hot e ganhar lease
+        while clock() < T0 + 130:
+            on_message("canal_quente", clock(), "u1", "oi")
+            if clock() == T0 + 70:
+                # Pico em canal excluido deve ser ignorado sem gravar
+                for i in range(12):
+                    on_message("canal_ignorado", clock(), f"u{i % 6}", "KKKK")
+            if added_at[0] is None:
+                doc = db.lives.find_one({"_id": "twitch:canal_quente:501"})
+                if doc is not None and doc["owner"] == "w-busca-excl":
+                    added_at[0] = clock()
+                    # Outro PC / bot adiciona canal_quente como alvo ativo em alvos
+                    db.alvos.insert_one({
+                        "_id": "canal_quente",
+                        "tipo": "live",
+                        "plataforma": "twitch",
+                        "entrada": "canal_quente",
+                        "estado": "ativo",
+                        "owner": None,
+                        "lease_until": None,
+                    })
+            if added_at[0] is not None and released_at[0] is None:
+                doc = db.lives.find_one({"_id": "twitch:canal_quente:501"})
+                if doc is not None and doc["owner"] is None:
+                    released_at[0] = clock()
+                    stop.set()
+                    return
+            await clock.sleep(1)
+        stop.set()
+
+    asyncio.run(monitor.run_monitor(
+        ["canal_quente", "canal_ignorado"],
+        tmp_path / "out",
+        monitor.ChannelPolicy(),
+        queue_root=tmp_path / "q",
+        irc=irc,
+        popen=FakePopen(),
+        now=clock,
+        sleep=clock.sleep,
+        coord=coord,
+        stream_ids={"canal_quente": "501", "canal_ignorado": "502"},
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+        worker=False,
+        excluir=lambda: set(excl_local),
+    ))
+
+    assert "canal_ignorado" not in captured_channels
+    assert db.lives.find_one({"_id": "twitch:canal_ignorado:502"}) is None
+    assert added_at[0] is not None
+    assert released_at[0] is not None
+    assert released_at[0] - added_at[0] <= 30.0
 
 
 

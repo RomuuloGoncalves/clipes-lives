@@ -1,9 +1,12 @@
-"""Module entrypoint for `python -m clipes` (`monitor`, `bench-live`, `bot`, and `auth` subcommands)."""
+"""Module entrypoint for `python -m clipes` (`servico`, `bot`, `auth`, and `<url>`)."""
 
 import argparse
 import os
 import sys
 from pathlib import Path
+
+REMOVED_CMD_MSG = "removido: use ./clipar servico (e /live adicionar no Discord)"
+_REMOVED_CMDS = {"monitor", "acompanhar", "bench-live"}
 
 
 def _auth(argv: list[str]) -> int:
@@ -68,16 +71,13 @@ def _bench_live(argv: list[str]) -> int:
 
 
 def main(argv: list[str]) -> int:
-    if argv[:1] == ["monitor"]:
-        from .monitor import main as monitor_main  # keeps ASR/render imports out of the IRC process
-
-        return monitor_main(argv[1:])
-    if argv[:1] == ["acompanhar"]:
+    if argv[:1] == ["servico"]:
         from .acompanhar import main as acompanhar_main
 
         return acompanhar_main(argv[1:])
-    if argv[:1] == ["bench-live"]:
-        return _bench_live(argv[1:])
+    if argv[:1] and argv[0] in _REMOVED_CMDS:
+        print(REMOVED_CMD_MSG, file=sys.stderr, flush=True)
+        return 2
     if argv[:1] == ["bot"]:
         from .bot import main as bot_main
 

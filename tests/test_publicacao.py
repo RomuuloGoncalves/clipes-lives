@@ -12,6 +12,7 @@ from typing import Any
 import mongomock
 import pytest
 
+from clipes import publicacao
 from clipes.monitor import ChannelPolicy
 from clipes.publicacao import LocalStore, MongoStore, find_clip, quota_ok, request, run_pending
 
@@ -1331,6 +1332,140 @@ def test_run_pending_finishes_ok_even_if_registro_or_clips_json_write_fails(
     assert "[publicacao]" in out
     assert SECRET_ACCESS not in out
     assert SECRET_REFRESH not in out
+
+
+# --- T16 (ORG-02 AC 3, 5): clipe descartado bloqueia publicacao; conclusao edita a linha de estado ---
+
+
+class _FakeDiscordMsg:
+    def __init__(self, content: str, *, fail_get: bool = False):
+        self.content = content
+        self.fail_get = fail_get
+        self.edits: list[str] = []
+
+    def get_message(self, channel_id: str, message_id: str) -> dict[str, Any]:
+        if self.fail_get:
+            raise RuntimeError("discord fora do ar")
+        return {"content": self.content}
+
+    def edit(self, channel_id: str, message_id: str, content: str) -> None:
+        self.edits.append(content)
+        self.content = content
+
+
+def test_request_recusa_clipe_descartado_sem_enfileirar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from clipes.registro import Registro
+    import hashlib
+
+    _make_clip_fixture(tmp_path)
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"refresh_token": SECRET_REFRESH}})
+
+    # Create registro record with matching file hash, then mark as descartado
+    mp4_path = tmp_path / "2026-11-17 - Live [live1]" / "clip_01_jogada_epica.mp4"
+    file_bytes = mp4_path.read_bytes()
+    file_sha = hashlib.sha256(file_bytes).hexdigest()
+    file_size = len(file_bytes)
+
+    reg = Registro(tmp_path)
+    reg.upsert({
+        "clip_id": "live1_c01",
+        "titulo": "Jogada epica!",
+        "canal": "gaules",
+        "arquivo": str(mp4_path.relative_to(tmp_path)),
+        "tamanho": file_size,
+        "sha256": file_sha,
+    })
+    reg.marcar("live1_c01", status="descartado")
+
+    res = request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    assert res == "clipe descartado"
+    assert store.get_request("live1_c01", "youtube") is None
+    assert store.find_pending() == []
+
+
+def test_run_pending_ok_edita_linha_de_estado_para_publicado(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _make_clip_fixture(tmp_path)
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"refresh_token": SECRET_REFRESH, "access_token": SECRET_ACCESS}})
+    client = _FakeDiscordMsg("🗓️ agendado (2026-11-20 10:00) — **Jogada epica!**\nID: `live1_c01`")
+
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path, platforms=("youtube",))
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": lambda mp4, title, desc, token: {"video_id": "yt777", "privacyStatus": "private"}},
+        discord_client=client,
+    )
+
+    assert outcomes[0]["status"] == "ok"
+    assert client.edits == ["✅ publicado (YouTube) — **Jogada epica!**\nID: `live1_c01`"]
+
+
+def test_run_pending_nao_publica_clipe_descartado_depois_de_enfileirado(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import hashlib
+    from clipes.registro import Registro
+
+    _make_clip_fixture(tmp_path)
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"refresh_token": SECRET_REFRESH, "access_token": SECRET_ACCESS}})
+    mp4_path = tmp_path / "2026-11-17 - Live [live1]" / "clip_01_jogada_epica.mp4"
+    file_bytes = mp4_path.read_bytes()
+    reg = Registro(tmp_path)
+    reg.upsert({
+        "clip_id": "live1_c01", "titulo": "Jogada epica!", "canal": "gaules",
+        "arquivo": str(mp4_path.relative_to(tmp_path)), "tamanho": len(file_bytes),
+        "sha256": hashlib.sha256(file_bytes).hexdigest(),
+    })
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path, platforms=("youtube",))
+    assert store.find_pending() != []
+    reg.marcar("live1_c01", status="descartado")  # descartado depois do aceite
+
+    chamadas: list[str] = []
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": lambda mp4, title, desc, token: chamadas.append(mp4) or {"video_id": "yt9"}},
+    )
+    assert chamadas == []
+    assert outcomes[0]["status"] == "erro"
+
+
+def test_run_pending_falha_ao_editar_estado_nao_vira_erro(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _make_clip_fixture(tmp_path)
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {"youtube": {"refresh_token": SECRET_REFRESH, "access_token": SECRET_ACCESS}})
+
+    def boom(**_kwargs: Any) -> None:
+        raise RuntimeError("falha na edicao")
+
+    monkeypatch.setattr(publicacao, "_edit_published_status_message", boom)
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path, platforms=("youtube",))
+    outcomes = run_pending(
+        store,
+        "w-pc1",
+        out_root=tmp_path,
+        now=T0,
+        tokens_path=tokens_path,
+        publishers={"youtube": lambda mp4, title, desc, token: {"video_id": "yt778", "privacyStatus": "private"}},
+    )
+
+    assert [o["status"] for o in outcomes] == ["ok"]
+    assert store.get_request("live1_c01", "youtube")["status"] == "ok"
 
 
 

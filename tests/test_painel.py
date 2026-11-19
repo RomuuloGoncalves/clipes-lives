@@ -366,3 +366,128 @@ def test_status_serializa_history_com_datetime_em_json(db):
     ws = {w["id"]: w for w in r["workers"]}
     assert ws["w-2"]["history"] == [{"t": NOW.isoformat() + "Z", "cpu_pct": 12.5, "temp_c": 55}]
     json.dumps(r)  # nao pode levantar TypeError (500 no /api/status)
+
+
+# ---- T17: slots, fila e alvos
+def test_status_inclui_slots_fila_e_alvos(db):
+    db.workers.update_one({"_id": "w-2"}, {"$set": {
+        "slots": {"twitch": 2, "kick": 0}, "ocupados": {"twitch": 1}, "fila": {"janelas": 1, "busca": 0}}})
+    assert _nucleo.criar_alvo(db, "fulano", "PC-2", NOW) == (201, {"ok": True, "_id": "fulano"})
+    assert _nucleo.criar_alvo(db, "twitch.tv/outro", "", NOW + timedelta(seconds=1))[0] == 201
+    assert _nucleo.criar_alvo(db, "kick.com/terceiro", "", NOW + timedelta(seconds=2))[0] == 201
+    assert _nucleo.remover_alvo(db, "kick_terceiro")[0] == 200
+
+    r = _nucleo.status(db, NOW)
+    ws = {w["id"]: w for w in r["workers"]}
+    assert ws["w-2"]["slots"] == {"twitch": 2, "kick": 0}
+    assert ws["w-2"]["ocupados"] == {"twitch": 1}
+    assert ws["w-2"]["fila"] == {"janelas": 1, "busca": 0}
+    assert ws["w-1"]["slots"] is None and ws["w-1"]["fila"] is None
+    assert [a["_id"] for a in r["alvos"]] == ["fulano", "outro"]  # removido nao aparece
+    assert r["alvos"][0] == {"_id": "fulano", "plataforma": "twitch", "entrada": "fulano",
+                             "owner": None, "pc_fixo": "PC-2", "fase": "sem vaga"}
+    json.dumps(r)
+
+
+PARIDADE_ALVOS = [
+    "twitch.tv/Fulano", "https://www.twitch.tv/fulano_1", "fulano", "@Fulano", "twitch.tv/a/b",
+    "twitch.tv/", "https://m.twitch.tv/x-y", "youtube.com/watch?v=abcd1234",
+    "https://www.youtube.com/watch?v=abcd1234&t=1", "youtube.com/watch", "youtu.be/abcd1234",
+    "youtu.be/ab", "https://www.youtube.com/live/abcd1234", "youtube.com/@Canal.X/live",
+    "youtube.com/@canal", "https://kick.com/Slug-x", "kick.com/ab", "kick.com/a", "kick.com:443/slug",
+    "https://user:pw@kick.com/slug", "ftp://kick.com/slug", "kick.com/slug;x", "kick.com/categories",
+    "https://m.kick.com/xqc", "kick.com:443/slug", "x y", "", "@", "a.b",
+    "https://example.com/abc", "https://twitch.tv/nome com",
+]
+
+
+@pytest.mark.parametrize("entrada", PARIDADE_ALVOS)
+def test_parse_alvo_paridade_com_o_bot(entrada):
+    # O painel nao importa clipes (Vercel); aqui conferimos que o espelho aceita/recusa e normaliza igual ao bot.
+    from clipes import bot
+
+    try:
+        esperado = bot._parse_live_alvo(entrada)
+    except ValueError:
+        esperado = None
+    got = _nucleo._parse_alvo(entrada)
+    if esperado is None:
+        assert got is None
+    else:
+        assert got == {"plataforma": esperado.plataforma, "chave": esperado.chave,
+                       "canal": esperado.canal, "url": esperado.url}
+
+
+def test_criar_alvo_valida_duplicado_e_grava_doc_como_o_bot(db):
+    assert _nucleo.criar_alvo(db, "https://x.invalid/nope", "", NOW) == (400, {"erro": "alvo invalido"})
+    assert _nucleo.criar_alvo(db, "  ", "", NOW) == (400, {"erro": "alvo invalido"})
+    assert _nucleo.criar_alvo(db, "twitch.tv/Fulano", " PC-1 ", NOW) == (201, {"ok": True, "_id": "fulano"})
+    doc = db.alvos.find_one({"_id": "fulano"})
+    assert doc == {"_id": "fulano", "tipo": "live", "plataforma": "twitch", "entrada": "fulano",
+                   "canal": "fulano", "url": None, "estado": "ativo", "pc_fixo": "PC-1", "owner": None,
+                   "lease_until": None, "fase": "sem vaga", "criado_por": "painel", "criado_em": NOW,
+                   "erro": None}
+    assert _nucleo.criar_alvo(db, "fulano", "", NOW) == (409, {"erro": "alvo ja acompanhado"})
+
+    assert _nucleo.criar_alvo(db, "youtu.be/abcd1234", "", NOW)[0] == 201
+    yt = db.alvos.find_one({"_id": "yt_abcd1234"})
+    assert yt["entrada"] == "https://www.youtube.com/watch?v=abcd1234" and yt["pc_fixo"] is None
+
+
+def test_criar_alvo_limite_30_ativos_e_remover(db):
+    db.alvos.insert_many([{"_id": f"t{i}", "tipo": "live", "estado": "ativo"} for i in range(30)])
+    assert _nucleo.criar_alvo(db, "fulano", "", NOW) == (409, {"erro": "limite de 30 alvos ativos atingido"})
+    db.alvos.update_one({"_id": "t0"}, {"$set": {"estado": "removido"}})
+    assert _nucleo.criar_alvo(db, "fulano", "", NOW)[0] == 201
+
+    assert _nucleo.remover_alvo(db, "fulano") == (200, {"ok": True})
+    assert db.alvos.find_one({"_id": "fulano"})["estado"] == "removido"
+    assert _nucleo.remover_alvo(db, "fulano") == (404, {"erro": "alvo nao encontrado"})
+    assert _nucleo.remover_alvo(db, "") == (400, {"erro": "alvo invalido"})
+    assert _nucleo.gerir_alvo(db, {"acao": "xyz"}, NOW) == (400, {"erro": "acao invalida"})
+
+
+def test_alvos_handler_auth_origem_json_e_codigos(db, env):
+    from painel.api import alvos as alvos_fn
+
+    body = {"acao": "adicionar", "alvo": "fulano", "pc": ""}
+    assert chamar(alvos_fn, db, "GET", basic("s3"))[0] == 405
+    assert chamar(alvos_fn, db, "POST", None, body)[0] == 401
+    assert chamar(alvos_fn, db, "POST", basic("s3"), raw_body=b"alvo=fulano")[0] == 415
+    assert chamar(alvos_fn, db, "POST", basic("s3"), body, headers={"Origin": "https://atacante.invalid"})[0] == 403
+    code, _, corpo = chamar(alvos_fn, db, "POST", basic("s3"), body)
+    assert code == 201 and json.loads(corpo) == {"ok": True, "_id": "fulano"}
+    assert chamar(alvos_fn, db, "POST", basic("s3"), body)[0] == 409
+    assert chamar(alvos_fn, db, "POST", basic("s3"), {"acao": "remover", "id": "fulano"})[0] == 200
+    assert chamar(alvos_fn, db, "POST", basic("s3"), {"acao": "xyz"})[0] == 400
+
+
+def test_index_html_slots_fila_e_alvos():
+    from html.parser import HTMLParser
+    from pathlib import Path
+
+    class Scripts(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.scripts, self._in = [], False
+
+        def handle_starttag(self, tag, attrs):
+            self._in = self._in or tag == "script"
+
+        def handle_endtag(self, tag):
+            self._in = False if tag == "script" else self._in
+
+        def handle_data(self, data):
+            if self._in:
+                self.scripts.append(data)
+
+    html = Path(__file__).resolve().parents[1] / "painel" / "index.html"
+    raw = html.read_text(encoding="utf-8")
+    p = Scripts()
+    p.feed(raw)
+    js = "\n".join(p.scripts)
+    assert 'fetch("/api/alvos"' in js and '"Authorization": basicHeader(senha)' in js
+    assert 'id="alvo-form"' in raw and 'id="alvos"' in raw
+    for campo in ("slots", "ocupados", "fila", "pc_fixo", "owner", "fase", "entrada", "_id"):
+        assert campo in js
+    assert "innerHTML" not in js and "insertAdjacentHTML" not in js

@@ -266,3 +266,34 @@ def test_painel_nao_importa_clipes():
     for arq in (PAINEL_DIR / "api").glob("*.py"):
         txt = arq.read_text(encoding="utf-8")
         assert not re.search(r"^\s*(?:from|import)\s+clipes\b", txt, re.M), f"{arq.name} importa clipes"
+
+
+# ---- T17: /api/alvos segue o mesmo gate do /api/comando (Basic Auth, origem, rate limit compartilhado)
+
+
+def test_t17_api_alvos_exige_auth_e_compartilha_rate_limit(monkeypatch):
+    from painel.api import alvos as alvos_api
+
+    monkeypatch.setenv("PAINEL_SENHA", "segredo")
+    monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
+    client = mongomock.MongoClient("mongodb://exemplo.invalid")
+    corpo = {"acao": "adicionar", "alvo": "twitch.tv/fulano", "pc": ""}
+    ip = {"X-Real-IP": "198.51.100.60"}
+
+    assert _chamar_client(alvos_api, client, "POST", None, corpo, headers=ip)[0] == 401  # 1a falha
+    for _ in range(_nucleo.MAX_TENTATIVAS_SENHA - 1):  # 5 falhas no total: IP bloqueado
+        assert _chamar_client(alvos_api, client, "POST", basic("errada"), corpo, headers=ip)[0] == 401
+    # o bloqueio vale para /api/alvos, /api/comando e /api/status (mesmo contador por IP)
+    assert _chamar_client(alvos_api, client, "POST", basic("segredo"), corpo, headers=ip)[0] == 429
+    assert _chamar_client(status_fn, client, "GET", basic("segredo"), headers=ip)[0] == 429
+    assert client["clipes_lives"].alvos.count_documents({}) == 0
+
+
+def test_t17_api_alvos_so_aceita_post(monkeypatch):
+    from painel.api import alvos as alvos_api
+
+    monkeypatch.setenv("PAINEL_SENHA", "segredo")
+    monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
+    client = mongomock.MongoClient("mongodb://exemplo.invalid")
+    code, hdr, _ = _chamar_client(alvos_api, client, "GET", basic("segredo"))
+    assert code == 405 and hdr.get("Allow") == "POST"

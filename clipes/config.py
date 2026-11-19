@@ -5,10 +5,14 @@ Valor invalido nunca derruba o processo: cai no padrao e avisa uma vez por varia
 
 import math
 import os
+import re
+import sys
 from pathlib import Path
 
 _TRUE = ("1", "true", "yes", "on", "sim")
 _FALSE = ("0", "false", "no", "off", "nao")
+_SLOTS_DEFAULT = {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1}
+_SLOTS_INT_RE = re.compile(r"[0-9]+")
 _avisados: set[str] = set()
 
 
@@ -90,3 +94,27 @@ def resolve_policy_path(out_root: Path | str | None = None, *, legacy: Path | st
                 print(f"[config] {path} nao existe; usando policy legada {old} (mova-a para OUT_DIR ou use CLIPES_POLICY_FILE)", flush=True)
             return old
     return path
+
+
+def slots() -> dict[str, int]:
+    """Slots por plataforma lidos de CLIPES_SLOTS (padrao: twitch=1,kick=1,youtube=1,busca=1).
+
+    Aceita inteiros >= 0 (0 desliga a plataforma no PC). Trecho invalido sai com codigo 2.
+    """
+    result = dict(_SLOTS_DEFAULT)
+    raw = os.environ.get("CLIPES_SLOTS", "").strip()
+    if not raw:
+        return result
+    for parte in raw.split(","):
+        trecho = parte.strip()
+        if not trecho or "=" not in trecho:
+            print(f"CLIPES_SLOTS invalido: {trecho}", file=sys.stderr, flush=True)
+            raise SystemExit(2)
+        plat_raw, val_raw = trecho.split("=", 1)
+        plat = plat_raw.strip().lower()
+        val_str = val_raw.strip()
+        if plat not in result or not _SLOTS_INT_RE.fullmatch(val_str):
+            print(f"CLIPES_SLOTS invalido: {trecho}", file=sys.stderr, flush=True)
+            raise SystemExit(2)
+        result[plat] = int(val_str)
+    return result

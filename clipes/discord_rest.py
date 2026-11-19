@@ -315,6 +315,24 @@ class DiscordRest:
             raw, ctype = _encode_multipart(payload, Path(file))
         return self._request(f"/channels/{channel_id}/messages", raw, ctype)
 
+    def edit(
+        self,
+        channel_id: str | int,
+        message_id: str | int,
+        content: str,
+        components: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Edit an existing message (and optional components) in a channel or thread."""
+        payload: dict[str, Any] = {"content": content}
+        if components is not None:
+            payload["components"] = components
+        return self._request(
+            f"/channels/{channel_id}/messages/{message_id}",
+            json.dumps(payload).encode("utf-8"),
+            "application/json",
+            method="PATCH",
+        )
+
     def thread_from(
         self,
         channel_id: str | int,

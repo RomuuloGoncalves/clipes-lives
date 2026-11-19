@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import inspect
 import json
 import os
 import re
 import shutil
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -29,11 +31,13 @@ from .perfil import max_lives as perfil_max_lives
 _YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,32}")
 _YT_HANDLE_RE = re.compile(r"@([A-Za-z0-9_.-]{1,64})")
 _KICK_SLUG_RE = re.compile(r"[a-z0-9_-]{1,25}")
-_KICK_RESERVED = frozenset({"video", "videos", "categories", "search", "auth", "clips"})
+_KICK_RESERVED = frozenset({"video", "videos", "categories", "search", "auth", "clips"})  # espelho em painel/api/_nucleo.py
 
 RECORDER_RESTART_BASE_S = 5.0
 RECORDER_RESTART_MAX_S = 60.0
 LIVE_CAPTURA_MORTA_S = 900.0
+ALVO_RECHECK_S = 120.0  # Q4: reconsulta alvo offline / pos-live a cada 2 min
+_PLATFORMS_LIVE = ("twitch", "kick", "youtube")
 
 
 def _captura_morta_s() -> float:
@@ -57,6 +61,17 @@ class Alvo:
     video_id: str | None = None
     channel_id: str | None = None
     raw: str = ""
+
+
+@dataclass
+class _ManagedAlvo:
+    alvo_id: str
+    alvo: Alvo
+    entrada: str
+    plataforma: str
+    fase: str = "aguardando live"
+    next_check_at: float = float("-inf")
+    session_key: str | None = None
 
 
 def parse_alvo(s: str) -> Alvo:
@@ -136,7 +151,9 @@ def parse_alvo(s: str) -> Alvo:
                 raw=raw,
             )
 
-        if host in {"kick.com", "www.kick.com"}:
+        if host in {"kick.com", "www.kick.com", "m.kick.com"}:
+            # urlsplit (sem ;params), como o painel; chave kick_<slug> casa com monitor._YT_KEY_RE (live_id usa kick:<slug>:<sid>)
+            path = urllib.parse.urlsplit(to_parse).path.strip("/")
             if not path or "/" in path:
                 raise ValueError(f"alvo invalido: {s!r}")
             slug = path.lower()
@@ -193,8 +210,13 @@ def _is_window_job(job: dict[str, Any]) -> bool:
     return all(k in job for k in ("window_start", "window_end", "video_start", "last"))
 
 
+def _is_busca_job(job: dict[str, Any]) -> bool:
+    """Identifica jobs de pico criados pela busca geral integrada."""
+    return job.get("origem") == "busca"
+
+
 class _SessionQueueView(monitor.DiskQueue):
-    """Visao da DiskQueue que so reivindica jobs de janela das sessoes deste Supervisor."""
+    """Visao da DiskQueue que reivindica janelas proprias e jobs com origem='busca'."""
 
     def __init__(self, queue: monitor.DiskQueue, own_keys: Callable[[], set[str]]) -> None:
         self._queue = queue
@@ -211,7 +233,7 @@ class _SessionQueueView(monitor.DiskQueue):
             try:
                 job = monitor._read_job(job_dir)
                 skey = job.get("session_key") or job.get("channel")
-                if skey not in own or not _is_window_job(job):
+                if not (_is_busca_job(job) or (skey in own and _is_window_job(job))):
                     continue
                 pending.append((
                     -float(job.get("z_score") or 0.0),
@@ -618,6 +640,35 @@ def _exit_signals_to_kb() -> Iterator[None]:
                 pass
 
 
+class _SupervisorCoordSession:
+    """Adapter da sessao Mongo do Supervisor compartilhada com a thread da busca geral."""
+
+    def __init__(self, sup: Supervisor) -> None:
+        self._sup = sup
+
+    @property
+    def configured(self) -> bool:
+        return self._sup.coord is not None
+
+    @property
+    def online(self) -> bool:
+        return self._sup._coord_active() is not None
+
+    @property
+    def active(self) -> Any | None:
+        return self._sup._coord_active()
+
+    @property
+    def next_retry(self) -> float:
+        return self._sup._mongo_offline_until
+
+    def mark_offline(self, exc: BaseException) -> None:
+        self._sup._on_mongo_err(exc)
+
+    def maybe_reconnect(self) -> bool:
+        return self._sup._coord_active() is not None
+
+
 class Supervisor:
     """Supervise up to L simultaneous live sessions sharing 1 DiskQueue and 1 worker."""
 
@@ -650,6 +701,14 @@ class Supervisor:
         kill_children: Callable[[], None] | None = None,
         run_pending_fn: Callable[..., Any] | None = None,
         discord_client: Any | None = None,
+        stop_event: threading.Event | None = None,
+        channels_file: Path | None = None,
+        busca_channels: list[str] | None = None,
+        busca_irc: Any | None = None,
+        busca_popen: Any | None = None,
+        busca_sleep: Any | None = None,
+        busca_stream_ids: dict[str, str] | None = None,
+        vod_pipeline: Callable[[str, Path], int] | None = None,
     ) -> None:
         self.alvos = dedup_alvos(alvos)
         self.out_root = Path(out_root)
@@ -677,10 +736,23 @@ class Supervisor:
         self.kill_children = kill_children
         self.run_pending_fn = run_pending_fn
         self.discord_client = discord_client
+        self.stop_event = stop_event
+        self.channels_file = Path(channels_file) if channels_file is not None else None
+        self.busca_channels = list(busca_channels) if busca_channels is not None else None
+        self.busca_irc = busca_irc
+        self.busca_popen = busca_popen
+        self.busca_sleep = busca_sleep
+        self.busca_stream_ids = busca_stream_ids
+        self.vod_pipeline = vod_pipeline
+        self.slots = config.slots()
 
         self._lock = threading.Lock()
         self._active: dict[str, LiveSession] = {}
         self._all_sessions: dict[str, LiveSession] = {}
+        self._managed_alvos: dict[str, _ManagedAlvo] = {}
+        self._busca_owned_lives: dict[str, str] = {}
+        self._active_vod_id: list[str | None] = [None]
+        self._invalid_alvo_ids: set[str] = set()
         self._aguardando: list[tuple[Alvo, str]] = []
         self._avisados: set[tuple[str, str]] = set()
         self._lost_lives: set[str] = set()
@@ -756,11 +828,95 @@ class Supervisor:
             return default_cap(self.out_root)
         return {"cpus": None, "score": 1}
 
-    def _limite(self) -> int:
+    def _limite(self, plataforma: str = "twitch") -> int:
         if self.limite_fn is not None:
+            try:
+                if len(inspect.signature(self.limite_fn).parameters) >= 1:
+                    return int(self.limite_fn(plataforma))
+            except (TypeError, ValueError):
+                pass
             return int(self.limite_fn())
-        cap = self._cap()
-        return resolve_max_lives(self.out_root, cap.get("cpus"), max_lives_fn=self.ml_fn)
+        if self.ml_fn is not None:
+            cap = self._cap()
+            return int(self.ml_fn(self.out_root, cap.get("cpus")))
+        return int(self.slots.get(plataforma, 0))
+
+    def _ativos_na_plataforma(self, plataforma: str, *, exclude_alvo_id: str | None = None) -> int:
+        with self._lock:
+            managed_keys = {m.session_key for m in self._managed_alvos.values() if m.session_key is not None}
+            managed_count = sum(
+                1
+                for aid, m in self._managed_alvos.items()
+                if m.plataforma == plataforma and aid != exclude_alvo_id
+            )
+            extra_active = sum(
+                1
+                for k, s in self._active.items()
+                if s.alvo.plataforma == plataforma and k not in managed_keys
+            )
+        return managed_count + extra_active
+
+    def _ocupados(self) -> dict[str, int]:
+        counts = {"twitch": 0, "kick": 0, "youtube": 0, "busca": len(self._busca_owned_lives)}
+        for plat in _PLATFORMS_LIVE:
+            counts[plat] = self._ativos_na_plataforma(plat)
+        return counts
+
+    def _excluir_para_busca(self) -> set[str]:
+        """Canais acompanhados localmente neste PC (exclusao em memoria para a busca geral)."""
+        with self._lock:
+            out: set[str] = set()
+            for sess in self._active.values():
+                if sess.alvo.canal:
+                    out.add(sess.alvo.canal.lower())
+                if sess.alvo.chave:
+                    out.add(sess.alvo.chave.lower())
+            for m in self._managed_alvos.values():
+                if m.alvo.canal:
+                    out.add(m.alvo.canal.lower())
+                if m.alvo.chave:
+                    out.add(m.alvo.chave.lower())
+                if m.alvo_id:
+                    out.add(m.alvo_id.lower())
+            return out
+
+    def _resolve_busca_channels(self) -> list[str]:
+        if int(self.slots.get("busca", 0)) <= 0:
+            return []
+        if self.busca_channels is not None:
+            raw = self.busca_channels
+        elif self.channels_file is not None and self.channels_file.is_file():
+            return monitor.discover_channels(self.channels_file, self.policy)
+        else:
+            return []
+        return [c for c in raw if self.policy.permits(c)]
+
+    def _fila(self, queue: monitor.DiskQueue | None, c: Any | None = None) -> dict[str, int]:
+        janelas = 0
+        busca = 0
+        if queue is not None:
+            pending_dir = queue.root / "pending"
+            if pending_dir.is_dir():
+                for d in pending_dir.iterdir():
+                    try:
+                        job = monitor._read_job(d)
+                    except (OSError, ValueError, TypeError):
+                        continue
+                    if job.get("origem") == "busca":
+                        busca += 1
+                    elif _is_window_job(job):
+                        janelas += 1
+        vods = 0
+        if c is not None and hasattr(c, "db"):
+            try:
+                vods = int(c.db.alvos.count_documents({"tipo": "vod", "estado": "ativo"}))
+            except Exception as exc:
+                if monitor._is_mongo_error(exc):
+                    raise
+        return {"janelas": janelas, "busca": busca, "vods": vods}
+
+    def _total_slots_live(self) -> int:
+        return sum(int(v) for k, v in self.slots.items() if k != "busca")
 
     def _recusar(self, alvo: Alvo, motivo: str) -> None:
         self._last_refusal_reason = motivo
@@ -850,6 +1006,227 @@ class Supervisor:
         sid = alvo.video_id or alvo.chave
         return f"youtube:{alvo.channel_id or alvo.canal}:{sid}", sid
 
+    def _should_stop(self) -> bool:
+        return self.stop_event is not None and self.stop_event.is_set()
+
+    def _safe_release_alvo(self, c: Any | None, alvo_id: str) -> None:
+        if c is None:
+            return
+        rel_fn = getattr(c, "release_alvo", None)
+        if not callable(rel_fn):
+            return
+        try:
+            rel_fn(alvo_id)
+        except Exception as exc:
+            if monitor._is_mongo_error(exc):
+                self._on_mongo_err(exc)
+
+    def _parse_alvo_doc(self, doc: Any) -> tuple[str, Alvo, str] | None:
+        if not isinstance(doc, dict):
+            print(f"[acompanhar] alvo invalido no Mongo: {doc!r}", flush=True)
+            return None
+        alvo_id = doc.get("_id")
+        if not isinstance(alvo_id, str) or not alvo_id:
+            print(f"[acompanhar] alvo invalido no Mongo ({alvo_id!r}): _id invalido", flush=True)
+            return None
+        if "entrada" in doc:
+            raw_entrada = doc.get("entrada")
+        else:
+            raw_entrada = alvo_id.split(":", 1)[1] if ":" in alvo_id else alvo_id
+        if not isinstance(raw_entrada, str) or not raw_entrada.strip():
+            print(f"[acompanhar] alvo invalido no Mongo ({alvo_id!r}): entrada ausente", flush=True)
+            return None
+        entrada = raw_entrada.strip()
+        try:
+            alvo = parse_alvo(entrada)
+        except ValueError as exc:
+            print(f"[acompanhar] alvo invalido no Mongo ({alvo_id!r}): {exc}", flush=True)
+            return None
+        plat_doc = doc.get("plataforma")
+        if plat_doc and plat_doc != alvo.plataforma:
+            print(
+                f"[acompanhar] alvo invalido no Mongo ({alvo_id!r}): plataforma {plat_doc!r} != {alvo.plataforma!r}",
+                flush=True,
+            )
+            return None
+        return alvo_id, alvo, entrada
+
+    def _resume_own_alvos(self, c: Any) -> None:
+        own_fn = getattr(c, "own_alvos", None)
+        if not callable(own_fn):
+            return
+        try:
+            docs = own_fn()
+        except Exception as exc:
+            if not monitor._is_mongo_error(exc):
+                raise
+            self._on_mongo_err(exc)
+            return
+        for doc in docs:
+            parsed = self._parse_alvo_doc(doc)
+            if parsed is None:
+                if isinstance(doc, dict) and isinstance(doc.get("_id"), str):
+                    self._invalid_alvo_ids.add(doc["_id"])
+                    self._safe_release_alvo(c, doc["_id"])
+                continue
+            alvo_id, alvo, entrada = parsed
+            limite = self._limite(alvo.plataforma)
+            if limite < 1 or self._ativos_na_plataforma(alvo.plataforma) >= limite:
+                self._safe_release_alvo(c, alvo_id)
+                continue
+            with self._lock:
+                self._managed_alvos[alvo_id] = _ManagedAlvo(
+                    alvo_id=alvo_id,
+                    alvo=alvo,
+                    entrada=entrada,
+                    plataforma=alvo.plataforma,
+                    fase="aguardando live",
+                    next_check_at=float("-inf"),
+                )
+
+    def _stop_removed_alvo(self, m: _ManagedAlvo, c_active: Any) -> None:
+        key = m.session_key
+        sess: LiveSession | None = None
+        if key is not None:
+            with self._lock:
+                sess = self._active.get(key)
+        if sess is not None and key is not None:
+            try:
+                sess.encerrar()
+            except Exception as exc:
+                print(f"[acompanhar] erro ao encerrar alvo removido {m.alvo_id}: {exc}", flush=True)
+            with self._lock:
+                self._active.pop(key, None)
+                self._pending_lease_lost.discard(key)
+            sess.live_ended = False
+            self._release_session(key, sess, release_pool=False, reraise_non_mongo=False)
+        self._safe_release_alvo(c_active, m.alvo_id)
+
+    def _release_all_managed_alvos(self, c: Any | None) -> None:
+        with self._lock:
+            ids = list(self._managed_alvos.keys())
+            self._managed_alvos.clear()
+        if c is None:
+            return
+        for aid in ids:
+            self._safe_release_alvo(c, aid)
+
+    def _sync_mongo_alvos(self, c_active: Any, worker_alias: str, pool: Any) -> None:
+        renew_alvos_fn = getattr(c_active, "renew_alvos", None)
+        if callable(renew_alvos_fn):
+            with self._lock:
+                fases = {aid: m.fase for aid, m in self._managed_alvos.items()}
+            if fases:
+                renewed = renew_alvos_fn(fases)
+                for aid in list(fases):
+                    if aid in renewed:
+                        continue
+                    with self._lock:
+                        m = self._managed_alvos.pop(aid, None)
+                    if m is None:
+                        continue
+                    doc = c_active.db.alvos.find_one({"_id": aid}) if hasattr(c_active, "db") else None
+                    if doc is None or doc.get("estado") != "ativo":
+                        self._stop_removed_alvo(m, c_active)
+                    elif m.session_key is not None:
+                        with self._lock:
+                            sess = self._active.get(m.session_key)
+                        if sess is not None:
+                            self._handle_lease_lost(m.session_key, sess, pool)
+
+        claim_alvo_fn = getattr(c_active, "claim_alvo", None)
+        if not callable(claim_alvo_fn):
+            return
+        for plat in _PLATFORMS_LIVE:
+            limite = self._limite(plat)
+            while limite >= 1 and self._ativos_na_plataforma(plat) < limite:
+                with self._lock:
+                    exclude = set(self._managed_alvos) | self._invalid_alvo_ids
+                doc = claim_alvo_fn(plat, worker_alias, exclude_ids=exclude)
+                if doc is None:
+                    break
+                parsed = self._parse_alvo_doc(doc)
+                if parsed is None:
+                    aid_bad = doc.get("_id") if isinstance(doc, dict) else None
+                    if isinstance(aid_bad, str) and aid_bad:
+                        self._invalid_alvo_ids.add(aid_bad)
+                        self._safe_release_alvo(c_active, aid_bad)
+                    continue
+                alvo_id, alvo, entrada = parsed
+                prev_owner = doc.get("previous_owner")
+                if prev_owner:
+                    msg = f"[acompanhar] failover {alvo_id}: assumido de {prev_owner} por {worker_alias}"
+                    print(msg, flush=True)
+                    self.aviso_fn(msg)
+                with self._lock:
+                    self._managed_alvos[alvo_id] = _ManagedAlvo(
+                        alvo_id=alvo_id,
+                        alvo=alvo,
+                        entrada=entrada,
+                        plataforma=alvo.plataforma,
+                        fase="aguardando live",
+                        next_check_at=float("-inf"),
+                    )
+
+    def _tick_managed_alvos(
+        self,
+        t: float,
+        beat_interval: float,
+        queue: monitor.DiskQueue,
+        pool: Any,
+        pipeline_fn: Callable[[Path, Path], dict[str, Any]],
+        is_live_fn: Callable[[str], bool],
+        probe_fn: Callable[[str], dict[str, Any]],
+    ) -> None:
+        with self._lock:
+            managed = list(self._managed_alvos.values())
+        for m in managed:
+            with self._lock:
+                is_active = m.session_key is not None and m.session_key in self._active
+            if is_active:
+                m.fase = "gravando"
+                continue
+            if t < m.next_check_at:
+                continue
+            if self._coord_active() is None:
+                continue  # queda do Mongo: mantem sessoes ativas sem novos claims/inicios
+            try:
+                fresh_alvo = parse_alvo(m.entrada)
+            except ValueError:
+                m.next_check_at = t + ALVO_RECHECK_S
+                continue
+            limite = self._limite(m.plataforma)
+            status = self._try_start_alvo(
+                fresh_alvo,
+                limite,
+                queue,
+                pool,
+                pipeline_fn,
+                is_live_fn,
+                probe_fn,
+                exclude_alvo_id=m.alvo_id,
+                managed=True,
+            )
+            if status == "started":
+                m.alvo = fresh_alvo
+                m.session_key = fresh_alvo.chave
+                m.fase = "gravando"
+            elif status == "busy":
+                m.session_key = None
+                m.fase = "aguardando live"
+                m.next_check_at = t + min(beat_interval, 5.0)
+            else:
+                m.session_key = None
+                m.fase = "aguardando live"
+                m.next_check_at = t + ALVO_RECHECK_S
+            c_now = self._coord_active()
+            if c_now is not None and callable(getattr(c_now, "renew_alvos", None)):
+                try:
+                    c_now.renew_alvos({m.alvo_id: m.fase})
+                except Exception as exc:
+                    if monitor._is_mongo_error(exc):
+                        self._on_mongo_err(exc)
+
     def _try_start_alvo(
         self,
         alvo: Alvo,
@@ -861,6 +1238,8 @@ class Supervisor:
         probe_fn: Callable[[str], dict[str, Any]],
         *,
         already_probed: bool = False,
+        exclude_alvo_id: str | None = None,
+        managed: bool = False,
     ) -> str:
         if alvo.plataforma in ("youtube", "kick") and not already_probed:
             probed = (
@@ -870,7 +1249,8 @@ class Supervisor:
             )
             if not probed:
                 return "skip"
-            if alvo.chave in self._all_sessions or any(a.chave == alvo.chave for a, _ in self._aguardando):
+            dup_pool = self._active if managed else self._all_sessions
+            if alvo.chave in dup_pool or any(a.chave == alvo.chave for a, _ in self._aguardando):
                 return "skip"
             self._alvo_by_key[alvo.chave] = alvo
 
@@ -888,10 +1268,16 @@ class Supervisor:
                 print(f"[acompanhar] {self._label(alvo)} offline; ignorado", flush=True)
                 return "skip"
 
-        if limite < 1 or len(self._active) >= limite:
+        if limite < 1 or self._ativos_na_plataforma(alvo.plataforma, exclude_alvo_id=exclude_alvo_id) >= limite:
             self._saw_not_claimed = True
-            self._recusar(alvo, f"limite max_lives={limite} (rode bench-live ou defina CLIPES_MAX_LIVES)")
+            self._recusar(alvo, f"limite slots {alvo.plataforma}={limite} (defina CLIPES_SLOTS)")
             return "aguardando"
+
+        if alvo.plataforma == "twitch" and alvo.canal.lower() in self._busca_owned_lives:
+            self._saw_not_claimed = True
+            if not managed:
+                self._recusar(alvo, "live em captura pela busca local")
+            return "busy" if managed else "aguardando"
 
         live_id: str | None = None
         pending_live_id: str | None = None
@@ -902,19 +1288,11 @@ class Supervisor:
             live_id, sid = self._resolve_live_id(alvo, probe_fn=probe_fn)
             if not live_id:
                 self._saw_not_claimed = True
-                self._recusar(alvo, "stream_id indisponivel")
-                return "aguardando"
+                if not managed:
+                    self._recusar(alvo, "stream_id indisponivel")
+                return "busy" if managed else "aguardando"
 
             try:
-                count_fn = getattr(c_active, "count_owned_live", None)
-                if callable(count_fn):
-                    with self._lock:
-                        active_ids = {s.live_id for s in self._active.values() if s.live_id}
-                    other_owned = int(count_fn(exclude=active_ids | {live_id}))
-                    if len(self._active) + other_owned >= limite:
-                        self._saw_not_claimed = True
-                        self._recusar(alvo, f"limite max_lives={limite} (rode bench-live ou defina CLIPES_MAX_LIVES)")
-                        return "aguardando"
                 c_active.ensure_live(live_id, channel=alvo.canal, platform=alvo.plataforma, stream_id=sid)
                 monitor._wait_claim_sync(30.0 / max(1.0, float(cap.get("score") or 1)), now=self.now, sleep=self.sleep)
                 claimed = c_active.claim_live(live_id)
@@ -922,15 +1300,20 @@ class Supervisor:
                 if not monitor._is_mongo_error(exc):
                     raise
                 self._on_mongo_err(exc)
+                if managed:
+                    return "busy"
                 pending_live_id = live_id
                 pending_stream_id = sid
                 live_id = None
             else:
                 if not claimed:
                     self._saw_not_claimed = True
-                    self._recusar(alvo, "lease com outro PC")
-                    return "aguardando"
+                    if not managed:
+                        self._recusar(alvo, "lease com outro PC")
+                    return "busy" if managed else "aguardando"
         elif self.coord is not None:
+            if managed:
+                return "busy"
             # Mongo em backoff na abertura: guarda live_id pretendido para tentar claim ao reconectar (M-01)
             pending_live_id, pending_stream_id = self._resolve_live_id(alvo)
 
@@ -974,6 +1357,9 @@ class Supervisor:
 
         with self._lock:
             self._active[sess.key] = sess
+        prev_sess = self._all_sessions.get(sess.key)
+        if prev_sess is not None and prev_sess is not sess:
+            self._jobs.extend(prev_sess.jobs)
         self._all_sessions[sess.key] = sess
         return "started"
 
@@ -986,21 +1372,28 @@ class Supervisor:
         ml: int,
         razao: float,
         beat_s: float,
+        *,
+        queue: monitor.DiskQueue | None = None,
     ) -> None:
         beat_fn = getattr(c, "beat", None)
         if not callable(beat_fn):
             return
         try:
             params = inspect.signature(beat_fn).parameters
-            accepts_beat_s = "beat_s" in params or any(
-                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
-            )
+            has_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
         except (TypeError, ValueError):
-            accepts_beat_s = True
-        if accepts_beat_s:
-            beat_fn(alias, cap, job_atual, ml, razao, beat_s=beat_s)
-        else:
-            beat_fn(alias, cap, job_atual, ml, razao)
+            params = {}
+            has_kw = True
+        kwargs: dict[str, Any] = {}
+        if has_kw or "beat_s" in params:
+            kwargs["beat_s"] = beat_s
+        if has_kw or "slots" in params:
+            kwargs["slots"] = dict(self.slots)
+        if has_kw or "ocupados" in params:
+            kwargs["ocupados"] = self._ocupados()
+        if has_kw or "fila" in params:
+            kwargs["fila"] = self._fila(queue, c)
+        beat_fn(alias, cap, job_atual, ml, razao, **kwargs)
 
     def _handle_lease_lost(self, key: str, sess: LiveSession, pool: Any, *, msg: str | None = None) -> None:
         lid = sess.live_id or sess.pending_live_id
@@ -1020,6 +1413,11 @@ class Supervisor:
         with self._lock:
             self._active.pop(key, None)
             self._pending_lease_lost.discard(key)
+            for m in self._managed_alvos.values():
+                if m.session_key == key:
+                    m.session_key = None
+                    m.fase = "aguardando live"
+                    m.next_check_at = self.now() + 5.0
 
     def _drain_lost_leases(self, pool: Any) -> bool:
         """Aplica no loop principal as perdas de lease registradas pela thread de keepalive."""
@@ -1083,12 +1481,12 @@ class Supervisor:
     ) -> None:
         if not self._aguardando:
             return
-        limite = self._limite()
         still_waiting: list[tuple[Alvo, str]] = []
-        for idx, (alvo, motivo) in enumerate(self._aguardando):
-            if len(self._active) >= limite:
-                still_waiting.extend(self._aguardando[idx:])
-                break
+        for alvo, motivo in self._aguardando:
+            limite = self._limite(alvo.plataforma)
+            if limite < 1 or self._ativos_na_plataforma(alvo.plataforma) >= limite:
+                still_waiting.append((alvo, motivo))
+                continue
             status = self._try_start_alvo(
                 alvo, limite, queue, pool, pipeline_fn, is_live_fn, probe_fn,
                 already_probed=(alvo.plataforma in ("youtube", "kick")),
@@ -1107,6 +1505,8 @@ class Supervisor:
         for d in (queue.root / "pending").iterdir():
             try:
                 job = monitor._read_job(d)
+                if _is_busca_job(job):
+                    return True
                 skey = job.get("session_key") or job.get("channel")
                 if skey in own and _is_window_job(job):
                     return True
@@ -1123,6 +1523,8 @@ class Supervisor:
     ) -> bool:
         def dispatch_pipeline(job_dir: Path, root: Path) -> dict[str, Any]:
             job = monitor._read_job(job_dir)
+            if _is_busca_job(job):
+                return pipeline_fn(job_dir, root)
             skey = job.get("session_key") or job.get("channel")
             sess = self._all_sessions.get(skey) if isinstance(skey, str) else None
             if sess is None or not _is_window_job(job):
@@ -1142,6 +1544,98 @@ class Supervisor:
             lost_lives=self._lost_lives,
             on_job_active=lambda jid: self._current_job.__setitem__(0, jid),
         )
+
+    def _run_vod_cli(self, url: str, out_root: Path) -> int:
+        from . import cli
+
+        argv = [url, "--out-dir", str(out_root), "--max-dur", str(self.max_dur)]
+        if self.min_dur is not None:
+            argv.extend(["--min-dur", str(self.min_dur)])
+        return int(cli.main(argv))
+
+    def _check_vod_policy(self, vod: dict[str, Any], url: str, probe_fn: Callable[[str], dict[str, Any]]) -> str | None:
+        if not self.policy.blocked and self.policy.allowed is None:
+            return None
+        candidatos: list[str] = []
+        canal_doc = vod.get("canal")
+        if isinstance(canal_doc, str) and canal_doc.strip():
+            candidatos.append(canal_doc.strip().lstrip("@").lower())
+        if not candidatos:
+            try:
+                meta = probe_fn(url)
+            except Exception:
+                meta = {}
+            if isinstance(meta, dict):
+                for campo in ("uploader_id", "channel", "uploader", "channel_id"):
+                    val = meta.get(campo)
+                    if isinstance(val, str) and val.strip():
+                        candidatos.append(val.strip().lstrip("@").lower())
+        for ch in candidatos:
+            if not self.policy.permits(ch):
+                return f"bloqueado pela policy ({ch})"
+        return None
+
+    def _process_one_vod(self, worker_alias: str, probe_fn: Callable[[str], dict[str, Any]]) -> bool:
+        c = self._coord_active()
+        if c is None:
+            return False
+        pegar_fn = getattr(c, "pegar_vod", None)
+        fim_fn = getattr(c, "fim_vod", None)
+        if not (callable(pegar_fn) and callable(fim_fn)):
+            return False
+        try:
+            vod = pegar_fn(worker_alias)
+        except Exception as exc:
+            if not monitor._is_mongo_error(exc):
+                raise
+            self._on_mongo_err(exc)
+            return False
+        if not isinstance(vod, dict) or not vod.get("_id"):
+            return False
+
+        vod_id = str(vod["_id"])
+        url = str(vod.get("url") or "").strip()
+        self._current_job[0] = vod_id
+        self._active_vod_id[0] = vod_id
+        try:
+            if not url:
+                raise ValueError("url de VOD ausente")
+            bloqueio = self._check_vod_policy(vod, url, probe_fn)
+            if bloqueio is not None:
+                raise PermissionError(bloqueio)
+            runner = self.vod_pipeline or self._run_vod_cli
+            rc = runner(url, self.out_root)
+            if isinstance(rc, int) and rc != 0:
+                raise RuntimeError(f"pipeline VOD retornou codigo {rc}")
+        except Exception as exc:
+            uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
+            erro = monitor._sanitize_error(exc, uri)
+            from .coord import _sanitize_erro
+
+            erro_limpo = _sanitize_erro(erro) or erro
+            c_fin = self._coord_active() or self.coord
+            if c_fin is not None and callable(getattr(c_fin, "fim_vod", None)):
+                try:
+                    c_fin.fim_vod(vod_id, "falhou", erro_limpo)
+                except Exception as mexc:
+                    if monitor._is_mongo_error(mexc):
+                        self._on_mongo_err(mexc)
+            msg = f"[vod] falha {vod_id}: {erro_limpo}"
+            print(msg, flush=True)
+            self.aviso_fn(msg)
+            return True
+        else:
+            c_fin = self._coord_active() or self.coord
+            if c_fin is not None and callable(getattr(c_fin, "fim_vod", None)):
+                try:
+                    c_fin.fim_vod(vod_id, "feito")
+                except Exception as mexc:
+                    if monitor._is_mongo_error(mexc):
+                        self._on_mongo_err(mexc)
+            return True
+        finally:
+            self._active_vod_id[0] = None
+            self._current_job[0] = None
 
     def _release_session(
         self,
@@ -1176,8 +1670,25 @@ class Supervisor:
         stop_hb: threading.Event | None = None
         hb_thread: threading.Thread | None = None
         publish_loop: PublishLoop | None = None
+        busca_thread: threading.Thread | None = None
+        busca_loop_ref: list[asyncio.AbstractEventLoop | None] = [None]
+        busca_stop_ref: list[asyncio.Event | None] = [None]
+        busca_stop_early = threading.Event()
+
+        def _stop_busca() -> None:
+            busca_stop_early.set()
+            loop = busca_loop_ref[0]
+            ev = busca_stop_ref[0]
+            if loop is not None and ev is not None and not loop.is_closed():
+                try:
+                    loop.call_soon_threadsafe(ev.set)
+                except RuntimeError:
+                    pass
+            if busca_thread is not None and busca_thread.is_alive():
+                busca_thread.join(timeout=10.0)
 
         def _stop_keepalive() -> None:
+            _stop_busca()
             if stop_hb is not None:
                 stop_hb.set()
             if hb_thread is not None and hb_thread.is_alive():
@@ -1204,7 +1715,7 @@ class Supervisor:
                     pool = monitor.RollingRecorderPool(
                         queue.root / ".buffer",
                         max_hot=0,
-                        max_on_demand=max(1, len(self.alvos)),
+                        max_on_demand=max(1, len(self.alvos), self._total_slots_live()),
                         buffer_seconds=monitor.LIVE_WINDOW_S + 2 * self.step,
                         source_cmd=_source_cmd,
                     )
@@ -1219,6 +1730,10 @@ class Supervisor:
                 else:
                     beat_interval = config.env_float("CLIPES_BEAT_S", 20.0, min_value=1.0)
                 last_beat = float("-inf")
+
+                mongo_mode = self.coord is not None and not self.alvos
+                busca_chans = self._resolve_busca_channels()
+                service_mode = mongo_mode or (not self.alvos and bool(busca_chans))
 
                 # A-02: solta lives proprias com lease vencida (sobras de crash) na inicializacao
                 c_init = self._coord_active()
@@ -1235,6 +1750,10 @@ class Supervisor:
                     c_init = self._coord_active()
                     if c_init is not None:
                         self._replay_unsynced(queue, c_init)
+                    # Retomada pos-reinicio: assume alvos proprios com lease valida antes de tomar novos
+                    c_init = self._coord_active()
+                    if mongo_mode and c_init is not None:
+                        self._resume_own_alvos(c_init)
 
                 # A-03: keepalive continuo durante todo o run() (beat + renew das sessoes ativas)
                 if self.coord is not None:
@@ -1247,14 +1766,21 @@ class Supervisor:
                                 continue
                             try:
                                 cap_k = self._cap()
-                                ml_k = max(
-                                    1,
-                                    int(resolve_max_lives(self.out_root, cap_k.get("cpus"), max_lives_fn=self.ml_fn)),
-                                )
+                                ml_k = max(1, self._total_slots_live())
                                 razao_k = monitor._read_perfil_razao(self.out_root, cap_k.get("cpus"))
                                 self._call_beat(
-                                    c, worker_alias, cap_k, self._current_job[0], ml_k, razao_k, beat_interval
+                                    c, worker_alias, cap_k, self._current_job[0], ml_k, razao_k, beat_interval,
+                                    queue=queue,
                                 )
+                                renew_alvos_fn = getattr(c, "renew_alvos", None)
+                                if callable(renew_alvos_fn):
+                                    with self._lock:
+                                        fases_k = {aid: m.fase for aid, m in self._managed_alvos.items()}
+                                    if fases_k:
+                                        renew_alvos_fn(fases_k)
+                                    vod_k = self._active_vod_id[0]
+                                    if vod_k:
+                                        renew_alvos_fn([vod_k])
                                 with self._lock:
                                     active_snapshot = list(self._active.items())
                                     already_lost = set(self._pending_lease_lost)
@@ -1322,6 +1848,47 @@ class Supervisor:
                     publish_loop = PublishLoop(_publish_once, beat_interval, name="publicacao")
                     publish_loop.start()
 
+                if busca_chans:
+                    shared_cs = _SupervisorCoordSession(self)
+
+                    def _busca_worker() -> None:
+                        async def _run_busca() -> None:
+                            loop = asyncio.get_running_loop()
+                            ev = asyncio.Event()
+                            busca_loop_ref[0] = loop
+                            busca_stop_ref[0] = ev
+                            if busca_stop_early.is_set():
+                                ev.set()
+                                return
+                            await monitor.run_monitor(
+                                busca_chans,
+                                self.out_root,
+                                self.policy,
+                                queue_root=queue.root,
+                                irc=self.busca_irc or monitor.irc_chat_loop,
+                                popen=self.busca_popen or subprocess.Popen,
+                                now=self.now,
+                                sleep=self.busca_sleep or asyncio.sleep,
+                                stop=ev,
+                                coord_session=shared_cs,
+                                capacity_fn=self.cap_fn,
+                                stream_ids=self.busca_stream_ids,
+                                probe=probe_fn,
+                                beat_s=beat_interval,
+                                alias=worker_alias,
+                                worker=False,
+                                excluir=self._excluir_para_busca,
+                                owned_lives_out=self._busca_owned_lives,
+                            )
+
+                        try:
+                            asyncio.run(_run_busca())
+                        except Exception as exc:
+                            print(f"[busca] encerrada com erro: {exc}", flush=True)
+
+                    busca_thread = threading.Thread(target=_busca_worker, daemon=True, name="busca-geral")
+                    busca_thread.start()
+
                 def _liberar() -> None:
                     # M-03: para gravadores, mata filhos e solta leases sem marcar ended
                     _stop_keepalive()
@@ -1337,23 +1904,25 @@ class Supervisor:
                     for key, sess in active_items:
                         sess.live_ended = False
                         self._release_session(key, sess, release_pool=True, reraise_non_mongo=False)
+                    self._release_all_managed_alvos(self.coord)
 
-                limite = self._limite()
-                for alvo in self.alvos:
-                    status = self._try_start_alvo(alvo, limite, queue, pool, pipeline_fn, is_live_fn, probe_fn)
-                    if status == "aguardando":
-                        self._aguardando.append((alvo, self._last_refusal_reason or ""))
+                if not service_mode:
+                    for alvo in self.alvos:
+                        limite = self._limite(alvo.plataforma)
+                        status = self._try_start_alvo(alvo, limite, queue, pool, pipeline_fn, is_live_fn, probe_fn)
+                        if status == "aguardando":
+                            self._aguardando.append((alvo, self._last_refusal_reason or ""))
 
-                if not self._active:
-                    if self._saw_blocked and not self._saw_not_claimed:
-                        return {"status": "blocked", "jobs": [], "reason": None}
-                    if self._saw_not_claimed:
-                        return {"status": "not_claimed", "jobs": [], "reason": self._last_refusal_reason}
-                    return {"status": "ended", "jobs": [], "reason": None}
-
-                while self._active:
-                    slot_opened = self._drain_lost_leases(pool)
                     if not self._active:
+                        if self._saw_blocked and not self._saw_not_claimed:
+                            return {"status": "blocked", "jobs": [], "reason": None}
+                        if self._saw_not_claimed:
+                            return {"status": "not_claimed", "jobs": [], "reason": self._last_refusal_reason}
+                        return {"status": "ended", "jobs": [], "reason": None}
+
+                while (service_mode and not self._should_stop()) or (not service_mode and self._active):
+                    slot_opened = self._drain_lost_leases(pool)
+                    if not service_mode and not self._active:
                         if slot_opened and self._aguardando:
                             self._promote_aguardando(queue, pool, pipeline_fn, is_live_fn, probe_fn)
                         if not self._active:
@@ -1364,15 +1933,13 @@ class Supervisor:
                     if c_active is not None and t - last_beat >= beat_interval:
                         last_beat = t
                         cap_now = self._cap()
-                        ml_now = max(
-                            1,
-                            int(resolve_max_lives(self.out_root, cap_now.get("cpus"), max_lives_fn=self.ml_fn)),
-                        )
+                        ml_now = max(1, self._total_slots_live())
                         razao_now = monitor._read_perfil_razao(self.out_root, cap_now.get("cpus"))
                         cmd_action: str | None = None
                         try:
                             self._call_beat(
-                                c_active, worker_alias, cap_now, self._current_job[0], ml_now, razao_now, beat_interval
+                                c_active, worker_alias, cap_now, self._current_job[0], ml_now, razao_now, beat_interval,
+                                queue=queue,
                             )
                             with self._lock:
                                 active_beat = list(self._active.items())
@@ -1387,6 +1954,8 @@ class Supervisor:
                                 if callable(renew_fn) and not renew_fn(sess.live_id):
                                     self._handle_lease_lost(key, sess, pool)
                                     slot_opened = True
+                            if mongo_mode:
+                                self._sync_mongo_alvos(c_active, worker_alias, pool)
                             run_cmd = getattr(c_active, "run_pending_command", None)
                             if callable(run_cmd):
                                 cmd_action = run_cmd(_liberar)
@@ -1400,6 +1969,11 @@ class Supervisor:
                                 raise SystemExit(75)
                             if publish_loop is not None:
                                 publish_loop.run_now()
+
+                    if mongo_mode:
+                        self._tick_managed_alvos(
+                            t, beat_interval, queue, pool, pipeline_fn, is_live_fn, probe_fn
+                        )
 
                     c_replay = self._coord_active()
                     if c_replay is not None and self._need_replay:
@@ -1422,6 +1996,11 @@ class Supervisor:
                             with self._lock:
                                 self._active.pop(key, None)
                                 self._pending_lease_lost.discard(key)
+                                for m in self._managed_alvos.values():
+                                    if m.session_key == key:
+                                        m.session_key = None
+                                        m.fase = "aguardando live"
+                                        m.next_check_at = t + ALVO_RECHECK_S
                             self._release_session(key, sess, release_pool=True, reraise_non_mongo=False)
                             if self.reraise_start_error:  # live unica (follow_live): o chamador ve a falha
                                 raise
@@ -1436,18 +2015,39 @@ class Supervisor:
                             continue
 
                         if ended:
+                            ended_alvos: dict[str, str] = {}
                             with self._lock:
                                 self._active.pop(key, None)
+                                for m in self._managed_alvos.values():
+                                    if m.session_key == key:
+                                        m.session_key = None
+                                        m.fase = "aguardando live"
+                                        m.next_check_at = t + ALVO_RECHECK_S
+                                        ended_alvos[m.alvo_id] = m.fase
                             self._release_session(key, sess, release_pool=False, reraise_non_mongo=True)
+                            if ended_alvos:
+                                c_upd = self._coord_active()
+                                if c_upd is not None and callable(getattr(c_upd, "renew_alvos", None)):
+                                    try:
+                                        c_upd.renew_alvos(ended_alvos)
+                                    except Exception as exc:
+                                        if monitor._is_mongo_error(exc):
+                                            self._on_mongo_err(exc)
                             slot_opened = True
 
-                    if slot_opened and self._aguardando:
-                        self._promote_aguardando(queue, pool, pipeline_fn, is_live_fn, probe_fn)
+                    if not service_mode:
+                        if slot_opened and self._aguardando:
+                            self._promote_aguardando(queue, pool, pipeline_fn, is_live_fn, probe_fn)
 
-                    if not self._active:
-                        break
+                        if not self._active:
+                            break
 
-                    if not (self._has_own_pending(queue, skip_lost=True) and self._process_one(queue, pipeline_fn, skip_lost=True)):
+                    worked = False
+                    if self._has_own_pending(queue, skip_lost=True):
+                        worked = self._process_one(queue, pipeline_fn, skip_lost=True)
+                    elif mongo_mode:
+                        worked = self._process_one_vod(worker_alias, probe_fn)
+                    if not worked:
                         self.sleep(1.0)
                     pool.cleanup(t)
                     if hasattr(pool, "enforce_cap"):
@@ -1461,7 +2061,7 @@ class Supervisor:
                 if c_end is not None and self._need_replay:
                     self._replay_unsynced(queue, c_end)
 
-                all_jobs: list[str] = []
+                all_jobs: list[str] = list(self._jobs)
                 for sess in self._all_sessions.values():
                     all_jobs.extend(sess.jobs)
                 status = "lease_lost" if (self._saw_lease_lost and not any(s.live_ended for s in self._all_sessions.values())) else "ended"
@@ -1471,6 +2071,7 @@ class Supervisor:
                 _stop_keepalive()
                 for key, sess in list(self._active.items()):
                     self._release_session(key, sess, release_pool=True, reraise_non_mongo=True)
+                self._release_all_managed_alvos(self.coord)
             finally:
                 if pool is not None and hasattr(pool, "stop_all"):
                     try:
@@ -1480,14 +2081,23 @@ class Supervisor:
                 lock.close()
 
 
+def _aviso_servico(texto: str) -> None:
+    # aviso de ciclo de vida: falha ao postar nunca derruba o servico
+    try:
+        post_aviso(texto)
+    except Exception as exc:
+        print(f"[acompanhar] falha ao postar aviso ({type(exc).__name__})", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
-        prog="clipes acompanhar",
-        description="Acompanha uma ou mais lives (Twitch/YouTube/Kick) em uma fila unica.",
+        prog="clipes servico",
+        description="Servico unico por PC: acompanha lives (Twitch/YouTube/Kick), roda busca geral e processa VODs em uma fila unica.",
     )
-    p.add_argument("alvos", nargs="+", help="Canais/URLs Twitch ou URLs de live do YouTube/Kick")
+    p.add_argument("alvos", nargs="*", help="Canais/URLs Twitch ou URLs de live do YouTube/Kick (opcional com CLIPES_MONGO_URI)")
     p.add_argument("--out-dir", default=None, help="Padrao: OUT_DIR ou ./out")
     p.add_argument("--queue-dir", type=Path, default=None, help="Padrao: <out-dir>/queue")
+    p.add_argument("--channels-file", type=Path, default=Path("channels.txt"), help="Canais da busca geral (1 por linha; padrao: channels.txt)")
     p.add_argument("--policy-file", type=Path, default=None, help="Padrao: CLIPES_POLICY_FILE, senao <OUT_DIR>/policy.json (legado ao lado do channels.txt/cwd so se o padrao nao existir)")
     p.add_argument("--max-dur", type=float, default=60.0, help="Duracao maxima de cada clipe em segundos")
     p.add_argument("--min-dur", type=float, default=None, help="Duracao minima de cada clipe em segundos")
@@ -1498,6 +2108,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     if args.min_dur is not None and args.min_dur <= 0:
         print("[acompanhar] --min-dur deve ser > 0", file=sys.stderr, flush=True)
+        return 2
+
+    has_mongo = bool(os.environ.get("CLIPES_MONGO_URI", "").strip())
+    if not args.alvos and not has_mongo:
+        print("[acompanhar] informe ao menos um alvo ou configure CLIPES_MONGO_URI", file=sys.stderr, flush=True)
         return 2
 
     parsed: list[Alvo] = []
@@ -1513,7 +2128,10 @@ def main(argv: list[str] | None = None) -> int:
     policy = monitor.load_policy(args.policy_file) if args.policy_file else monitor.load_policy(config.resolve_policy_path(out_root, legacy=Path("policy.json")))
     try:
         with _exit_signals_to_kb():
-            coord = monitor._connect_coord_for_follow(out_root) if os.environ.get("CLIPES_MONGO_URI", "").strip() else None
+            coord = monitor._connect_coord_for_follow(out_root) if has_mongo else None
+            if not parsed and coord is None:
+                print("[acompanhar] CLIPES_MONGO_URI indisponivel e nenhum alvo informado", file=sys.stderr, flush=True)
+                return 1
 
             sup = Supervisor(
                 parsed,
@@ -1523,8 +2141,13 @@ def main(argv: list[str] | None = None) -> int:
                 min_dur=args.min_dur,
                 policy=policy,
                 coord=coord,
+                channels_file=args.channels_file,
             )
-            sup.run()
+            _aviso_servico("servico iniciado")
+            try:
+                sup.run()
+            finally:
+                _aviso_servico("servico parado")
     except KeyboardInterrupt:
         pass
     except RuntimeError as exc:

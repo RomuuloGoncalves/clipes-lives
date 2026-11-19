@@ -43,7 +43,7 @@ fi
 
 mkdir -p "$OUT_DIR" "$(dirname "$LOG")"
 pausado=0
-trap 'ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives); [ -n "$ids" ] && docker unpause $ids >/dev/null 2>&1; exit' INT TERM EXIT
+trap 'ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes); [ -n "$ids" ] && docker unpause $ids >/dev/null 2>&1; exit' INT TERM EXIT
 
 while :; do
   t=$(ler_temp)
@@ -51,13 +51,13 @@ while :; do
   if [ "$t" = "sem-sensor" ]; then
     echo "$(date +%T) sem-sensor pausado=$pausado" >> "$LOG"; sync "$LOG" 2>/dev/null
     if [ "$pausado" = 1 ]; then
-      ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives)
+      ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes)
       [ -n "$ids" ] && docker unpause $ids >/dev/null 2>&1
       pausado=0
     fi
   else
     echo "$(date +%T) ${t}C pausado=$pausado" >> "$LOG"; sync "$LOG" 2>/dev/null
-    ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives)
+    ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes)
     if [ "$pausado" = 0 ] && [ "$t" -ge "$MAX" ]; then
       [ -n "$ids" ] && docker pause $ids >/dev/null 2>&1
       pausado=1

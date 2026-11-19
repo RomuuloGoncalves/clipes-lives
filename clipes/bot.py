@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
 import json
 import os
 import re
 import sys
 import threading
+import time
+import urllib.parse
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,14 +20,32 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from . import config, publicacao
+from . import acompanhar, config, notificar, publicacao
 from .executor_publicacao import PublishLoop
 from .publicacao import LocalStore, MongoStore
 from .registro import Registro
 
 _PUBLICAR_RE = re.compile(r"^\s*publicar\s+(\S+)(?:\s+(agora))?\s*$", re.IGNORECASE)
 _BUSCAR_RE = re.compile(r"^\s*buscar(?:\s+(.*))?$", re.IGNORECASE)
+_AGENDADO_PARA_RE = re.compile(r"agendado para (\d{4}-\d{2}-\d{2} \d{2}:\d{2})")
+_VOD_HOST_PLATFORM: dict[str, str] = {
+    "twitch.tv": "twitch",
+    "www.twitch.tv": "twitch",
+    "m.twitch.tv": "twitch",
+    "kick.com": "kick",
+    "www.kick.com": "kick",
+    "m.kick.com": "kick",
+    "youtube.com": "youtube",
+    "www.youtube.com": "youtube",
+    "m.youtube.com": "youtube",
+    "youtu.be": "youtube",
+}
+_MONGO_URI_RE = re.compile(r"mongodb(?:\+srv)?://[^\s,;'\"]+")
+_URI_CREDS_RE = re.compile(r"(https?://)([^/\s@:]+:[^/\s@]+@)")
 _DISCORD_MAX_CHARS = 1900
+_MAX_ALVOS_ATIVOS = 30
+_MAX_VODS_ATIVOS = 20
+_DEFAULT_BEAT_S = 20.0
 _PLATFORM_LABELS: dict[str, str] = {
     "youtube": "YouTube",
     "tiktok": "TikTok",
@@ -60,6 +81,54 @@ def _parse_agendar_custom_id(custom_id: str) -> tuple[bool, str] | None:
     return (state == "on", clip_id)
 
 
+def _parse_descartar_custom_id(custom_id: str) -> str | None:
+    if not custom_id.startswith("descartar:"):
+        return None
+    clip_id = custom_id[len("descartar:") :].strip()
+    return clip_id or None
+
+
+def _discard_clip(out_root: Path, store: Any, clip_id: str) -> bool:
+    """Marca o clipe `descartado` no registro/Mongo; False se o clipe nao existe em lugar nenhum."""
+    db = getattr(store, "db", None)
+    reg = Registro(out_root, mongo=db)
+    updated = reg.marcar(clip_id, status="descartado")
+    if updated is None:
+        found = publicacao.find_clip(out_root, clip_id, store=store)
+        if found is not None:
+            clip_meta = found.get("clip") or {}
+            reg.upsert({
+                "clip_id": clip_id,
+                "titulo": str(clip_meta.get("title") or clip_id),
+                "canal": str(found.get("channel") or ""),
+                "video_id": str(found.get("video_id") or ""),
+                "owner": found.get("owner"),
+                "status": "descartado",
+            })
+            updated = reg.marcar(clip_id, status="descartado") or reg.get(clip_id)
+    mongo_hit = False
+    if db is not None and hasattr(db, "clips"):
+        try:
+            res = db.clips.update_one(
+                {"$or": [{"_id": clip_id}, {"clip_id": clip_id}]},
+                {"$set": {"status": "descartado"}},
+            )
+            mongo_hit = bool(getattr(res, "matched_count", 0))
+        except Exception as exc:
+            print(f"[bot] erro ao marcar descartado no Mongo ({_redact(f'{type(exc).__name__}: {exc}')})", flush=True)
+    return updated is not None or mongo_hit
+
+
+def _status_line_for_accepted(result: str, accepted: list[str]) -> str:
+    match = _AGENDADO_PARA_RE.search(result)
+    if match:
+        return f"🗓️ agendado ({match.group(1)})"
+    labels = [_PLATFORM_LABELS[p] for p in accepted if p in _PLATFORM_LABELS]
+    if labels:
+        return f"🗓️ na fila ({', '.join(labels)})"
+    return "🗓️ agendado"
+
+
 def _read_agendar_toggle(message: Any) -> bool:
     components = getattr(message, "components", None)
     if not components:
@@ -87,6 +156,14 @@ def _build_clip_view(clip_id: str, *, agendar_on: bool) -> discord.ui.View:
             style=discord.ButtonStyle(1 if agendar_on else 2),
             label="Agendar: sim" if agendar_on else "Agendar: nao",
             custom_id=f"agendar:{'on' if agendar_on else 'off'}:{clip_id}",
+            row=1,
+        )
+    )
+    view.add_item(
+        discord.ui.Button(
+            style=discord.ButtonStyle(4),
+            label="Descartar",
+            custom_id=f"descartar:{clip_id}",
             row=1,
         )
     )
@@ -164,19 +241,31 @@ def _in_configured_channel(channel: Any, configured_channel_id: str | int | None
     return parent_id is not None and str(parent_id) == target
 
 
-def _interaction_in_configured_channel(interaction: Any, configured_channel_id: str | int | None) -> bool:
+async def _autorizado(
+    interaction: Any,
+    channel_id: str | int | None,
+    allowed_ids: Iterable[str | int] | None,
+) -> bool:
+    """Valida canal configurado (ou suas threads) e usuario permitido; responde 'sem permissao' efemero se negado."""
     channel = getattr(interaction, "channel", None)
     if channel is not None:
-        return _in_configured_channel(channel, configured_channel_id)
-    if configured_channel_id is None or str(configured_channel_id).strip() == "":
-        return False
-    cid = getattr(interaction, "channel_id", None)
-    return cid is not None and str(cid) == str(configured_channel_id).strip()
+        in_channel = _in_configured_channel(channel, channel_id)
+    elif channel_id is None or str(channel_id).strip() == "":
+        in_channel = False
+    else:
+        cid = getattr(interaction, "channel_id", None)
+        in_channel = cid is not None and str(cid) == str(channel_id).strip()
 
-
-def _interaction_user_allowed(interaction: Any, allowed_ids: Iterable[str | int] | None) -> bool:
     user_id = getattr(getattr(interaction, "user", None), "id", "")
-    return publicacao.user_allowed(user_id, allowed_ids)
+    if not in_channel or not publicacao.user_allowed(user_id, allowed_ids):
+        await _reply_now(
+            interaction,
+            "sem permissao",
+            ephemeral=True,
+            no_mentions=discord.AllowedMentions.none(),
+        )
+        return False
+    return True
 
 
 def _clip_id_from_entry(manifest: dict[str, Any], entry: dict[str, Any]) -> str | None:
@@ -330,11 +419,332 @@ _SECRET_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "MONGO_URI", "API_KEY")
 
 def _redact(text: str) -> str:
     """Mascara segredos de env (token do Discord, URI do Mongo e variaveis com cara de segredo) em mensagens de erro."""
+    text = _MONGO_URI_RE.sub("mongodb://***@***", text)
+    text = _URI_CREDS_RE.sub(r"\1***@", text)
     for name, value in os.environ.items():
         value = value.strip()
         if len(value) >= 6 and (name == "DISCORD_BOT_TOKEN" or any(h in name.upper() for h in _SECRET_ENV_HINTS)):
             text = text.replace(value, "***")
     return text
+
+
+def _now_ts(now: Callable[[], float] | float | None) -> float:
+    if callable(now):
+        return float(now())
+    if now is not None:
+        return float(now)
+    return time.time()
+
+
+def _worker_is_online(worker: dict[str, Any], now_ts: float) -> bool:
+    hb = worker.get("heartbeat_at")
+    if not isinstance(hb, datetime):
+        return False
+    hb_utc = hb.replace(tzinfo=timezone.utc) if hb.tzinfo is None else hb.astimezone(timezone.utc)
+    try:
+        beat_s = float(worker.get("beat_s") or _DEFAULT_BEAT_S)
+        if beat_s <= 0:
+            beat_s = _DEFAULT_BEAT_S
+    except (TypeError, ValueError):
+        beat_s = _DEFAULT_BEAT_S
+    return (now_ts - hb_utc.timestamp()) <= 3.0 * beat_s
+
+
+def _parse_live_alvo(raw: str) -> acompanhar.Alvo:
+    """Valida alvo de live (login Twitch ou URL de twitch.tv, kick.com, youtube.com, youtu.be)."""
+    clean = (raw or "").strip()
+    if not clean or any(ch.isspace() for ch in clean):
+        raise ValueError("alvo invalido")
+    if "://" in clean:
+        parsed_url = urllib.parse.urlsplit(clean)
+        if parsed_url.scheme.lower() not in ("http", "https") or parsed_url.username or parsed_url.password:
+            raise ValueError("alvo invalido")
+    return acompanhar.parse_alvo(clean)  # regra unica (inclui kick_<slug> e _KICK_RESERVED)
+
+
+def _has_free_slot(db: Any, plataforma: str, pc_fixo: str | None, now_ts: float) -> bool:
+    for w in db.workers.find({}):
+        if not _worker_is_online(w, now_ts):
+            continue
+        if pc_fixo is not None:
+            alias = str(w.get("alias") or w.get("_id") or "")
+            if alias != pc_fixo:
+                continue
+        slots = w.get("slots")
+        if not isinstance(slots, dict):
+            continue
+        ocupados = w.get("ocupados") if isinstance(w.get("ocupados"), dict) else {}
+        try:
+            cap = int(slots.get(plataforma, 0) or 0)
+            used = int(ocupados.get(plataforma, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if cap > used:
+            return True
+    return False
+
+
+def _live_adicionar(
+    store: Any,
+    raw_alvo: str,
+    pc: str | None,
+    user_id: str | int,
+    *,
+    now: Callable[[], float] | float | None = None,
+) -> str:
+    db = getattr(store, "db", None)
+    if db is None:
+        return "controle requer CLIPES_MONGO_URI"
+    try:
+        parsed = _parse_live_alvo(raw_alvo)
+    except ValueError:
+        return "alvo invalido"
+
+    pc_fixo = (pc or "").strip() or None
+    try:
+        existing = db.alvos.find_one({"_id": parsed.chave})
+        if existing is not None and existing.get("estado") == "ativo":
+            owner_id = existing.get("owner")
+            if owner_id:
+                w = db.workers.find_one({"_id": owner_id})
+                dono = str(w.get("alias") or owner_id) if w else str(owner_id)
+            else:
+                return "ja acompanhado (sem PC)"
+            return f"ja acompanhado por {dono}"
+
+        ativos = db.alvos.count_documents({"tipo": "live", "estado": "ativo"})
+        if ativos >= _MAX_ALVOS_ATIVOS:
+            return f"limite de {_MAX_ALVOS_ATIVOS} alvos ativos atingido"
+
+        now_ts = _now_ts(now)
+        now_dt = datetime.fromtimestamp(now_ts, timezone.utc).replace(tzinfo=None)
+        entrada = parsed.canal if parsed.plataforma == "twitch" else parsed.url
+        doc = {
+            "_id": parsed.chave,
+            "tipo": "live",
+            "plataforma": parsed.plataforma,
+            "entrada": entrada,
+            "canal": parsed.canal,
+            "url": None,
+            "estado": "ativo",
+            "pc_fixo": pc_fixo,
+            "owner": None,
+            "lease_until": None,
+            "fase": "sem vaga",
+            "criado_por": str(user_id),
+            "criado_em": now_dt,
+            "erro": None,
+        }
+        db.alvos.replace_one({"_id": parsed.chave}, doc, upsert=True)
+        has_vaga = _has_free_slot(db, parsed.plataforma, pc_fixo, now_ts)
+    except Exception as exc:
+        print(f"[bot] erro Mongo em /live adicionar ({_redact(f'{type(exc).__name__}: {exc}')})", flush=True)
+        return "controle indisponivel (Mongo)"
+
+    if not has_vaga:
+        return f"alvo adicionado: {parsed.chave} (sem vaga)"
+    return f"alvo adicionado: {parsed.chave}"
+
+
+def _live_remover(store: Any, raw_alvo: str) -> str:
+    db = getattr(store, "db", None)
+    if db is None:
+        return "controle requer CLIPES_MONGO_URI"
+    clean = (raw_alvo or "").strip()
+    if not clean:
+        return "alvo invalido"
+
+    candidates = [clean]
+    try:
+        parsed = _parse_live_alvo(clean)
+        if parsed.chave not in candidates:
+            candidates.append(parsed.chave)
+    except ValueError:
+        pass
+
+    try:
+        doc = db.alvos.find_one({"_id": {"$in": candidates}, "tipo": "live", "estado": "ativo"})
+        if doc is None:
+            doc = db.alvos.find_one({"entrada": clean, "tipo": "live", "estado": "ativo"})
+        if doc is None:
+            return f"alvo nao encontrado: {clean}"
+        db.alvos.update_one({"_id": doc["_id"]}, {"$set": {"estado": "removido"}})
+        return f"alvo removido: {doc['_id']}"
+    except Exception as exc:
+        print(f"[bot] erro Mongo em /live remover ({_redact(f'{type(exc).__name__}: {exc}')})", flush=True)
+        return "controle indisponivel (Mongo)"
+
+
+def _live_lista(store: Any) -> str:
+    db = getattr(store, "db", None)
+    if db is None:
+        return "controle requer CLIPES_MONGO_URI"
+    try:
+        docs = list(db.alvos.find({"tipo": "live", "estado": "ativo"}).sort("criado_em", 1))
+        if not docs:
+            return "nenhum alvo ativo"
+        aliases = {
+            w["_id"]: str(w.get("alias") or w["_id"])
+            for w in db.workers.find({})
+            if "_id" in w
+        }
+    except Exception as exc:
+        print(f"[bot] erro Mongo em /live lista ({_redact(f'{type(exc).__name__}: {exc}')})", flush=True)
+        return "controle indisponivel (Mongo)"
+
+    lines: list[str] = []
+    total_len = 0
+    for doc in docs:
+        aid = str(doc.get("_id") or "")
+        plat = str(doc.get("plataforma") or "?")
+        owner_id = doc.get("owner")
+        dono = aliases.get(owner_id, str(owner_id)) if owner_id else "sem PC"
+        fase = str(doc.get("fase") or "sem vaga")
+        pc_fixo = doc.get("pc_fixo")
+        fixo_part = f" [pc: {pc_fixo}]" if pc_fixo else ""
+        line = f"• `{aid}` ({plat}) — {dono} · {fase}{fixo_part}"
+        sep = 1 if lines else 0
+        if total_len + sep + len(line) > _DISCORD_MAX_CHARS:
+            if not lines:
+                lines.append(line[:_DISCORD_MAX_CHARS])
+            break
+        lines.append(line)
+        total_len += sep + len(line)
+    return "\n".join(lines) if lines else "nenhum alvo ativo"
+
+
+def _parse_vod_url(raw: str) -> tuple[str, str] | None:
+    clean = (raw or "").strip()
+    if not clean or any(ch.isspace() for ch in clean):
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(clean)
+    except ValueError:
+        return None
+    if parsed.scheme.lower() not in ("http", "https"):
+        return None
+    if parsed.username or parsed.password:
+        return None
+    host = (parsed.hostname or "").lower()
+    plataforma = _VOD_HOST_PLATFORM.get(host)
+    if not plataforma or not parsed.path.strip("/"):
+        return None
+    return plataforma, clean
+
+
+def _clipar_vod(
+    store: Any,
+    raw_url: str,
+    user_id: str | int,
+    *,
+    now: Callable[[], float] | float | None = None,
+) -> str:
+    db = getattr(store, "db", None)
+    if db is None:
+        return "controle requer CLIPES_MONGO_URI"
+    parsed = _parse_vod_url(raw_url)
+    if parsed is None:
+        return "url invalida"
+    plataforma, clean_url = parsed
+    vod_id = f"vod:{hashlib.sha256(clean_url.encode('utf-8')).hexdigest()[:8]}"
+
+    try:
+        existing = db.alvos.find_one({"_id": vod_id})
+        if existing is not None and existing.get("estado") == "ativo":
+            return "ja na fila"
+        ativos = db.alvos.count_documents({"tipo": "vod", "estado": "ativo"})
+        if ativos >= _MAX_VODS_ATIVOS:
+            return f"fila cheia ({_MAX_VODS_ATIVOS})"
+        now_dt = datetime.fromtimestamp(_now_ts(now), timezone.utc).replace(tzinfo=None)
+        doc = {
+            "_id": vod_id,
+            "tipo": "vod",
+            "plataforma": plataforma,
+            "entrada": "",
+            "url": clean_url,
+            "estado": "ativo",
+            "pc_fixo": None,
+            "owner": None,
+            "lease_until": None,
+            "fase": "na fila",
+            "criado_por": str(user_id),
+            "criado_em": now_dt,
+            "erro": None,
+        }
+        db.alvos.replace_one({"_id": vod_id}, doc, upsert=True)
+        pos = db.alvos.count_documents({"tipo": "vod", "estado": "ativo"})
+        return f"na fila: posição {pos}"
+    except Exception as exc:
+        print(f"[bot] erro Mongo em /clipar ({_redact(f'{type(exc).__name__}: {exc}')})", flush=True)
+        return "controle indisponivel (Mongo)"
+
+
+def _format_workers_status(store: Any, *, now: Callable[[], float] | float | None = None) -> str:
+    db = getattr(store, "db", None)
+    if db is None:
+        return "controle requer CLIPES_MONGO_URI"
+    try:
+        workers = list(db.workers.find({}))
+    except Exception as exc:
+        print(f"[bot] erro Mongo em /status ({_redact(f'{type(exc).__name__}: {exc}')})", flush=True)
+        return "controle indisponivel (Mongo)"
+
+    if not workers:
+        return "nenhum PC registrado"
+
+    workers.sort(key=lambda w: (str(w.get("alias") or w.get("_id") or "").lower(), str(w.get("_id") or "")))
+    now_ts = _now_ts(now)
+    tz, _ = publicacao._resolve_tz()
+
+    lines: list[str] = []
+    total_len = 0
+    for w in workers:
+        alias = str(w.get("alias") or w.get("_id") or "?")
+        hb = w.get("heartbeat_at")
+        if _worker_is_online(w, now_ts):
+            estado = "online"
+        elif isinstance(hb, datetime):
+            hb_utc = hb.replace(tzinfo=timezone.utc) if hb.tzinfo is None else hb.astimezone(timezone.utc)
+            estado = f"offline (desde {hb_utc.astimezone(tz).strftime('%H:%M')})"
+        else:
+            estado = "offline"
+
+        slots = w.get("slots") if isinstance(w.get("slots"), dict) else {}
+        ocupados = w.get("ocupados") if isinstance(w.get("ocupados"), dict) else {}
+        ordem = [p for p in ("twitch", "kick", "youtube", "busca") if p in slots or p in ocupados]
+        extras = sorted(p for p in (set(slots) | set(ocupados)) if p not in ordem)
+        plats = ordem + extras
+        if plats:
+            slots_str = " ".join(
+                f"{p}:{int(ocupados.get(p, 0) or 0)}/{int(slots.get(p, 0) or 0)}" for p in plats
+            )
+        else:
+            slots_str = f"max:{w.get('max_lives', '-')}"
+
+        job = str(w.get("job_atual") or "ocioso")[:40]
+        fila = w.get("fila") if isinstance(w.get("fila"), dict) else {}
+        j = int(fila.get("janelas", 0) or 0)
+        b = int(fila.get("busca", 0) or 0)
+        v = int(fila.get("vods", 0) or 0)
+
+        cap = w.get("capacity") if isinstance(w.get("capacity"), dict) else {}
+        temp = cap.get("temp_c")
+        temp_str = f"{temp:g}C" if isinstance(temp, (int, float)) else "-C"
+        disco = cap.get("disco_livre_gb")
+        disco_str = f"{disco:.1f}GB" if isinstance(disco, (int, float)) else "-GB"
+
+        line = (
+            f"• **{alias}** ({estado}) | {slots_str} | job: {job} | "
+            f"fila: janelas={j} busca={b} vods={v} | {temp_str} | {disco_str}"
+        )
+        sep = 1 if lines else 0
+        if total_len + sep + len(line) > _DISCORD_MAX_CHARS:
+            if not lines:
+                lines.append(line[:_DISCORD_MAX_CHARS])
+            break
+        lines.append(line)
+        total_len += sep + len(line)
+    return "\n".join(lines) if lines else "nenhum PC registrado"
 
 
 async def _reply_now(interaction: Any, text: str, *, ephemeral: bool, no_mentions: Any) -> None:
@@ -557,6 +967,7 @@ class ClipesBot(discord.Client):
             await message.reply(result, mention_author=False, allowed_mentions=no_mentions)
         elif channel is not None and hasattr(channel, "send"):
             await channel.send(result, allowed_mentions=no_mentions)
+        await self._update_clip_card(clip_id, result, author, user_id, no_mentions, agendar=not agora)
 
         await self._maybe_notify_thread(clip_id, result, getattr(channel, "id", None))
         await self._maybe_run_local(result)
@@ -591,6 +1002,8 @@ class ClipesBot(discord.Client):
         has_yt = _has_platform_line(new_content, "YouTube") or ("youtube: ja publicado" in result)
         has_tt = _has_platform_line(new_content, "TikTok") or ("tiktok: ja publicado" in result)
         remove_buttons = has_yt and has_tt
+        status = "✅ publicado (YouTube, TikTok)" if remove_buttons else _status_line_for_accepted(result, accepted)
+        new_content = notificar.set_clip_status_line(new_content, status)
         if new_content == orig_content and not remove_buttons:
             return
         edit_kw: dict[str, Any] = (
@@ -605,6 +1018,29 @@ class ClipesBot(discord.Client):
         except Exception:
             pass
 
+    async def _update_clip_card(
+        self, clip_id: str, result: str, user: Any, user_id: Any, no_mentions: discord.AllowedMentions, *, agendar: bool
+    ) -> None:
+        """Slash/texto nao tem a mensagem do clipe em mãos: busca pelo registro e reusa a edicao do botao."""
+        accepted = _accepted_platforms(result)
+        if not accepted:
+            return
+        try:
+            found = await asyncio.to_thread(publicacao.find_clip, self.out_root, clip_id, store=self.store)
+            d_info = found.get("discord") if isinstance((found or {}).get("discord"), dict) else {}
+            thread_id = d_info.get("thread_id") or (found or {}).get("thread_id")
+            message_id = d_info.get("message_id")
+            if not (thread_id and message_id):
+                return
+            channel = self.get_channel(int(thread_id)) or await self.fetch_channel(int(thread_id))
+            msg = await channel.fetch_message(int(message_id))
+        except Exception as exc:
+            print(f"[bot] erro ao localizar cartao do clipe {clip_id} ({type(exc).__name__})", flush=True)
+            return
+        await self._update_button_message(
+            msg, user, user_id, accepted, result, no_mentions, agendar=agendar
+        )
+
     async def on_interaction(self, interaction: Any) -> None:
         itype = getattr(interaction, "type", None)
         if itype not in (discord.InteractionType.component, 3):
@@ -614,16 +1050,17 @@ class ClipesBot(discord.Client):
             return
         custom_id = str(data.get("custom_id") or "")
         toggle_parsed = _parse_agendar_custom_id(custom_id)
-        dest_parsed = None if toggle_parsed is not None else _parse_button_custom_id(custom_id)
-        if toggle_parsed is None and dest_parsed is None:
+        descartar_clip_id = None if toggle_parsed is not None else _parse_descartar_custom_id(custom_id)
+        dest_parsed = (
+            None
+            if (toggle_parsed is not None or descartar_clip_id is not None)
+            else _parse_button_custom_id(custom_id)
+        )
+        if toggle_parsed is None and descartar_clip_id is None and dest_parsed is None:
             return
 
         no_mentions = discord.AllowedMentions.none()
-        if not _interaction_in_configured_channel(interaction, self.channel_id):
-            await _reply_now(interaction, "canal nao permitido", ephemeral=True, no_mentions=no_mentions)
-            return
-        if not _interaction_user_allowed(interaction, self.allowed_ids):
-            await _reply_now(interaction, "sem permissao", ephemeral=True, no_mentions=no_mentions)
+        if not await _autorizado(interaction, self.channel_id, self.allowed_ids):
             return
 
         if toggle_parsed is not None:
@@ -633,6 +1070,34 @@ class ClipesBot(discord.Client):
             if _accepts_kw(interaction.response.edit_message, "allowed_mentions"):
                 edit_kw["allowed_mentions"] = no_mentions
             await interaction.response.edit_message(**edit_kw)
+            return
+
+        if descartar_clip_id is not None:
+            msg = getattr(interaction, "message", None)
+            await _defer_once(interaction, thinking=True)
+            ok = await _run_deferred(interaction, _discard_clip, self.out_root, self.store, descartar_clip_id)
+            if ok is None:
+                return
+            if not ok:
+                await interaction.followup.send(
+                    f"clipe {descartar_clip_id} nao encontrado", allowed_mentions=no_mentions
+                )
+                return
+            if msg is not None and hasattr(msg, "edit"):
+                orig_content = str(getattr(msg, "content", "") or "")
+                new_content = notificar.set_clip_status_line(
+                    orig_content,
+                    "🗑️ descartado",
+                    prepend_if_missing=True,
+                )
+                edit_kw = {"view": None}
+                if _accepts_kw(msg.edit, "allowed_mentions"):
+                    edit_kw["allowed_mentions"] = no_mentions
+                try:
+                    await msg.edit(content=new_content, **edit_kw)
+                except Exception:
+                    pass
+            await interaction.followup.send(f"clipe descartado: {descartar_clip_id}", allowed_mentions=no_mentions)
             return
 
         assert dest_parsed is not None
@@ -692,6 +1157,9 @@ def make_bot(
     if store is None:
         store = LocalStore(resolved_root)
 
+    if "*" in publicacao._allowed_user_set(allowed_ids):
+        print("[bot] aviso: comandos liberados para qualquer membro do canal", flush=True)
+
     intents = discord.Intents.default()
     intents.message_content = True
 
@@ -718,17 +1186,12 @@ def make_bot(
     )
     async def publicar_cmd(interaction: discord.Interaction, id: str, agora: bool = False) -> None:
         no_mentions = discord.AllowedMentions.none()
-        if not _interaction_in_configured_channel(interaction, bot.channel_id):
-            await _reply_now(interaction, "canal nao permitido", ephemeral=True, no_mentions=no_mentions)
+        if not await _autorizado(interaction, bot.channel_id, bot.allowed_ids):
             return
         clip_id = id.strip()
         channel = getattr(interaction, "channel", None)
         thread_id = _extract_thread_id(channel)
         user_id = getattr(getattr(interaction, "user", None), "id", "")
-        # A-07: defer antes do I/O; "sem permissao" e checado antes para sair efemero
-        if not _interaction_user_allowed(interaction, bot.allowed_ids):
-            await _reply_now(interaction, "sem permissao", ephemeral=True, no_mentions=no_mentions)
-            return
         await _defer_once(interaction)
         result = await _run_deferred(
             interaction, bot._request_publish, clip_id, user_id, thread_id, agendar=not agora
@@ -739,6 +1202,9 @@ def make_bot(
             result,
             allowed_mentions=no_mentions,
         )
+        await bot._update_clip_card(
+            clip_id, result, getattr(interaction, "user", None), user_id, no_mentions, agendar=not agora
+        )
         current_cid = getattr(interaction, "channel_id", getattr(channel, "id", None))
         await bot._maybe_notify_thread(clip_id, result, current_cid)
         await bot._maybe_run_local(result)
@@ -746,11 +1212,7 @@ def make_bot(
     @bot.tree.command(name="listar", description="Lista os 10 ultimos clip_id disponiveis")
     async def listar_cmd(interaction: discord.Interaction) -> None:
         no_mentions = discord.AllowedMentions.none()
-        if not _interaction_in_configured_channel(interaction, bot.channel_id):
-            await _reply_now(interaction, "canal nao permitido", ephemeral=True, no_mentions=no_mentions)
-            return
-        if not _interaction_user_allowed(interaction, bot.allowed_ids):
-            await _reply_now(interaction, "sem permissao", ephemeral=True, no_mentions=no_mentions)
+        if not await _autorizado(interaction, bot.channel_id, bot.allowed_ids):
             return
         await _defer_once(interaction)
         text = await _run_deferred(interaction, _format_recent_clips, bot.out_root, store=bot.store, limit=10)
@@ -762,11 +1224,7 @@ def make_bot(
     @app_commands.describe(texto="Palavras para buscar (minimo 2 caracteres)")
     async def buscar_cmd(interaction: discord.Interaction, texto: str) -> None:
         no_mentions = discord.AllowedMentions.none()
-        if not _interaction_in_configured_channel(interaction, bot.channel_id):
-            await _reply_now(interaction, "canal nao permitido", ephemeral=True, no_mentions=no_mentions)
-            return
-        if not _interaction_user_allowed(interaction, bot.allowed_ids):
-            await _reply_now(interaction, "sem permissao", ephemeral=True, no_mentions=no_mentions)
+        if not await _autorizado(interaction, bot.channel_id, bot.allowed_ids):
             return
         gid = _resolve_guild_id(interaction, bot.guild_id)
         await _defer_once(interaction)
@@ -778,6 +1236,73 @@ def make_bot(
             store=bot.store,
             guild_id=gid,
         )
+        if reply is None:
+            return
+        await interaction.followup.send(reply, ephemeral=False, allowed_mentions=no_mentions)
+
+    live_group = app_commands.Group(name="live", description="Gerencia lives acompanhadas")
+
+    @live_group.command(name="adicionar", description="Adiciona uma live para acompanhamento")
+    @app_commands.describe(
+        alvo="Canal Twitch ou URL (Twitch, Kick, YouTube)",
+        pc="Alias de um PC especifico (opcional)",
+    )
+    async def live_adicionar_cmd(interaction: discord.Interaction, alvo: str, pc: str | None = None) -> None:
+        no_mentions = discord.AllowedMentions.none()
+        if not await _autorizado(interaction, bot.channel_id, bot.allowed_ids):
+            return
+        user_id = getattr(getattr(interaction, "user", None), "id", "")
+        await _defer_once(interaction)
+        reply = await _run_deferred(interaction, _live_adicionar, bot.store, alvo, pc, user_id, now=bot.now)
+        if reply is None:
+            return
+        await interaction.followup.send(reply, ephemeral=False, allowed_mentions=no_mentions)
+
+    @live_group.command(name="remover", description="Remove uma live acompanhada")
+    @app_commands.describe(alvo="Canal, URL ou chave do alvo ativo")
+    async def live_remover_cmd(interaction: discord.Interaction, alvo: str) -> None:
+        no_mentions = discord.AllowedMentions.none()
+        if not await _autorizado(interaction, bot.channel_id, bot.allowed_ids):
+            return
+        await _defer_once(interaction)
+        reply = await _run_deferred(interaction, _live_remover, bot.store, alvo)
+        if reply is None:
+            return
+        await interaction.followup.send(reply, ephemeral=False, allowed_mentions=no_mentions)
+
+    @live_group.command(name="lista", description="Lista as lives atualmente acompanhadas")
+    async def live_lista_cmd(interaction: discord.Interaction) -> None:
+        no_mentions = discord.AllowedMentions.none()
+        if not await _autorizado(interaction, bot.channel_id, bot.allowed_ids):
+            return
+        await _defer_once(interaction)
+        reply = await _run_deferred(interaction, _live_lista, bot.store)
+        if reply is None:
+            return
+        await interaction.followup.send(reply, ephemeral=False, allowed_mentions=no_mentions)
+
+    bot.tree.add_command(live_group)
+
+    @bot.tree.command(name="clipar", description="Enfileira um VOD para clipagem")
+    @app_commands.describe(url="URL http(s) do VOD (Twitch, Kick ou YouTube)")
+    async def clipar_cmd(interaction: discord.Interaction, url: str) -> None:
+        no_mentions = discord.AllowedMentions.none()
+        if not await _autorizado(interaction, bot.channel_id, bot.allowed_ids):
+            return
+        user_id = getattr(getattr(interaction, "user", None), "id", "")
+        await _defer_once(interaction)
+        reply = await _run_deferred(interaction, _clipar_vod, bot.store, url, user_id, now=bot.now)
+        if reply is None:
+            return
+        await interaction.followup.send(reply, ephemeral=False, allowed_mentions=no_mentions)
+
+    @bot.tree.command(name="status", description="Mostra estado dos PCs, slots, fila, temperatura e disco")
+    async def status_cmd(interaction: discord.Interaction) -> None:
+        no_mentions = discord.AllowedMentions.none()
+        if not await _autorizado(interaction, bot.channel_id, bot.allowed_ids):
+            return
+        await _defer_once(interaction)
+        reply = await _run_deferred(interaction, _format_workers_status, bot.store, now=bot.now)
         if reply is None:
             return
         await interaction.followup.send(reply, ephemeral=False, allowed_mentions=no_mentions)
@@ -820,6 +1345,7 @@ def main(argv: list[str] | None = None) -> int:
             db = client.get_default_database(default="clipes_lives")
             store = MongoStore(db)
             store.ensure_indexes()
+            db.alvos.create_index([("estado", 1), ("tipo", 1), ("plataforma", 1)])
         except Exception as exc:
             msg = str(exc).replace(mongo_uri, "***").replace(token, "***")
             print(f"[bot] erro Mongo: {msg}", file=sys.stderr, flush=True)

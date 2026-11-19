@@ -480,3 +480,223 @@ def test_run_pending_command_liberar_marca_executando_chama_e_marca_feito(env):
     assert vistos == ["executando"]
     assert db.commands.find_one({"_id": cid})["status"] == "feito"
     assert a.run_pending_command(liberar) is None
+
+
+# ---- controle-discord T2: colecao alvos e heartbeat estendido ----
+
+
+def _alvo_doc(
+    alvo_id: str,
+    *,
+    tipo: str = "live",
+    plataforma: str = "twitch",
+    entrada: str = "gaules",
+    estado: str = "ativo",
+    pc_fixo: str | None = None,
+    owner: str | None = None,
+    lease_until=None,
+    fase: str = "sem vaga",
+    criado_em: float = 1.0,
+    url: str | None = None,
+) -> dict:
+    return {
+        "_id": alvo_id,
+        "tipo": tipo,
+        "plataforma": plataforma,
+        "entrada": entrada,
+        "url": url,
+        "estado": estado,
+        "pc_fixo": pc_fixo,
+        "owner": owner,
+        "lease_until": lease_until,
+        "fase": fase,
+        "criado_em": criado_em,
+        "erro": None,
+    }
+
+
+def test_ensure_indexes_cria_indice_alvos(env):
+    _, db, a, _ = env
+    a.ensure_indexes()
+    assert "estado_1_tipo_1_plataforma_1" in db.alvos.index_information()
+
+
+def test_claim_alvo_respeita_plataforma_estado_pc_fixo_e_exclude_ids(env):
+    clock, db, a, b = env
+    db.alvos.insert_many([
+        _alvo_doc("gaules", plataforma="twitch", entrada="gaules"),
+        _alvo_doc("alanzoka", plataforma="twitch", entrada="alanzoka", pc_fixo="PC-2"),
+        _alvo_doc("yt_1", plataforma="youtube", entrada="https://youtu.be/1"),
+        _alvo_doc("removido", plataforma="twitch", entrada="removido", estado="removido"),
+        _alvo_doc("vod:11111111", tipo="vod", plataforma="twitch", entrada="", url="https://twitch.tv/videos/1"),
+    ])
+
+    doc_a = a.claim_alvo("twitch", "PC-1")
+    assert doc_a is not None
+    assert doc_a["_id"] == "gaules"
+    assert doc_a["owner"] == "w-a"
+    assert doc_a["lease_until"] == a._dt(90)
+    assert "previous_owner" not in doc_a
+
+    # PC-1 nao pode pegar alanzoka (pc_fixo=PC-2) nem re-pegar gaules quando excluido
+    assert a.claim_alvo("twitch", "PC-1", exclude_ids={"gaules"}) is None
+
+    # PC-2 pega alanzoka (pc_fixo=PC-2) e nao pega gaules (owner=w-a com lease valida)
+    doc_b = b.claim_alvo("twitch", "PC-2")
+    assert doc_b is not None and doc_b["_id"] == "alanzoka" and doc_b["owner"] == "w-b"
+
+    # YouTube continua separado da Twitch
+    doc_yt = a.claim_alvo("youtube", "PC-1")
+    assert doc_yt is not None and doc_yt["_id"] == "yt_1"
+
+
+def test_claim_alvo_failover_apos_lease_90s_e_own_alvos(env):
+    clock, db, a, b = env
+    db.alvos.insert_one(_alvo_doc("gaules", plataforma="twitch", entrada="gaules"))
+
+    assert a.claim_alvo("twitch", "PC-1")["_id"] == "gaules"
+    assert [d["_id"] for d in a.own_alvos()] == ["gaules"]
+    assert b.claim_alvo("twitch", "PC-2") is None
+
+    clock.t += 91
+    assert a.own_alvos() == []  # lease vencida nao volta em own_alvos
+    taken = b.claim_alvo("twitch", "PC-2")
+    assert taken is not None
+    assert taken["_id"] == "gaules"
+    assert taken["owner"] == "w-b"
+    assert taken["previous_owner"] == "w-a"
+    assert db.alvos.find_one({"_id": "gaules"})["owner"] == "w-b"
+
+
+def test_claim_alvo_corrida_atomica_entre_dois_coords(env):
+    _, db, a, b = env
+    ids = [f"canal_{i}" for i in range(20)]
+    for i, aid in enumerate(ids):
+        db.alvos.insert_one(_alvo_doc(aid, plataforma="twitch", entrada=aid, criado_em=float(i)))
+
+    barrier = threading.Barrier(2)
+    wins: dict[str, set[str]] = {"w-a": set(), "w-b": set()}
+    errors: list[BaseException] = []
+
+    def racer(coord: Coord, alias: str) -> None:
+        try:
+            for _ in range(len(ids)):
+                barrier.wait(timeout=5)
+                doc = coord.claim_alvo("twitch", alias, exclude_ids=wins[coord.worker_id])
+                if doc is not None:
+                    wins[coord.worker_id].add(doc["_id"])
+        except BaseException as exc:  # pragma: no cover
+            errors.append(exc)
+
+    t1 = threading.Thread(target=racer, args=(a, "PC-1"))
+    t2 = threading.Thread(target=racer, args=(b, "PC-2"))
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+
+    assert not errors
+    assert wins["w-a"].isdisjoint(wins["w-b"])
+    assert wins["w-a"] | wins["w-b"] == set(ids)
+    for aid in ids:
+        expected = "w-a" if aid in wins["w-a"] else "w-b"
+        assert db.alvos.find_one({"_id": aid})["owner"] == expected
+
+
+def test_renew_alvos_e_release_alvo(env):
+    clock, db, a, b = env
+    db.alvos.insert_many([
+        _alvo_doc("c1", owner="w-a", lease_until=a._dt(90), fase="sem vaga"),
+        _alvo_doc("c2", owner="w-a", lease_until=a._dt(90), estado="removido", fase="gravando"),
+        _alvo_doc("c3", owner="w-b", lease_until=b._dt(90), fase="gravando"),
+    ])
+
+    clock.t += 30
+    renewed = a.renew_alvos({"c1": "gravando", "c2": "gravando", "c3": "aguardando live"})
+    assert renewed == {"c1"}
+    d1 = db.alvos.find_one({"_id": "c1"})
+    assert d1["fase"] == "gravando" and d1["lease_until"] == a._dt(90)
+    # c2 (removido) e c3 (outro dono) nao sao renovados nem alterados
+    assert db.alvos.find_one({"_id": "c2"})["lease_until"] != a._dt(90)
+    assert db.alvos.find_one({"_id": "c3"})["fase"] == "gravando"
+
+    # release_alvo limpa owner/lease e volta fase para "sem vaga" apenas se ativo
+    a.release_alvo("c1")
+    d1_rel = db.alvos.find_one({"_id": "c1"})
+    assert (d1_rel["owner"], d1_rel["lease_until"], d1_rel["fase"]) == (None, None, "sem vaga")
+
+    a.release_alvo("c2")
+    d2_rel = db.alvos.find_one({"_id": "c2"})
+    assert (d2_rel["owner"], d2_rel["lease_until"], d2_rel["fase"]) == (None, None, "gravando")
+
+    # Nao-dono nao solta c3
+    a.release_alvo("c3")
+    assert db.alvos.find_one({"_id": "c3"})["owner"] == "w-b"
+
+
+def test_alvos_ativos_retorna_chaves_de_lives_ativas_de_qualquer_pc(env):
+    _, db, a, _ = env
+    db.alvos.insert_many([
+        _alvo_doc("gaules", tipo="live", estado="ativo", owner="w-a"),
+        _alvo_doc("twitch:alanzoka", tipo="live", estado="ativo", owner="w-b"),
+        _alvo_doc("yt_AbC123", tipo="live", plataforma="youtube", estado="ativo", owner=None),
+        _alvo_doc("parado", tipo="live", estado="removido", owner=None),
+        _alvo_doc("vod:12345678", tipo="vod", estado="ativo", url="https://twitch.tv/videos/1"),
+    ])
+    ativos = a.alvos_ativos()
+    assert {"gaules", "twitch:alanzoka", "alanzoka", "yt_AbC123"} <= ativos
+    assert "parado" not in ativos
+    assert "vod:12345678" not in ativos
+
+
+def test_pegar_vod_mais_antigo_e_fim_vod_sanitizado(env, monkeypatch):
+    clock, db, a, b = env
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok_super_secreto_12345")
+    # VOD sem campos opcionais pc_fixo/owner (como na spec CTRL-02 AC1)
+    db.alvos.insert_many([
+        {"_id": "vod:novo0002", "tipo": "vod", "url": "https://twitch.tv/videos/2", "estado": "ativo", "criado_em": 20},
+        {"_id": "vod:velh0001", "tipo": "vod", "url": "https://twitch.tv/videos/1", "estado": "ativo", "criado_em": 10},
+        _alvo_doc("gaules", tipo="live", estado="ativo", criado_em=1),
+    ])
+
+    v1 = a.pegar_vod("PC-1")
+    assert v1 is not None and v1["_id"] == "vod:velh0001" and v1["owner"] == "w-a"
+    v2 = b.pegar_vod("PC-2")
+    assert v2 is not None and v2["_id"] == "vod:novo0002" and v2["owner"] == "w-b"
+    c = Coord(db, "w-c", now=clock)
+    assert c.pegar_vod("PC-3") is None
+
+    # Nao-dono nao finaliza VOD de outro PC
+    assert b.fim_vod("vod:velh0001", "feito") is False
+    assert a.fim_vod("vod:velh0001", "feito") is True
+    assert a.pegar_vod("PC-1") is None  # nao ha mais VOD livre
+    d1 = db.alvos.find_one({"_id": "vod:velh0001"})
+    assert (d1["estado"], d1["erro"], d1["owner"]) == ("feito", None, None)
+
+    assert b.fim_vod(
+        "vod:novo0002",
+        "falhou",
+        "erro em mongodb+srv://user:senha@cluster.local/db com tok_super_secreto_12345 e https://u:p@host/x",
+    ) is True
+    d2 = db.alvos.find_one({"_id": "vod:novo0002"})
+    assert d2["estado"] == "falhou"
+    assert "senha" not in d2["erro"]
+    assert "tok_super_secreto_12345" not in d2["erro"]
+    assert "u:p@" not in d2["erro"]
+    assert "mongodb+srv://***@***" in d2["erro"]
+
+    with pytest.raises(ValueError):
+        a.fim_vod("vod:velh0001", "ativo")
+
+
+def test_beat_estendido_grava_slots_ocupados_e_fila(env):
+    _, db, a, _ = env
+    slots = {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1}
+    ocupados = {"twitch": 1, "kick": 0, "youtube": 1, "busca": 0}
+    fila = {"janelas": 2, "busca": 1, "vods": 0}
+    a.beat("PC-1", CAP, "job-1", 3, 0.4, beat_s=20, slots=slots, ocupados=ocupados, fila=fila)
+    doc = db.workers.find_one({"_id": "w-a"})
+    assert doc["slots"] == slots
+    assert doc["ocupados"] == ocupados
+    assert doc["fila"] == fila
+    assert doc["beat_s"] == 20.0

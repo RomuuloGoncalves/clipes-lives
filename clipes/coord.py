@@ -3,6 +3,8 @@
 O Mongo só decide quem grava o quê; nenhum vídeo passa por ele. Nunca loga nem guarda a URI.
 """
 
+import os
+import re
 import time
 from datetime import datetime, timezone
 
@@ -10,11 +12,27 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
 ACOES = {"liberar"}  # lista branca de comandos do painel
+_SECRET_ENV_HINTS = ("SECRET", "TOKEN", "KEY", "PASS", "URI")
+_URI_CREDS_RE = re.compile(r"(https?://)([^/\s@:]+:[^/\s@]+@)")
+_MONGO_URI_RE = re.compile(r"mongodb(?:\+srv)?://[^\s,;'\"]+")
 
 
 def mask_uri(uri: str) -> str:
     """Esconde usuário, senha e host: `mongodb+srv://***@***`."""
     return uri.split("://", 1)[0] + "://***@***" if "://" in uri else "***"
+
+
+def _sanitize_erro(erro: str | None) -> str | None:
+    if erro is None:
+        return None
+    msg = str(erro)
+    msg = _MONGO_URI_RE.sub(lambda m: mask_uri(m.group(0)), msg)
+    msg = _URI_CREDS_RE.sub(r"\1***@", msg)
+    for name, value in os.environ.items():
+        val = value.strip()
+        if len(val) >= 6 and (name == "DISCORD_BOT_TOKEN" or any(h in name.upper() for h in _SECRET_ENV_HINTS)):
+            msg = msg.replace(val, "***")
+    return msg
 
 
 class Coord:
@@ -28,6 +46,7 @@ class Coord:
     def ensure_indexes(self) -> None:
         self.db.jobs.create_index([("status", 1), ("priority", -1)])
         self.db.lives.create_index([("status", 1), ("lease_until", 1)])
+        self.db.alvos.create_index([("estado", 1), ("tipo", 1), ("plataforma", 1)])
         self.db.commands.create_index([("worker_id", 1), ("status", 1)])
         self.db.commands.create_index(
             [("worker_id", 1)],
@@ -63,11 +82,15 @@ class Coord:
         )
         return res.matched_count == 1
 
-    def release(self, live_id: str, ended: bool) -> None:
+    def release(self, live_id: str, ended: bool, *, discord_client=None) -> None:
         fields = {"owner": None, "lease_until": None}
         if ended:
             fields.update(status="ended", ended_at=self._dt())
-        self.db.lives.update_one({"_id": live_id, "owner": self.worker_id}, {"$set": fields})
+        res = self.db.lives.update_one({"_id": live_id, "owner": self.worker_id}, {"$set": fields})
+        if ended and res.matched_count == 1:
+            from .notificar import encerrar_cartao_live
+
+            encerrar_cartao_live(self.db, live_id, discord_client=discord_client)
 
     def count_owned_live(self, exclude: "set[str] | list[str] | tuple[str, ...]" = ()) -> int:
         """Lives `live` deste PC com lease ainda válida (as órfãs de um crash não contam no max_lives)."""
@@ -133,15 +156,149 @@ class Coord:
             {"$set": {"status": "lost", "updated_at": self._dt()}},
         )
 
+    # ---- alvos (lives e VODs) ----
+
+    def own_alvos(self) -> list[dict]:
+        """Alvos de live ativos ainda sob lease valida deste PC (retomada pos-reinicio)."""
+        return list(
+            self.db.alvos.find({
+                "owner": self.worker_id,
+                "estado": "ativo",
+                "tipo": "live",
+                "lease_until": {"$gte": self._dt()},
+            })
+        )
+
+    def claim_alvo(
+        self,
+        plataforma: str,
+        alias: str | None = None,
+        *,
+        exclude_ids: "set[str] | list[str] | tuple[str, ...]" = (),
+    ) -> dict | None:
+        """Toma atomicamente um alvo de live ativo da plataforma compatível com `pc_fixo`."""
+        now = self._dt()
+        lease_until = self._dt(self.lease_s)
+        pc_vals = [None] if alias is None else [None, alias]
+        q: dict = {
+            "estado": "ativo",
+            "tipo": "live",
+            "plataforma": plataforma,
+            "pc_fixo": {"$in": pc_vals},
+            "$or": [{"owner": None}, {"lease_until": {"$lt": now}}, {"owner": self.worker_id}],
+        }
+        if exclude_ids:
+            q["_id"] = {"$nin": list(exclude_ids)}
+        got = self.db.alvos.find_one_and_update(
+            q,
+            {"$set": {"owner": self.worker_id, "lease_until": lease_until}},
+            return_document=ReturnDocument.BEFORE,
+        )
+        if got is None:
+            return None
+        prev_owner = got.get("owner")
+        doc = {**got, "owner": self.worker_id, "lease_until": lease_until}
+        if prev_owner not in (None, self.worker_id):
+            doc["previous_owner"] = prev_owner
+        return doc
+
+    def renew_alvos(self, fases_por_id) -> set[str]:
+        """Renova `lease_until` (e `fase`, se dict) dos alvos ativos deste PC; devolve os IDs renovados."""
+        lease_until = self._dt(self.lease_s)
+        renewed: set[str] = set()
+        if isinstance(fases_por_id, dict):
+            items = list(fases_por_id.items())
+        else:
+            items = [(aid, None) for aid in fases_por_id]
+        for alvo_id, fase in items:
+            fields: dict = {"lease_until": lease_until}
+            if fase is not None:
+                fields["fase"] = fase
+            res = self.db.alvos.update_one(
+                {"_id": alvo_id, "owner": self.worker_id, "estado": "ativo"},
+                {"$set": fields},
+            )
+            if res.matched_count == 1:
+                renewed.add(alvo_id)
+        return renewed
+
+    def release_alvo(self, alvo_id: str) -> None:
+        """Solta a lease do alvo deste PC, voltando `fase` para `sem vaga` se ainda estiver ativo."""
+        res = self.db.alvos.update_one(
+            {"_id": alvo_id, "owner": self.worker_id, "estado": "ativo"},
+            {"$set": {"owner": None, "lease_until": None, "fase": "sem vaga"}},
+        )
+        if res.matched_count == 0:
+            self.db.alvos.update_one(
+                {"_id": alvo_id, "owner": self.worker_id},
+                {"$set": {"owner": None, "lease_until": None}},
+            )
+
+    def alvos_ativos(self) -> set[str]:
+        """Conjunto de chaves/canais de todos os alvos de live ativos (qualquer PC)."""
+        chaves: set[str] = set()
+        for doc in self.db.alvos.find({"tipo": "live", "estado": "ativo"}):
+            aid = doc.get("_id")
+            if isinstance(aid, str) and aid:
+                chaves.add(aid)
+                if ":" in aid:
+                    _, resto = aid.split(":", 1)
+                    if resto:
+                        chaves.add(resto.lower())
+            canal = doc.get("canal")
+            if isinstance(canal, str) and canal.strip():
+                chaves.add(canal.strip().lower())
+        return chaves
+
+    def pegar_vod(self, alias: str | None = None) -> dict | None:
+        """Toma atomicamente o VOD ativo mais antigo (ordenado por `criado_em` ascendente)."""
+        now = self._dt()
+        lease_until = self._dt(self.lease_s)
+        pc_vals = [None] if alias is None else [None, alias]
+        return self.db.alvos.find_one_and_update(
+            {
+                "estado": "ativo",
+                "tipo": "vod",
+                "pc_fixo": {"$in": pc_vals},
+                "$or": [{"owner": None}, {"lease_until": {"$lt": now}}, {"owner": self.worker_id}],
+            },
+            {"$set": {"owner": self.worker_id, "lease_until": lease_until}},
+            sort=[("criado_em", 1)],
+            return_document=ReturnDocument.AFTER,
+        )
+
+    def fim_vod(self, alvo_id: str, estado: str, erro: str | None = None) -> bool:
+        """Grava estado final (`feito` ou `falhou`) de um VOD deste PC com erro sanitizado."""
+        if estado not in ("feito", "falhou"):
+            raise ValueError(f"estado de VOD invalido: {estado!r}")
+        res = self.db.alvos.update_one(
+            {"_id": alvo_id, "tipo": "vod", "owner": self.worker_id},
+            {"$set": {
+                "estado": estado,
+                "erro": _sanitize_erro(erro),
+                "owner": None,
+                "lease_until": None,
+                "finalizado_em": self._dt(),
+            }},
+        )
+        return res.matched_count == 1
+
     # ---- heartbeat ----
 
     def beat(self, alias: str, capacity: dict, job_atual: str | None, max_lives: int, razao: float,
-             beat_s: float | None = None) -> None:
+             beat_s: float | None = None, *, slots: dict[str, int] | None = None,
+             ocupados: dict[str, int] | None = None, fila: dict[str, int] | None = None) -> None:
         now = self._dt()
-        fields = {"alias": alias, "capacity": capacity, "job_atual": job_atual,
-                  "max_lives": max_lives, "razao": razao, "heartbeat_at": now}
+        fields: dict = {"alias": alias, "capacity": capacity, "job_atual": job_atual,
+                        "max_lives": max_lives, "razao": razao, "heartbeat_at": now}
         if beat_s is not None:
             fields["beat_s"] = float(beat_s)  # o painel calcula `online` com o intervalo real do worker
+        if slots is not None:
+            fields["slots"] = dict(slots)
+        if ocupados is not None:
+            fields["ocupados"] = dict(ocupados)
+        if fila is not None:
+            fields["fila"] = dict(fila)
         self.db.workers.update_one(
             {"_id": self.worker_id},
             {"$set": fields,

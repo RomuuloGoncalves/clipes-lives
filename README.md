@@ -21,14 +21,15 @@ mkdir -p ~/.config/clipes-lives && chmod 700 ~/.config/clipes-lives
 touch .env && chmod 600 .env && nano .env
 ```
 
-Rodar:
+Rodar (um comando por PC, uma vez; o resto é pelo Discord):
 
 ```sh
-./clipar "<url do VOD>"                      # um VOD
-./clipar "https://www.twitch.tv/<canal>" --ate-acabar   # live inteira, em janelas, até acabar
-./clipar monitor --follow <canal>            # monitor contínuo de um canal
-docker compose up -d bot                     # bot do Discord (1 só processo por servidor)
+./clipar servico                             # serviço único do PC: acompanha as lives, busca geral e VODs (fica rodando)
+./clipar "<url do VOD>"                      # um VOD direto no terminal
+docker compose up -d bot                     # bot do Discord (1 só processo por servidor, num PC só)
 ```
+
+No Discord, `/live adicionar alvo:<canal>` coloca uma live num PC com vaga, `/clipar url:<url>` enfileira um VOD e `/status` mostra os PCs (ver a tabela em "Bot do Discord").
 
 Operação:
 
@@ -61,7 +62,7 @@ Processar um VOD ou live ativa. Use o `./clipar` (cria a pasta de saída como se
 ./clipar "https://www.youtube.com/watch?v=cStJTQf9XUk" --live-minutes 4 --max-clips 2
 ```
 
-O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 8 GB), respeitando valores definidos no ambiente; roda com prioridade baixa e liga o `./vigia-temp`: ele grava a temperatura em `<saída>/.temp.log` a cada 5 s, pausa o container a 85 °C (`CLIPES_TEMP_MAX`) e retoma a 75 °C (`CLIPES_TEMP_MIN`). Para uso contínuo, `./clipar monitor` mantém o ciclo detectar, gravar e processar um job por vez; se parar, retoma da fila.
+O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 8 GB), respeitando valores definidos no ambiente; roda com prioridade baixa e liga o `./vigia-temp`: ele grava a temperatura em `<saída>/.temp.log` a cada 5 s, pausa o container a 85 °C (`CLIPES_TEMP_MAX`) e retoma a 75 °C (`CLIPES_TEMP_MIN`). Para uso contínuo, `./clipar servico` (ver "Serviço único" abaixo) mantém a fila de janelas, a busca geral e os VODs em um processo só, com 1 worker que processa um job por vez; se parar, retoma da fila.
 
 Opções da CLI:
 
@@ -144,12 +145,14 @@ Exemplo fictício de variáveis aceitas no `.env` (use apenas as que for utiliza
 # Fila multi-PC (opcional; sem ela cada PC usa fila local em disco)
 CLIPES_MONGO_URI="mongodb+srv://workers:<SENHA_FORTE>@<CLUSTER_FICTICIO>.mongodb.net/clipes_lives"
 CLIPES_ALIAS="PC-1"
+CLIPES_SLOTS="twitch=1,kick=1,youtube=1,busca=1"   # opcional: 0 desliga a plataforma neste PC
 
 # Discord e publicação privada (opcional)
 DISCORD_BOT_TOKEN="<TOKEN_DO_BOT>"
 DISCORD_GUILD_ID="<ID_DO_SERVIDOR>"
 DISCORD_CHANNEL_ID="<ID_DO_CANAL>"
 DISCORD_ALLOWED_USER_IDS="<ID_USUARIO_1>,<ID_USUARIO_2>"
+DISCORD_LOG_CHANNEL_ID="<ID_CANAL_BOT_LOG>"   # opcional
 YOUTUBE_CLIENT_ID="<GOOGLE_CLIENT_ID>"
 YOUTUBE_CLIENT_SECRET="<GOOGLE_CLIENT_SECRET>"
 TIKTOK_CLIENT_KEY="<TIKTOK_CLIENT_KEY>"
@@ -158,17 +161,18 @@ TIKTOK_CLIENT_SECRET="<TIKTOK_CLIENT_SECRET>"
 
 O arquivo `~/.config/clipes-lives/tokens.json` (modo `600`) é montado em `/config` nos serviços `clipes` e `bot` do `docker-compose.yml` (personalizável via `CLIPES_CONFIG_DIR`).
 
-## Operação Multi-PC, Painel na Vercel e Live Contínua
+## Operação Multi-PC, Painel na Vercel e Serviço Contínuo
 
 ### 1. MongoDB Atlas M0 (coordenação sem vídeo)
 
-O MongoDB coordena apenas quem grava cada live, o estado dos jobs, o heartbeat dos PCs e comandos do painel — nenhum vídeo passa pelo banco. Sem `CLIPES_MONGO_URI`, cada PC opera localmente com `DiskQueue`.
+O MongoDB coordena apenas quem grava cada live, os alvos (`alvos`: lives e VODs pedidos pelo Discord), o estado dos jobs, o heartbeat dos PCs (com `slots` e `ocupados`) e comandos do painel — nenhum vídeo passa pelo banco. Sem `CLIPES_MONGO_URI`, cada PC opera localmente com `DiskQueue`.
 
 1. Crie um cluster gratuito **Atlas M0** com o banco `clipes_lives`.
 2. Em **Network Access**, adicione `0.0.0.0/0` (necessário para PCs com IP residencial dinâmico e funções serverless da Vercel), protegendo o acesso com senhas fortes.
 3. Em **Database Access**, crie dois usuários com permissão mínima:
-   - `workers`: permissão `readWrite` apenas nas coleções `lives`, `jobs`, `workers` e `commands`.
-   - `painel`: role customizada com leitura (`find`) em `lives`, `jobs`, `workers` e `insert`/`update` apenas na coleção `commands`.
+   - `workers`: permissão `readWrite` apenas nas coleções `lives`, `jobs`, `workers`, `commands` e `alvos` (os PCs tomam e renovam alvos com `update` em `alvos`).
+   - `painel`: role customizada com leitura (`find`) em `lives`, `jobs`, `workers`, `alvos` e `insert`/`update` apenas nas coleções `commands` e `alvos` (sem isso, adicionar ou remover alvo pelo painel falha com `not authorized`).
+   - O bot (`docker compose up -d bot`) grava `alvos` com `insert`/`update`, o mesmo que o painel precisa para escrever na coleção.
 4. No `.env` de cada máquina, defina `CLIPES_MONGO_URI` com o usuário `workers` e um apelido distinto em `CLIPES_ALIAS` (ex.: `PC-1`, `PC-2`, `PC-3`).
 
 > O Atlas M0 pausa automaticamente após 30 dias sem conexões; se o Mongo ficar fora do ar, os PCs seguem processando na fila local e tentam reconectar a cada 60 s.
@@ -180,7 +184,7 @@ O MongoDB coordena apenas quem grava cada live, o estado dos jobs, o heartbeat d
    - `PAINEL_SENHA`: senha forte usada no Basic Auth.
    - `PAINEL_MONGO_URI`: connection string do usuário `painel` (menor privilégio).
    - Opcionais: `PAINEL_MONGO_DB` (padrão `clipes_lives`) e `CLIPES_BEAT_S` (padrão `20`).
-3. O painel atualiza a cada 10 s mostrando status online/offline, CPU, RAM, disco livre, temperatura (`n/d` sem sensor), GPU, job atual, `max_lives` e o botão **liberar recursos** (exige confirmação e digitar `LIBERAR`, encerrando subprocessos e saindo com código `75` para o `./clipar` reiniciar o ciclo após `CLIPES_RESTART_S=60`).
+3. O painel atualiza a cada 10 s mostrando status online/offline, CPU, RAM, disco livre, temperatura (`n/d` sem sensor), GPU, job atual, slots e ocupados por plataforma, fila, a lista de alvos ativos com o dono e o botão **liberar recursos** (exige confirmação e digitar `LIBERAR`, encerrando subprocessos e saindo com código `75` para o `./clipar` reiniciar o ciclo após `CLIPES_RESTART_S=60`).
 
 ### 3. Windows (Docker Desktop + WSL2)
 
@@ -198,42 +202,25 @@ processors=12
 3. Execute o `./clipar` a partir de uma distro Linux dentro do WSL2, mantendo `OUT_DIR` dentro do sistema de arquivos da distro (evite `/mnt/c` pelo impacto em I/O).
 4. O contêiner no WSL2 não enxerga sensores térmicos do host Windows: o `./clipar` imprime o aviso de `sem-sensor` e continua sem alterar limites, e o painel exibe `n/d` na temperatura.
 
-### 4. Calibração (`bench-live`) e live contínua (`--ate-acabar`)
+### 4. Serviço único por PC (`./clipar servico`) e slots
 
-Antes de permitir mais de 1 live simultânea (`max_lives`) em um PC, grave uma amostra de live de 6 minutos (mínimo 300 s) e rode o `bench-live`:
-
-```sh
-./clipar "https://www.twitch.tv/<canal>" --live-minutes 6
-mkdir -p out/_bench
-cp "out/<pasta_da_live>/.cache/live_source.mkv" out/_bench/source.mkv
-./clipar bench-live /out/_bench
-```
-
-O comando grava `OUT_DIR/.perfil.json` (`razao`, `cpus`) e calcula `max_lives = max(1, floor(0.6 / razao))`. Sem o arquivo (ou se `cpus` mudar), o limite permanece `1`.
-
-Para clipar uma live em janelas alinhadas de 10 min a cada 5 min até ela acabar (respeitando `CLIPES_MIN_FREE_GB=5` de disco livre):
+Em cada PC, rode uma vez:
 
 ```sh
-./clipar "https://www.twitch.tv/<canal>" --ate-acabar
-./clipar monitor --follow <canal>
+./clipar servico
 ```
 
-#### Multi-live (`acompanhar`)
+Um único processo faz tudo: o `Supervisor` acompanha os alvos da coleção `alvos` do MongoDB (sem `CLIPES_MONGO_URI`, os alvos vêm do argv: `./clipar servico <canal|url>...`), a busca geral IRC da Twitch roda sobre o `channels.txt` de cada PC (um canal por linha; `#` comenta) e há 1 fila e 1 worker. O worker processa 1 job por vez, nesta ordem: janelas de live e clipes da busca (por `z_score`) e, só com a fila vazia, VODs.
 
-Para acompanhar duas ou mais lives (Twitch e YouTube) no mesmo processo, com uma fila única e um worker sequencial:
-
-```sh
-./clipar acompanhar gaules "https://www.youtube.com/@canal/live"
-```
-
-Formatos aceitos: `<canal>`, `twitch.tv/<canal>`, `youtube.com/@<handle>/live`, `youtube.com/watch?v=<id>` e `youtu.be/<id>`. Alvos repetidos são unificados e alvos offline no início são ignorados.
-
-- **Limite simultâneo (`CLIPES_MAX_LIVES`)**: se `CLIPES_MAX_LIVES` for um inteiro `>= 1`, ele define o máximo de lives gravando ao mesmo tempo; caso contrário vale o resultado de `bench-live` em `OUT_DIR/.perfil.json` (ou `1` sem medição).
-- **Recusa visível e fila de espera**: lives acima do limite (ou com lease ocupada por outro PC no Mongo) ficam em `aguardando` na ordem dos argumentos e começam assim que uma vaga abre. Cada recusa aparece no log (`[acompanhar] recusada ...`) e é enviada uma vez para o `DISCORD_CHANNEL_ID`. Janelas descartadas por backlog também avisam no Discord.
+- **Adicionar e parar pelo Discord**: `/live adicionar` grava o alvo em `alvos`; um PC com vaga da plataforma toma o alvo (claim atômico) em até 30 s. `/live remover` marca o alvo como `removido` e o PC dono fecha a janela em andamento. `/live lista` mostra o PC dono e o estado de cada alvo.
+- **Slots (`CLIPES_SLOTS`)**: padrão `twitch=1,kick=1,youtube=1,busca=1`. Cada valor é o máximo de sessões daquela plataforma neste PC; `0` desliga a plataforma aqui (ex.: `CLIPES_SLOTS=twitch=2,kick=0,busca=0`). Plataforma desconhecida, valor não inteiro ou negativo faz o serviço sair com código 2 e a mensagem `CLIPES_SLOTS invalido: <trecho>`. `busca=0` não abre conexão IRC. `CLIPES_SLOTS` substitui `CLIPES_MAX_LIVES` e o antigo `bench-live`.
+- **Heartbeat**: cada PC publica `slots` e `ocupados` por plataforma em `workers` (o painel mostra).
+- **Lease**: se o PC dono para de renovar um alvo por 90 s, outro PC com vaga pode tomá-lo. Ao reiniciar, o PC retoma os alvos de que ainda é dono. Mantenha `CLIPES_LEASE_S` >= `90` (padrão): avisos síncronos ao Discord (timeout de até ~60 s) pausam o laço principal.
+- **Sem live duplicada**: a busca geral ignora picos de canais que são alvo `ativo` em `alvos` (de qualquer PC), então uma live não é gravada por dois PCs.
 - **Disco por live**: cada gravador mantém cerca de 20 minutos de buffer em `queue/.buffer/` (~900 MB por live a 6 Mb/s), respeitando o teto global `BUFFER_CAP_BYTES` (~1,5 GB). `CLIPES_MIN_FREE_GB` evita fechar novas janelas quando o disco aperta, mas não limita o buffer em andamento.
-- **Lease no MongoDB (2 PCs)**: o worker mantém `beat`/`renew` ativos em segundo plano durante o processamento de cada job, mas avisos síncronos ao Discord (`post_aviso`, timeout até ~60 s) pausam o laço principal; mantenha `CLIPES_LEASE_S` >= `90` (padrão).
 - **YouTube (experimental)**: a gravação de lives do YouTube usa `yt-dlp -f "b[height<=1080]/b" --hls-use-mpegts -o -` sem chat. Se alguma live não entregar formato muxado via `yt-dlp`, o plano B é testar `streamlink <url> best`.
-- **Smoke manual**: rode 1 live da Twitch + 1 live do YouTube com `CLIPES_MAX_LIVES=2` por ~15 minutos (`./clipar acompanhar <twitch> <youtube>`) e confira nos logs e na fila que janelas das duas lives são geradas sem dois jobs simultâneos em `processing/`.
+- **Comandos removidos**: `./clipar monitor`, `monitor --follow`, `<url> --ate-acabar`, `acompanhar` e `bench-live` saem com código 2 e a mensagem `removido: use ./clipar servico (e /live adicionar no Discord)`.
+- **Smoke manual**: rode `./clipar servico` em um PC, adicione 1 live da Twitch e 1 do YouTube com `/live adicionar` e confira nos logs e na fila que janelas das duas são geradas, sem dois jobs simultâneos em `processing/`.
 
 ### 5. Consultas de diagnóstico e purga (MongoDB Compass / `mongosh`)
 
@@ -241,7 +228,8 @@ Para rodar manualmente no `mongosh` do MongoDB Compass (nunca automatize acesso 
 
 ```js
 // Diagnóstico: PCs, lives ativas, contagem de jobs (24 h) e comandos pendentes
-db.workers.find({}, { alias: 1, heartbeat_at: 1, job_atual: 1, max_lives: 1, "capacity.temp_c": 1, "capacity.disco_livre_gb": 1 }).sort({ heartbeat_at: -1 });
+db.workers.find({}, { alias: 1, heartbeat_at: 1, job_atual: 1, slots: 1, ocupados: 1, "capacity.temp_c": 1, "capacity.disco_livre_gb": 1 }).sort({ heartbeat_at: -1 });
+db.alvos.find({ estado: "ativo" }, { _id: 1, tipo: 1, plataforma: 1, owner: 1, fase: 1, pc_fixo: 1, lease_until: 1 }).sort({ plataforma: 1 });
 db.lives.find({ status: "live" }).sort({ lease_until: 1 });
 db.jobs.aggregate([{ $match: { updated_at: { $gte: new Date(Date.now() - 86400000) } } }, { $group: { _id: "$status", total: { $sum: 1 } } }]);
 db.commands.find({ status: { $in: ["pending", "executando"] } }).sort({ criado_em: -1 });
@@ -250,11 +238,12 @@ db.commands.find({ status: { $in: ["pending", "executando"] } }).sort({ criado_e
 db.jobs.countDocuments({ status: { $in: ["done", "rejected", "lost", "failed"] }, updated_at: { $lt: new Date(Date.now() - 30 * 86400000) } });
 db.jobs.deleteMany({ status: { $in: ["done", "rejected", "lost", "failed"] }, updated_at: { $lt: new Date(Date.now() - 30 * 86400000) } });
 db.commands.deleteMany({ status: { $in: ["feito", "rejeitado"] }, criado_em: { $lt: new Date(Date.now() - 30 * 86400000) } });
+db.alvos.deleteMany({ estado: { $in: ["feito", "falhou", "removido"] }, criado_em: { $lt: new Date(Date.now() - 30 * 86400000) } });
 ```
 
 ## Bot do Discord e Publicação Privada
 
-O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`), usando as variáveis definidas em `.env` e os tokens gravados em `/config/tokens.json`.
+O `./clipar servico` envia cada live para o canal `#clipes` (`DISCORD_CHANNEL_ID`) como 1 cartão + 1 thread por `live_id`, editados no lugar, e os avisos (recusa, sem vaga, janela descartada por backlog, falha, serviço iniciado/parado) para `#bot-log` (`DISCORD_LOG_CHANNEL_ID`, opcional; sem ela, vão para o canal de clipes). O serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`), usando as variáveis definidas em `.env` e os tokens gravados em `/config/tokens.json`.
 
 ### 1. Discord Developer Portal
 
@@ -267,7 +256,9 @@ O monitor pode enviar prévias dos clipes gerados para um canal do Discord e o s
    - **Bot Permissions**: marque `View Channels`, `Send Messages`, `Create Public Threads`, `Send Messages in Threads`, `Attach Files`, `Embed Links`, `Read Message History`, `Add Reactions` e `Use Slash Commands`.
    - Abra a URL gerada e autorize o bot no seu servidor.
 4. No `.env` (obtidos pelo Modo Desenvolvedor do Discord):
-   - `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` e `DISCORD_ALLOWED_USER_IDS` (lista vazia bloqueia todas as publicações; `*` libera qualquer usuário que enxergue o canal).
+   - `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` e `DISCORD_ALLOWED_USER_IDS` (lista vazia bloqueia todas as publicações e comandos).
+   - **Recomendado: IDs explícitos em `DISCORD_ALLOWED_USER_IDS`.** Com `*`, qualquer membro que enxergue o canal pode adicionar lives, enfileirar VODs, publicar e descartar; o bot loga `aviso: comandos liberados para qualquer membro do canal` na inicialização.
+   - `DISCORD_LOG_CHANNEL_ID` (opcional): canal `#bot-log` para avisos do serviço. Vazio = os avisos vão para `DISCORD_CHANNEL_ID`.
    - `CLIPES_DISCORD_MAX_MB=20` (opcional; no modo padrão `discord`, o master já mira esse teto em uma única codificação, caindo para 720x1280 se o bitrate ficar abaixo de 1500 kbps).
 
 ### 2. Google Cloud (YouTube Data API v3)
@@ -299,13 +290,29 @@ Subir o serviço contínuo do bot (um único processo por servidor Discord; exig
 docker compose up -d bot
 ```
 
-Comandos disponíveis apenas no canal configurado (`DISCORD_CHANNEL_ID`), suas threads e para IDs em `DISCORD_ALLOWED_USER_IDS`: `publicar <clip_id>` (ou `publicar <clip_id> agora`), `/publicar id:<clip_id>` (opcional `agora:True`), `/listar`, `/buscar texto:<palavras>` e `buscar <palavras>`.
+Todos os comandos abaixo funcionam só no canal configurado (`DISCORD_CHANNEL_ID`), nas suas threads e para os IDs em `DISCORD_ALLOWED_USER_IDS` (a mesma checagem vale para `/live`, `/clipar`, `/status` e `Descartar`; quem não está autorizado recebe `sem permissao`). Controle de lives e VODs exige `CLIPES_MONGO_URI`; sem ele a resposta é `controle requer CLIPES_MONGO_URI`.
+
+| Comando | O que faz |
+| ------- | --------- |
+| `/live adicionar alvo:<canal\|url> [pc:<alias>]` | Grava o alvo em `alvos` e responde `alvo adicionado: <rótulo>`; um PC com vaga da plataforma toma a live. `pc` fixa o PC dono. Responde `ja acompanhado por <PC>` se já estiver ativo, `alvo invalido` se o formato não for aceito e `sem vaga` se nenhum PC tiver slot livre |
+| `/live remover alvo:<canal\|url\|chave>` | Marca o alvo como `removido`; o PC dono fecha a janela em andamento e para em até 30 s |
+| `/live lista` | Lista os alvos ativos, o PC dono (ou `sem PC`) e o estado (`gravando`, `aguardando live`, `sem vaga`) |
+| `/clipar url:<url>` | Enfileira um VOD (Twitch, Kick ou YouTube) e responde `na fila: posição N`; `ja na fila` se a URL já está ativa e `fila cheia (20)` com 20 VODs pendentes |
+| `/status` | Estado dos PCs: slots e ocupados por plataforma, job atual, fila, temperatura e disco |
+| `/publicar id:<clip_id> [agora:True]` (ou `publicar <clip_id> [agora]`) | Publica como privado no YouTube e/ou TikTok; clipe `descartado` responde `clipe descartado` sem publicar |
+| `/listar` | Lista os 10 últimos `clip_id` do Discord |
+| `/buscar texto:<palavras>` (ou `buscar <palavras>`) | Busca clipes no registro local por texto |
+| Botões do clipe | **YouTube**, **TikTok**, **Ambos**, toggle **Agendar** e **Descartar** (marca o clipe `descartado`, troca a linha de estado para `🗑️` e remove os botões) |
+
+A linha de estado de cada clipe começa com `🟡` (pendente), `🗓️` (agendado, com data e hora), `✅` (publicado, com plataformas) ou `🗑️` (descartado).
+
+Para acompanhar uma live, não é preciso mexer no terminal: `/live adicionar alvo:gaules` basta. Controle de canais da busca geral continua no `channels.txt` de cada PC.
 
 - **Publicar por destino e toggle Agendar:** cada mensagem de clipe enviada ao Discord traz 2 linhas de botões — linha 1 com **YouTube** (`publicar:youtube:<clip_id>`), **TikTok** (`publicar:tiktok:<clip_id>`) e **Ambos** (`publicar:ambos:<clip_id>`), e linha 2 com o toggle **Agendar: nao** (`agendar:off:<clip_id>`) / **Agendar: sim** (`agendar:on:<clip_id>`), iniciando desligado (`off`). Somente usuários em `DISCORD_ALLOWED_USER_IDS` no canal configurado (`DISCORD_CHANNEL_ID`) ou suas threads podem usá-los. Clicar no toggle alterna `off` ↔ `on`; ao clicar em um destino com `Agendar: nao`, o pedido vai para publicação imediata (`(agora)`, igual a `publicar <clip_id> agora`), e com `Agendar: sim` (ou em mensagens antigas sem o toggle) agenda no próximo slot (`(agendado)`). Cada plataforma aceita acrescenta `<Plataforma> por <usuário> (agora|agendado)` à mensagem; plataformas sem token retornam `<plat>: desligada` e não são marcadas. Os botões (incluindo o toggle) permanecem na mensagem até que YouTube e TikTok tenham sido pedidos (via **Ambos** ou pelos dois cliques em sequência); botões legados `aprovar:<clip_id>` continuam funcionando como **Ambos**.
 
 - **Agenda de publicação:** no `docker-compose.yml`, `CLIPES_AGENDA_HORARIOS` vem com padrão `11:30,19:00` no fuso `CLIPES_TZ` (`America/Sao_Paulo`). Cada pedido aprovado recebe o próximo horário livre daquela plataforma com folga mínima de 30 minutos (1 publicação por horário por plataforma); defina `CLIPES_AGENDA_HORARIOS=` (vazio) no `.env` para publicar na hora, ou use `publicar <clip_id> agora` para publicar imediatamente.
 
-> **Workers multi-PC:** todo PC que executa o `monitor` e publica seus próprios clipes também precisa de `DISCORD_BOT_TOKEN` no `.env`; sem ele o worker pula prévias e `run_pending`, deixando pedidos `pending` na fila.
+> **Workers multi-PC:** todo PC que executa `./clipar servico` e publica seus próprios clipes também precisa de `DISCORD_BOT_TOKEN` no `.env`; sem ele o worker pula prévias e `run_pending`, deixando pedidos `pending` na fila.
 
 ### 5. Registro e liberar disco
 

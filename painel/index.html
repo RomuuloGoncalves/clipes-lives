@@ -147,6 +147,8 @@
     }
     .modal-acoes { display: flex; justify-content: flex-end; gap: 8px; }
     .btn-sec { background: var(--border); }
+    .alvo-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
+    input[type="text"].alvo-entrada { width: 260px; }
   </style>
 </head>
 <body>
@@ -172,6 +174,8 @@
           <th>Temp</th>
           <th>GPU</th>
           <th>Job atual</th>
+          <th>Slots</th>
+          <th>Fila</th>
           <th>max_lives</th>
           <th>Acao</th>
         </tr>
@@ -182,6 +186,28 @@
 
   <h2>Lives ativas</h2>
   <div id="lives" class="cards"></div>
+
+  <h2>Alvos ativos</h2>
+  <form id="alvo-form" class="alvo-form">
+    <input id="alvo-entrada" class="alvo-entrada" type="text" placeholder="URL ou login" aria-label="Alvo">
+    <input id="alvo-pc" type="text" placeholder="PC fixo" aria-label="PC fixo (opcional)">
+    <button type="submit" id="alvo-btn">adicionar alvo</button>
+  </form>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Alvo</th>
+          <th>Plataforma</th>
+          <th>PC fixo</th>
+          <th>Dono</th>
+          <th>Fase</th>
+          <th>Acao</th>
+        </tr>
+      </thead>
+      <tbody id="alvos"></tbody>
+    </table>
+  </div>
 
   <h2>Jobs (24 h)</h2>
   <div id="jobs" class="cards"></div>
@@ -202,6 +228,11 @@
     (function () {
       var pcsEl = document.getElementById("pcs");
       var livesEl = document.getElementById("lives");
+      var alvosEl = document.getElementById("alvos");
+      var alvoForm = document.getElementById("alvo-form");
+      var alvoEntradaEl = document.getElementById("alvo-entrada");
+      var alvoPcEl = document.getElementById("alvo-pc");
+      var alvoBtn = document.getElementById("alvo-btn");
       var jobsEl = document.getElementById("jobs");
       var atualizadoEl = document.getElementById("atualizado");
       var feedbackEl = document.getElementById("feedback");
@@ -255,14 +286,12 @@
         if (fn) fn(s);
       });
 
-      function pedirSenha(nome, onDone) {
+      function pedirSenha(descricao, onDone) {
         if (senhaCache) {
           onDone(senhaCache);
           return;
         }
-        authDescEl.textContent = nome
-          ? ("Digite a senha para liberar recursos de " + nome + ".")
-          : "Digite a senha para consultar o painel.";
+        authDescEl.textContent = descricao || "Digite a senha para consultar o painel.";
         authInput.value = "";
         pendingAuth = onDone;
         authModal.hidden = false;
@@ -317,7 +346,7 @@
         if (!confirm("Liberar recursos de " + nome + "? O container sera encerrado e reiniciado.")) {
           return;
         }
-        pedirSenha(nome, function (senha) {
+        pedirSenha("Digite a senha para liberar recursos de " + nome + ".", function (senha) {
           btn.disabled = true;
           fetch("/api/comando", {
             method: "POST",
@@ -357,12 +386,102 @@
         });
       }
 
+      function enviarAlvo(corpo, btn, okMsg, aoOk) {
+        pedirSenha("Digite a senha para alterar os alvos.", function (senha) {
+          btn.disabled = true;
+          fetch("/api/alvos", {
+            method: "POST",
+            credentials: "same-origin",
+            headers: {
+              "Content-Type": "application/json",
+              "Authorization": basicHeader(senha)
+            },
+            body: JSON.stringify(corpo)
+          })
+            .then(function (r) {
+              return r.json().catch(function () { return {}; }).then(function (body) {
+                return { status: r.status, body: body };
+              });
+            })
+            .then(function (res) {
+              if (res.status >= 200 && res.status < 300) {
+                mostrarMsg(okMsg, "ok");
+                if (aoOk) aoOk();
+                atualizar();
+              } else {
+                if (res.status === 401) {
+                  senhaCache = null;
+                  authAbrirBtn.hidden = false;
+                }
+                var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
+                mostrarMsg("Falha ao alterar alvos: " + erro, "erro");
+              }
+            })
+            .catch(function () {
+              mostrarMsg("Erro de rede ao alterar alvos.", "erro");
+            })
+            .finally(function () {
+              btn.disabled = false;
+            });
+        });
+      }
+
+      alvoForm.addEventListener("submit", function (e) {
+        e.preventDefault();
+        var alvo = (alvoEntradaEl.value || "").trim();
+        if (!alvo) {
+          mostrarMsg("Informe o alvo (URL ou login).", "erro");
+          alvoEntradaEl.focus();
+          return;
+        }
+        var pc = (alvoPcEl.value || "").trim();
+        enviarAlvo({ acao: "adicionar", alvo: alvo, pc: pc }, alvoBtn, "Alvo adicionado: " + alvo + ".", function () {
+          alvoEntradaEl.value = "";
+          alvoPcEl.value = "";
+        });
+      });
+
+      function renderAlvos(alvos, workers) {
+        var nomes = Object.create(null);
+        (workers || []).forEach(function (w) {
+          nomes[w.id] = w.alias || w.id;
+        });
+        if (!alvos || !alvos.length) {
+          var trVazio = el("tr");
+          var tdVazio = el("td", "meta", "Nenhum alvo ativo.");
+          tdVazio.colSpan = 6;
+          trVazio.appendChild(tdVazio);
+          alvosEl.replaceChildren(trVazio);
+          return;
+        }
+        var rows = alvos.map(function (a) {
+          var tr = el("tr");
+          var entrada = a.entrada || a._id;
+          tr.appendChild(el("td", null, entrada));
+          tr.appendChild(el("td", null, a.plataforma || "-"));
+          tr.appendChild(el("td", null, a.pc_fixo || "-"));
+          tr.appendChild(el("td", null, a.owner ? (nomes[a.owner] || a.owner) : "sem PC"));
+          tr.appendChild(el("td", null, a.fase || "-"));
+          var tdAcao = el("td");
+          var btn = el("button", null, "remover");
+          btn.type = "button";
+          btn.setAttribute("aria-label", "Remover " + entrada);
+          btn.addEventListener("click", function () {
+            enviarAlvo({ acao: "remover", id: a._id }, btn, "Alvo removido: " + entrada + ".");
+          });
+          tdAcao.appendChild(btn);
+          tr.appendChild(tdAcao);
+          return tr;
+        });
+        alvosEl.replaceChildren.apply(alvosEl, rows);
+      }
+
       function renderWorkers(workers) {
         var rows = [];
         if (!workers || !workers.length) {
           var trVazio = el("tr");
           var tdVazio = el("td", "meta", "Nenhum PC registrado.");
-          tdVazio.colSpan = 10;
+          tdVazio.colSpan = 12;
           trVazio.appendChild(tdVazio);
           rows.push(trVazio);
           pcsEl.replaceChildren.apply(pcsEl, rows);
@@ -393,6 +512,20 @@
 
           tr.appendChild(el("td", null, fmtGpu(cap.gpu)));
           tr.appendChild(el("td", null, w.job_atual || "-"));
+
+          var slots = w.slots || {};
+          var ocupados = w.ocupados || {};
+          var partesSlots = Object.keys(slots).map(function (p) {
+            return p + " " + (ocupados[p] || 0) + "/" + slots[p];
+          });
+          tr.appendChild(el("td", null, partesSlots.length ? partesSlots.join(", ") : "-"));
+
+          var fila = w.fila || {};
+          var tamFila = Object.keys(fila).reduce(function (s, k) {
+            return s + (Number(fila[k]) || 0);
+          }, 0);
+          tr.appendChild(el("td", null, w.fila ? String(tamFila) : "-"));
+
           tr.appendChild(el("td", null, fmtNum(w.max_lives)));
 
           var tdAcao = el("td");
@@ -480,6 +613,7 @@
               authAbrirBtn.hidden = true;
               renderWorkers(dados.workers || []);
               renderLives(dados.lives || [], dados.workers || []);
+              renderAlvos(dados.alvos || [], dados.workers || []);
               renderJobs(dados.jobs_24h || {});
               atualizadoEl.textContent = "Atualizado: " + new Date().toLocaleTimeString();
               if (erroAuthAtivo) {

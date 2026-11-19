@@ -434,7 +434,7 @@ def test_pool_uses_custom_source_cmd_for_twitch_and_youtube(tmp_path):
     sources = [p.cmd for p in popen.procs if p.cmd[0] != "ffmpeg"]
     assert sources[0][0] == "streamlink" and "twitch.tv/gaules" in sources[0]
     assert sources[1][0] == "yt-dlp"
-    assert sources[1][-2:] == ["-", "https://www.youtube.com/watch?v=abc123"]
+    assert sources[1][-4:] == ["-o", "-", "--", "https://www.youtube.com/watch?v=abc123"]
     assert "--hls-use-mpegts" in sources[1]
 
 
@@ -459,3 +459,38 @@ def test_pool_accepts_kick_keys_and_refuses_invalid_kick_keys(tmp_path):
     assert pool.start_on_demand("kick_") is False
     assert pool.start_on_demand("kick_a/b") is False
     assert sorted(pool.recordings) == ["gaules", "kick_foo-bar", "yt_abc123"]
+
+
+def test_ytdlp_live_cmd_passa_duplo_traco_antes_da_url():
+    url = "https://www.youtube.com/watch?v=abc123"
+    cmd = monitor.ytdlp_live_cmd(url)
+    assert cmd[0] == "yt-dlp"
+    assert cmd[-4:] == ["-o", "-", "--", url]
+
+
+def test_streamlink_cmd_passa_duplo_traco_antes_do_alvo():
+    cmd = monitor.streamlink_cmd("gaules")
+    assert cmd[0] == "streamlink"
+    assert cmd[cmd.index("--") + 1] == "twitch.tv/gaules"
+
+
+def test_capture_job_grava_origem_busca_e_live_id(tmp_path, ts_sample):
+    pool = make_pool(tmp_path)
+    add_segments(pool, "gaules", ts_sample, [BASE, BASE + 10, BASE + 20])
+    detector = monitor.ChannelSpikeDetector("gaules", t0=BASE)
+    clock = Clock(BASE + 25)
+    job_dir = asyncio.run(
+        monitor.capture_job(
+            pool,
+            detector,
+            spike_at(BASE + 25),
+            tmp_path / "staging",
+            now=clock.now,
+            sleep=clock.sleep,
+            live_id="twitch:gaules:777",
+        )
+    )
+    assert job_dir is not None
+    job = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))
+    assert job["origem"] == "busca"
+    assert job["live_id"] == "twitch:gaules:777"

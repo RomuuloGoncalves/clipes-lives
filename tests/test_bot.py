@@ -12,6 +12,7 @@ from typing import Any
 import discord
 import mongomock
 import pytest
+from discord.components import _component_factory
 
 from clipes import __main__ as entry
 from clipes import bot as bot_mod
@@ -501,8 +502,8 @@ def test_slash_publicar_and_listar_reject_outside_configured_channel_and_threads
         inter_list = _FakeInteraction(user_id=ALLOWED_USER, channel=ch)
         asyncio.run(pub_cmd.callback(inter_pub, "live1_c01"))
         asyncio.run(list_cmd.callback(inter_list))
-        assert inter_pub.response.messages == [("canal nao permitido", True)]
-        assert inter_list.response.messages == [("canal nao permitido", True)]
+        assert inter_pub.response.messages == [("sem permissao", True)]
+        assert inter_list.response.messages == [("sem permissao", True)]
 
     assert db.publish_requests.count_documents({}) == 0
 
@@ -569,8 +570,8 @@ def test_slash_rejects_when_channel_id_not_configured(tmp_path: Path):
     inter_list = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
     asyncio.run(pub_cmd.callback(inter_pub, "live1_c01"))
     asyncio.run(list_cmd.callback(inter_list))
-    assert inter_pub.response.messages == [("canal nao permitido", True)]
-    assert inter_list.response.messages == [("canal nao permitido", True)]
+    assert inter_pub.response.messages == [("sem permissao", True)]
+    assert inter_list.response.messages == [("sem permissao", True)]
 
 
 # --- Single-PC LocalStore direct execution ---
@@ -813,7 +814,7 @@ def test_buscar_slash_e_texto_resultado_vazio_curto_permissao_canal_e_limite_190
     # 6. Wrong channel
     i_wrong = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(OTHER_CHANNEL_ID))
     asyncio.run(buscar_cmd.callback(i_wrong, "gta"))
-    assert i_wrong.response.messages == [("canal nao permitido", True)]
+    assert i_wrong.response.messages == [("sem permissao", True)]
 
     m_wrong = _FakeMessage("buscar gta", author_id=ALLOWED_USER, channel=_FakeChannel(OTHER_CHANNEL_ID))
     asyncio.run(bot.on_message(m_wrong))
@@ -896,7 +897,7 @@ def test_on_interaction_aprovar_botao_permitido_negado_desconhecido_e_inexistent
         msg=msg_wrong,
     )
     asyncio.run(bot.on_interaction(i_wrong))
-    assert i_wrong.response.messages == [("canal nao permitido", True)]
+    assert i_wrong.response.messages == [("sem permissao", True)]
     assert msg_wrong.edits == []
     assert db.publish_requests.count_documents({}) == 0
 
@@ -1084,7 +1085,7 @@ def test_on_interaction_publicar_destino_negado_desligada_e_idempotente(tmp_path
         m_bad_ch = _CompMsg("post")
         i_bad_ch = _CompInteraction(cid, m_bad_ch, channel=_FakeChannel(OTHER_CHANNEL_ID))
         asyncio.run(bot.on_interaction(i_bad_ch))
-        assert i_bad_ch.response.messages == [("canal nao permitido", True)]
+        assert i_bad_ch.response.messages == [("sem permissao", True)]
         assert m_bad_ch.edits == []
 
         m_bad_u = _CompMsg("post")
@@ -1350,6 +1351,52 @@ def test_bot_respostas_usam_allowed_mentions_none_e_buscar_usa_to_thread(
     _assert_none_mentions(edit_msg.edits[0].get("allowed_mentions"))
 
 
+class _ToggleMsg:
+    def __init__(self, content: str, components: list[Any]):
+        self.content = content
+        self.components = components
+        self.edits: list[dict[str, Any]] = []
+
+    async def edit(self, *, content: str | None = None, view: Any = "UNSET") -> None:
+        self.edits.append({"content": content, "view": view})
+        if content is not None:
+            self.content = content
+        if view is None:
+            self.components = []
+
+
+class _ToggleResponse(_FakeInteractionResponse):
+    def __init__(self, msg: _ToggleMsg | None) -> None:
+        super().__init__()
+        self._msg = msg
+        self.edited: list[dict[str, Any]] = []
+
+    async def edit_message(self, *, view: Any = None, **kwargs: Any) -> None:
+        self.edited.append({"view": view, **kwargs})
+        if self._msg is not None and view is not None:
+            self._msg.components = [_component_factory(c) for c in view.to_components()]
+
+
+class _ToggleInteraction:
+    def __init__(
+        self,
+        custom_id: str,
+        msg: _ToggleMsg | None,
+        *,
+        user_id: int | str = ALLOWED_USER,
+        user_name: str = "Romulo",
+        channel: _FakeChannel | None = None,
+    ):
+        self.type = discord.InteractionType.component
+        self.data = {"custom_id": custom_id, "component_type": 2}
+        self.user = _FakeUser(user_id, name=user_name)
+        self.channel = channel or _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+        self.channel_id = self.channel.id
+        self.message = msg
+        self.response = _ToggleResponse(msg)
+        self.followup = self.response.followup
+
+
 def test_on_interaction_toggle_agendar_on_off_destinos_modos_e_legado(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -1380,49 +1427,6 @@ def test_on_interaction_toggle_agendar_on_off_destinos_modos_e_legado(
         now=t_now,
     )
 
-    class _ToggleMsg:
-        def __init__(self, content: str, components: list[Any]):
-            self.content = content
-            self.components = components
-            self.edits: list[dict[str, Any]] = []
-
-        async def edit(self, *, content: str | None = None, view: Any = "UNSET") -> None:
-            self.edits.append({"content": content, "view": view})
-            if content is not None:
-                self.content = content
-            if view is None:
-                self.components = []
-
-    class _ToggleResponse(_FakeInteractionResponse):
-        def __init__(self, msg: _ToggleMsg | None) -> None:
-            super().__init__()
-            self._msg = msg
-            self.edited: list[dict[str, Any]] = []
-
-        async def edit_message(self, *, view: Any = None, **kwargs: Any) -> None:
-            self.edited.append({"view": view, **kwargs})
-            if self._msg is not None and view is not None:
-                self._msg.components = [_component_factory(c) for c in view.to_components()]
-
-    class _ToggleInteraction:
-        def __init__(
-            self,
-            custom_id: str,
-            msg: _ToggleMsg | None,
-            *,
-            user_id: int | str = ALLOWED_USER,
-            user_name: str = "Romulo",
-            channel: _FakeChannel | None = None,
-        ):
-            self.type = discord.InteractionType.component
-            self.data = {"custom_id": custom_id, "component_type": 2}
-            self.user = _FakeUser(user_id, name=user_name)
-            self.channel = channel or _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
-            self.channel_id = self.channel.id
-            self.message = msg
-            self.response = _ToggleResponse(msg)
-            self.followup = self.response.followup
-
     recorded_agendar: list[tuple[str, bool, tuple[str, ...]]] = []
     real_request = publicacao.request
 
@@ -1442,7 +1446,7 @@ def test_on_interaction_toggle_agendar_on_off_destinos_modos_e_legado(
     asyncio.run(bot.on_interaction(i_wrong_user))
     asyncio.run(bot.on_interaction(i_bad_state))
     asyncio.run(bot.on_interaction(i_empty_id))
-    assert i_wrong_ch.response.messages == [("canal nao permitido", True)]
+    assert i_wrong_ch.response.messages == [("sem permissao", True)]
     assert i_wrong_ch.response.edited == []
     assert i_wrong_user.response.messages == [("sem permissao", True)]
     assert i_wrong_user.response.edited == []
@@ -1462,30 +1466,43 @@ def test_on_interaction_toggle_agendar_on_off_destinos_modos_e_legado(
         "publicar:tiktok:tg1_c01",
         "publicar:ambos:tg1_c01",
     ]
-    assert comps_on[1]["components"] == [
-        {
-            "type": 2,
-            "style": 1,
-            "disabled": False,
-            "label": "Agendar: sim",
-            "custom_id": "agendar:on:tg1_c01",
-        }
-    ]
+    # Row 1 now has Agendar toggle + Descartar button
+    assert len(comps_on[1]["components"]) == 2
+    assert comps_on[1]["components"][0] == {
+        "type": 2,
+        "style": 1,
+        "disabled": False,
+        "label": "Agendar: sim",
+        "custom_id": "agendar:on:tg1_c01",
+    }
+    assert comps_on[1]["components"][1] == {
+        "type": 2,
+        "style": 4,
+        "disabled": False,
+        "label": "Descartar",
+        "custom_id": "descartar:tg1_c01",
+    }
     assert msg_tg.content == "**Titulo tg1_c01**"
 
     i_off = _ToggleInteraction("agendar:on:tg1_c01", msg_tg)
     asyncio.run(bot.on_interaction(i_off))
     assert i_off.response.messages == []
     comps_off = i_off.response.edited[0]["view"].to_components()
-    assert comps_off[1]["components"] == [
-        {
-            "type": 2,
-            "style": 2,
-            "disabled": False,
-            "label": "Agendar: nao",
-            "custom_id": "agendar:off:tg1_c01",
-        }
-    ]
+    assert len(comps_off[1]["components"]) == 2
+    assert comps_off[1]["components"][0] == {
+        "type": 2,
+        "style": 2,
+        "disabled": False,
+        "label": "Agendar: nao",
+        "custom_id": "agendar:off:tg1_c01",
+    }
+    assert comps_off[1]["components"][1] == {
+        "type": 2,
+        "style": 4,
+        "disabled": False,
+        "label": "Descartar",
+        "custom_id": "descartar:tg1_c01",
+    }
 
     # 3. Clique YouTube com toggle off -> agendar=False (agora), preserva toggle
     i_yt_now = _ToggleInteraction("publicar:youtube:tg1_c01", msg_tg, user_name="Romulo")
@@ -1531,3 +1548,727 @@ def test_on_interaction_toggle_agendar_on_off_destinos_modos_e_legado(
     assert "agendado para 2026-11-18 19:00 (America/Sao_Paulo)" in i_leg.response.messages[0][0]
     assert msg_leg.content == "**Titulo leg1_c01**\nYouTube por Romulo (agendado)\nTikTok por Romulo (agendado)"
     assert msg_leg.edits[-1]["view"] is None
+
+
+# --- T10: _autorizado() centralizado e aviso para DISCORD_ALLOWED_USER_IDS="*" ---
+
+
+def test_autorizado_centralizado_e_aviso_curinga(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    store = LocalStore(tmp_path)
+
+    # Sem "*": nao imprime aviso
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    bot_mod.make_bot(store, allowed_ids=None, channel_id=CHANNEL_ID, guild_id=GUILD_ID, out_root=tmp_path)
+    assert "aviso: comandos liberados para qualquer membro do canal" not in capsys.readouterr().out
+
+    # Com "*" via env (como no main()): imprime aviso exato
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", "*")
+    bot_mod.make_bot(store, allowed_ids=None, channel_id=CHANNEL_ID, guild_id=GUILD_ID, out_root=tmp_path)
+    assert "aviso: comandos liberados para qualquer membro do canal" in capsys.readouterr().out
+
+    # Com "*" via allowed_ids explícito: imprime aviso exato
+    monkeypatch.delenv("DISCORD_ALLOWED_USER_IDS", raising=False)
+    bot_mod.make_bot(store, allowed_ids=["*"], channel_id=CHANNEL_ID, guild_id=GUILD_ID, out_root=tmp_path)
+    assert "aviso: comandos liberados para qualquer membro do canal" in capsys.readouterr().out
+
+    # _autorizado aprova canal configurado e thread filha, nega canal errado e usuario nao permitido
+    i_ok = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(CHANNEL_ID))
+    i_thr = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(THREAD_ID, parent_id=CHANNEL_ID))
+    i_bad_ch = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(OTHER_CHANNEL_ID))
+    i_bad_user = _FakeInteraction(user_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+
+    assert asyncio.run(bot_mod._autorizado(i_ok, CHANNEL_ID, [ALLOWED_USER])) is True
+    assert i_ok.response.messages == []
+    assert asyncio.run(bot_mod._autorizado(i_thr, CHANNEL_ID, [ALLOWED_USER])) is True
+    assert i_thr.response.messages == []
+    assert asyncio.run(bot_mod._autorizado(i_bad_ch, CHANNEL_ID, [ALLOWED_USER])) is False
+    assert i_bad_ch.response.messages == [("sem permissao", True)]
+    assert asyncio.run(bot_mod._autorizado(i_bad_user, CHANNEL_ID, [ALLOWED_USER])) is False
+    assert i_bad_user.response.messages == [("sem permissao", True)]
+
+
+# --- T11: /live adicionar, remover e lista (CTRL-01) ---
+
+
+def test_slash_live_adicionar_remover_lista_happy_pc_fixo_sem_vaga_e_duplicata(tmp_path: Path):
+    hb = datetime.fromtimestamp(T0, timezone.utc).replace(tzinfo=None)
+    db, store = _mongo_store("w-pc1", "PC-1", T0)
+    db.workers.update_one(
+        {"_id": "w-pc1"},
+        {"$set": {
+            "beat_s": 20.0,
+            "slots": {"twitch": 1, "kick": 1, "youtube": 0, "busca": 1},
+            "ocupados": {"twitch": 0, "kick": 0, "youtube": 0, "busca": 0},
+        }},
+    )
+    db.workers.insert_one({
+        "_id": "w-pc2",
+        "alias": "PC-2",
+        "heartbeat_at": hb,
+        "beat_s": 20.0,
+        "slots": {"twitch": 1, "kick": 0, "youtube": 1, "busca": 0},
+        "ocupados": {"twitch": 1, "kick": 0, "youtube": 0, "busca": 0},
+    })
+
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+    live_grp = bot.tree.get_command("live")
+    assert live_grp is not None
+    add_cmd = live_grp.get_command("adicionar")
+    rem_cmd = live_grp.get_command("remover")
+    lst_cmd = live_grp.get_command("lista")
+    assert add_cmd is not None and rem_cmd is not None and lst_cmd is not None
+
+    # 1. Lista vazia
+    i_empty = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(lst_cmd.callback(i_empty))
+    assert i_empty.response.messages == [("nenhum alvo ativo", False)]
+
+    # 2. Adicionar Twitch com vaga disponivel (CTRL-01 AC 1)
+    i_add = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(add_cmd.callback(i_add, "gaules"))
+    assert i_add.response.messages == [("alvo adicionado: gaules", False)]
+    doc = db.alvos.find_one({"_id": "gaules"})
+    assert doc is not None
+    assert (doc["tipo"], doc["plataforma"], doc["entrada"], doc["estado"], doc["pc_fixo"], doc["owner"], doc["lease_until"], doc["fase"]) == (
+        "live", "twitch", "gaules", "ativo", None, None, None, "sem vaga",
+    )
+    assert doc["criado_por"] == ALLOWED_USER
+
+    # 3. Duplicata ativa informa dono (CTRL-01 AC 10)
+    db.alvos.update_one({"_id": "gaules"}, {"$set": {"owner": "w-pc1", "fase": "gravando"}})
+    i_dup = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(add_cmd.callback(i_dup, "https://www.twitch.tv/gaules"))
+    assert i_dup.response.messages == [("ja acompanhado por PC-1", False)]
+
+    # 4. Adicionar Kick com pc_fixo sem vaga no PC escolhido -> indica "sem vaga" (CTRL-01 AC 3, 8)
+    i_kick = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(add_cmd.callback(i_kick, "https://kick.com/xqc", pc="PC-2"))
+    assert i_kick.response.messages == [("alvo adicionado: kick_xqc (sem vaga)", False)]
+    doc_kick = db.alvos.find_one({"_id": "kick_xqc"})
+    assert doc_kick is not None and doc_kick["plataforma"] == "kick" and doc_kick["pc_fixo"] == "PC-2"
+
+    # 5. Adicionar YouTube com vaga em PC-2
+    i_yt = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(add_cmd.callback(i_yt, "https://www.youtube.com/@caze/live"))
+    assert i_yt.response.messages == [("alvo adicionado: yt_caze", False)]
+    assert db.alvos.find_one({"_id": "yt_caze"})["plataforma"] == "youtube"
+
+    # 6. /live lista mostra dono (ou sem PC) e fase (CTRL-01 AC 5)
+    i_list = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(lst_cmd.callback(i_list))
+    txt, eph = i_list.response.messages[0]
+    assert eph is False
+    assert "gaules" in txt and "PC-1" in txt and "gravando" in txt
+    assert "kick_xqc" in txt and "sem PC" in txt and "sem vaga" in txt and "PC-2" in txt
+    assert "yt_caze" in txt
+
+    # 7. /live remover marca estado="removido" aceitando URL ou chave (CTRL-01 AC 4)
+    i_rem = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(rem_cmd.callback(i_rem, "https://www.twitch.tv/gaules"))
+    assert i_rem.response.messages == [("alvo removido: gaules", False)]
+    assert db.alvos.find_one({"_id": "gaules"})["estado"] == "removido"
+
+    # Re-adicionar apos removido funciona
+    i_readd = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(add_cmd.callback(i_readd, "gaules"))
+    assert i_readd.response.messages == [("alvo adicionado: gaules", False)]
+    assert db.alvos.find_one({"_id": "gaules"})["estado"] == "ativo"
+
+
+def test_slash_live_invalido_limite_30_sem_mongo_erro_mongo_e_autorizacao(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+):
+    # 1. Sem Mongo -> controle requer CLIPES_MONGO_URI (CTRL-01 AC 11)
+    bot_local = bot_mod.make_bot(
+        LocalStore(tmp_path),
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+    lg_local = bot_local.tree.get_command("live")
+    assert lg_local is not None
+    for sub, args in (("adicionar", ("gaules",)), ("remover", ("gaules",)), ("lista", ())):
+        inter = _FakeInteraction(user_id=ALLOWED_USER)
+        asyncio.run(lg_local.get_command(sub).callback(inter, *args))
+        assert inter.response.messages == [("controle requer CLIPES_MONGO_URI", False)], sub
+
+    # 2. Alvos invalidos -> "alvo invalido" sem gravar nada (CTRL-01 AC 9)
+    db, store = _mongo_store("w-pc1", "PC-1", T0)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+    lg = bot.tree.get_command("live")
+    add_cmd = lg.get_command("adicionar")
+    rem_cmd = lg.get_command("remover")
+    lst_cmd = lg.get_command("lista")
+
+    for bad in ("", "https://exemplo.com/live", "ftp://twitch.tv/gaules", "-flag", "canal com espaco"):
+        inter = _FakeInteraction(user_id=ALLOWED_USER)
+        asyncio.run(add_cmd.callback(inter, bad))
+        assert inter.response.messages == [("alvo invalido", False)], bad
+    assert db.alvos.count_documents({}) == 0
+
+    # 3. Autorizacao negada (usuario e canal) antes de tocar no Mongo
+    for sub, args in (("adicionar", ("gaules",)), ("remover", ("gaules",)), ("lista", ())):
+        i_u = _FakeInteraction(user_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+        i_c = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(OTHER_CHANNEL_ID))
+        asyncio.run(lg.get_command(sub).callback(i_u, *args))
+        asyncio.run(lg.get_command(sub).callback(i_c, *args))
+        assert i_u.response.messages == [("sem permissao", True)], sub
+        assert i_c.response.messages == [("sem permissao", True)], sub
+    assert db.alvos.count_documents({}) == 0
+
+    # 4. Limite de 30 alvos ativos
+    for idx in range(30):
+        db.alvos.insert_one({
+            "_id": f"canal_{idx}",
+            "tipo": "live",
+            "plataforma": "twitch",
+            "entrada": f"canal_{idx}",
+            "estado": "ativo",
+            "criado_em": datetime.fromtimestamp(T0 + idx, timezone.utc).replace(tzinfo=None),
+        })
+    i_cap = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(add_cmd.callback(i_cap, "canal_31"))
+    assert "30" in i_cap.response.messages[0][0]
+    assert db.alvos.find_one({"_id": "canal_31"}) is None
+
+    # 5. Falha do Mongo responde "controle indisponivel (Mongo)" com segredo mascarado no log
+    monkeypatch.setenv("CLIPES_MONGO_URI", "mongodb+srv://u:senhasecreta99@cluster.test/db")
+
+    class _BrokenCol:
+        def find_one(self, *a, **k):
+            raise RuntimeError("falha em mongodb+srv://u:senhasecreta99@cluster.test/db")
+
+        def find(self, *a, **k):
+            raise RuntimeError("falha em mongodb+srv://u:senhasecreta99@cluster.test/db")
+
+    broken_store = type("S", (), {"db": type("D", (), {"alvos": _BrokenCol(), "workers": _BrokenCol()})()})()
+    bot_broken = bot_mod.make_bot(
+        broken_store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+    lg_b = bot_broken.tree.get_command("live")
+    for sub, args in (("adicionar", ("gaules",)), ("remover", ("gaules",)), ("lista", ())):
+        inter = _FakeInteraction(user_id=ALLOWED_USER)
+        asyncio.run(lg_b.get_command(sub).callback(inter, *args))
+        assert inter.response.messages == [("controle indisponivel (Mongo)", False)], sub
+    out = capsys.readouterr().out
+    assert "senhasecreta99" not in out
+
+
+# --- T12: /clipar e /status (CTRL-02, CTRL-03) ---
+
+
+def test_slash_clipar_valido_duplicata_teto_20_invalido_sem_mongo_e_auth(tmp_path: Path):
+    import hashlib
+
+    # 1. Sem Mongo -> controle requer CLIPES_MONGO_URI
+    bot_local = bot_mod.make_bot(
+        LocalStore(tmp_path),
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+    clip_local = bot_local.tree.get_command("clipar")
+    assert clip_local is not None
+    i_no_mongo = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(clip_local.callback(i_no_mongo, "https://www.twitch.tv/videos/123"))
+    assert i_no_mongo.response.messages == [("controle requer CLIPES_MONGO_URI", False)]
+
+    # 2. Com Mongo: auth negada antes de tocar no banco
+    db, store = _mongo_store("w-pc1", "PC-1", T0)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+    clip_cmd = bot.tree.get_command("clipar")
+    assert clip_cmd is not None
+
+    i_u = _FakeInteraction(user_id=OTHER_USER, channel=_FakeChannel(CHANNEL_ID))
+    i_c = _FakeInteraction(user_id=ALLOWED_USER, channel=_FakeChannel(OTHER_CHANNEL_ID))
+    asyncio.run(clip_cmd.callback(i_u, "https://www.twitch.tv/videos/123"))
+    asyncio.run(clip_cmd.callback(i_c, "https://www.twitch.tv/videos/123"))
+    assert i_u.response.messages == [("sem permissao", True)]
+    assert i_c.response.messages == [("sem permissao", True)]
+    assert db.alvos.count_documents({}) == 0
+
+    # 3. URLs invalidas -> "url invalida" sem gravar nada (CTRL-02 AC 5)
+    for bad in (
+        "",
+        "twitch.tv/videos/123",
+        "ftp://twitch.tv/videos/123",
+        "https://exemplo.com/watch?v=1",
+        "https://twitch.tv/",
+        "https://user:pass@twitch.tv/videos/123",
+        "https://youtu.be/abc def",
+    ):
+        inter = _FakeInteraction(user_id=ALLOWED_USER)
+        asyncio.run(clip_cmd.callback(inter, bad))
+        assert inter.response.messages == [("url invalida", False)], bad
+    assert db.alvos.count_documents({}) == 0
+
+    # 4. URLs validas de todas as 4 origens permitidas -> vod:<sha8(url)> e "na fila: posição N" (CTRL-02 AC 1)
+    urls = [
+        ("https://www.twitch.tv/videos/111", "twitch"),
+        ("https://kick.com/xqc/videos/222", "kick"),
+        ("https://www.youtube.com/watch?v=abc12345", "youtube"),
+        ("https://youtu.be/xyz98765", "youtube"),
+    ]
+    for pos, (url, plat) in enumerate(urls, start=1):
+        inter = _FakeInteraction(user_id=ALLOWED_USER)
+        asyncio.run(clip_cmd.callback(inter, url))
+        assert inter.response.messages == [(f"na fila: posição {pos}", False)]
+        expected_id = f"vod:{hashlib.sha256(url.encode('utf-8')).hexdigest()[:8]}"
+        doc = db.alvos.find_one({"_id": expected_id})
+        assert doc is not None
+        assert (doc["tipo"], doc["plataforma"], doc["url"], doc["estado"]) == ("vod", plat, url, "ativo")
+
+    # 5. Duplicata ativa -> "ja na fila" (CTRL-02 AC 3)
+    i_dup = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(clip_cmd.callback(i_dup, urls[0][0]))
+    assert i_dup.response.messages == [("ja na fila", False)]
+
+    # 6. Teto de 20 VODs ativos -> "fila cheia (20)" (CTRL-02 AC 4)
+    for idx in range(5, 21):
+        inter = _FakeInteraction(user_id=ALLOWED_USER)
+        asyncio.run(clip_cmd.callback(inter, f"https://youtu.be/vod{idx:04d}"))
+        assert inter.response.messages == [(f"na fila: posição {idx}", False)]
+
+    i_full = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(clip_cmd.callback(i_full, "https://youtu.be/vod_extra_21"))
+    assert i_full.response.messages == [("fila cheia (20)", False)]
+    assert db.alvos.count_documents({"tipo": "vod", "estado": "ativo"}) == 20
+
+
+def test_slash_status_online_offline_slots_fila_metricas_limite_1900_e_sem_mongo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    from zoneinfo import ZoneInfo
+
+    monkeypatch.setenv("CLIPES_TZ", "America/Sao_Paulo")
+    sp = ZoneInfo("America/Sao_Paulo")
+    now_dt = datetime(2026, 11, 19, 14, 30, tzinfo=sp)
+    now_ts = now_dt.timestamp()
+    hb_on = now_dt.astimezone(timezone.utc).replace(tzinfo=None)
+    hb_off = datetime(2026, 11, 19, 12, 15, tzinfo=sp).astimezone(timezone.utc).replace(tzinfo=None)
+
+    # 1. Sem Mongo -> controle requer CLIPES_MONGO_URI
+    bot_local = bot_mod.make_bot(
+        LocalStore(tmp_path),
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=now_ts,
+    )
+    st_local = bot_local.tree.get_command("status")
+    assert st_local is not None
+    i_nm = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(st_local.callback(i_nm))
+    assert i_nm.response.messages == [("controle requer CLIPES_MONGO_URI", False)]
+
+    # 2. Com Mongo: online + offline (desde HH:MM), slots/ocupados, job_atual, fila, temp_c, disco_livre_gb
+    client = mongomock.MongoClient()
+    db = client.clipes_lives
+    db.workers.insert_many([
+        {
+            "_id": "w-1",
+            "alias": "PC-Mesa",
+            "heartbeat_at": hb_on,
+            "beat_s": 20.0,
+            "slots": {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1},
+            "ocupados": {"twitch": 1, "kick": 0, "youtube": 1, "busca": 1},
+            "job_atual": "twitch:gaules:101",
+            "fila": {"janelas": 2, "busca": 1, "vods": 0},
+            "capacity": {"temp_c": 74, "disco_livre_gb": 42.5},
+        },
+        {
+            "_id": "w-2",
+            "alias": "PC-Quarto",
+            "heartbeat_at": hb_off,
+            "beat_s": 20.0,
+            "slots": {"twitch": 1, "kick": 0, "youtube": 1, "busca": 0},
+            "ocupados": {"twitch": 0, "kick": 0, "youtube": 0, "busca": 0},
+            "job_atual": None,
+            "fila": {"janelas": 0, "busca": 0, "vods": 3},
+            "capacity": {"temp_c": 61, "disco_livre_gb": 18.2},
+        },
+    ])
+
+    bot = bot_mod.make_bot(
+        MongoStore(db),
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=now_ts,
+    )
+    st_cmd = bot.tree.get_command("status")
+    assert st_cmd is not None
+
+    # Auth negada
+    i_unauth = _FakeInteraction(user_id=OTHER_USER)
+    asyncio.run(st_cmd.callback(i_unauth))
+    assert i_unauth.response.messages == [("sem permissao", True)]
+
+    # Happy path
+    i_ok = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(st_cmd.callback(i_ok))
+    text, eph = i_ok.response.messages[0]
+    assert eph is False
+    lines = text.splitlines()
+    assert len(lines) == 2
+    assert "PC-Mesa" in lines[0] and "(online)" in lines[0]
+    assert "twitch:1/1" in lines[0] and "kick:0/1" in lines[0] and "youtube:1/1" in lines[0] and "busca:1/1" in lines[0]
+    assert "twitch:gaules:101" in lines[0]
+    assert "janelas=2" in lines[0] and "busca=1" in lines[0] and "vods=0" in lines[0]
+    assert "74C" in lines[0] and "42.5GB" in lines[0]
+
+    assert "PC-Quarto" in lines[1] and "offline (desde 12:15)" in lines[1]
+    assert "ocioso" in lines[1] and "vods=3" in lines[1] and "61C" in lines[1] and "18.2GB" in lines[1]
+
+    # 3. Respeita teto de 1900 chars com muitos workers
+    for idx in range(40):
+        db.workers.insert_one({
+            "_id": f"w-extra-{idx:02d}",
+            "alias": f"PC-Extra-{idx:02d}-" + ("X" * 20),
+            "heartbeat_at": hb_on,
+            "beat_s": 20.0,
+            "slots": {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1},
+            "ocupados": {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1},
+            "job_atual": "job_longo_de_teste",
+            "fila": {"janelas": 1, "busca": 2, "vods": 3},
+            "capacity": {"temp_c": 70, "disco_livre_gb": 10.0},
+        })
+    i_many = _FakeInteraction(user_id=ALLOWED_USER)
+    asyncio.run(st_cmd.callback(i_many))
+    assert len(i_many.response.messages[0][0]) <= 1900
+
+
+# --- T16: Botão Descartar e atualização de estado na mensagem do clipe ---
+
+
+def test_on_interaction_descartar_marca_descartado_remove_botoes_e_atualiza_estado(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """T16: Clicar Descartar -> _autorizado(), status=descartado no Registro/Mongo, linha 🗑️, botões removidos."""
+    import mongomock
+    from discord.components import _component_factory
+    from clipes.notificar import _approve_components
+    from clipes.registro import Registro
+
+    db = mongomock.MongoClient().clipes_lives
+    store = bot_mod.MongoStore(db)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+
+    # Criar um clipe no registro local e no Mongo
+    reg = Registro(tmp_path, mongo=db)
+    clip_id = "tg_discard_c01"
+    reg.upsert({
+        "clip_id": clip_id,
+        "titulo": "Titulo para descartar",
+        "canal": "gaules",
+        "video_id": "live_discard",
+        "owner": "w-pc1",
+        "status": "pendente",
+        "criado_em": T0,
+    })
+    reg.set_discord(clip_id, {
+        "thread_id": THREAD_ID,
+        "message_id": "msg-discard-1",
+        "attachment_id": "att-1",
+        "filename": "clip.mp4",
+        "size": 1000,
+    })
+
+    # Mock message class para testar edição via msg.edit
+    class _DiscardMsg:
+        def __init__(self, content: str, components: list[Any]):
+            self.content = content
+            self.components = components
+            self.edits: list[dict[str, Any]] = []
+
+        async def edit(self, *, content: str | None = None, view: Any = "UNSET", allowed_mentions: Any = None) -> None:
+            self.edits.append({"content": content, "view": view, "allowed_mentions": allowed_mentions})
+            if content is not None:
+                self.content = content
+            if view is None:
+                self.components = []
+
+    class _DiscardResponse(_FakeInteractionResponse):
+        def __init__(self, msg: _DiscardMsg | None) -> None:
+            super().__init__()
+            self._msg = msg
+            self.edited: list[dict[str, Any]] = []
+
+    class _DiscardInteraction:
+        def __init__(
+            self,
+            custom_id: str,
+            msg: _DiscardMsg | None,
+            *,
+            user_id: int | str = ALLOWED_USER,
+            user_name: str = "Romulo",
+            channel: _FakeChannel | None = None,
+        ):
+            self.type = discord.InteractionType.component
+            self.data = {"custom_id": custom_id, "component_type": 2}
+            self.user = _FakeUser(user_id, name=user_name)
+            self.channel = channel or _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+            self.channel_id = self.channel.id
+            self.message = msg
+            self.response = _DiscardResponse(msg)
+            self.followup = self.response.followup
+
+    # Mensagem original com estado 🟡 pendente
+    orig_content = "🟡 pendente — **Titulo para descartar**\nID: `tg_discard_c01`\nGancho: INSANO\nNota: 9.0 (gemini)\nDescricao: Descricao longa"
+    msg = _DiscardMsg(orig_content, [_component_factory(c) for c in _approve_components(clip_id)])
+
+    # Click Descartar (autorizado)
+    i_discard = _DiscardInteraction(f"descartar:{clip_id}", msg, user_name="Romulo")
+    asyncio.run(bot.on_interaction(i_discard))
+
+    # Resposta followup com confirmação
+    assert i_discard.response.messages == [(f"clipe descartado: {clip_id}", False)]
+    assert i_discard.response.edited == []  # edição da mensagem feita via msg.edit, não interaction.edit
+
+    # Mensagem editada para 🗑️ descartado e sem botões
+    assert msg.content.startswith("🗑️ descartado — **Titulo para descartar**")
+    assert msg.edits[-1]["view"] is None  # botões removidos
+
+    # Registro local marcado como descartado
+    reg_rec = reg.get(clip_id)
+    assert reg_rec is not None
+    assert reg_rec["status"] == "descartado"
+
+    # Mongo clips também marcado como descartado
+    mongo_clip = db.clips.find_one({"$or": [{"_id": clip_id}, {"clip_id": clip_id}]})
+    assert mongo_clip is not None
+    assert mongo_clip["status"] == "descartado"
+
+
+def test_on_interaction_descartar_negado_sem_permissao(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """T16: Descartar negado para usuário não autorizado ou canal errado."""
+    import mongomock
+    from discord.components import _component_factory
+    from clipes.notificar import _approve_components
+    from clipes.registro import Registro
+
+    db = mongomock.MongoClient().clipes_lives
+    store = bot_mod.MongoStore(db)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+
+    reg = Registro(tmp_path, mongo=db)
+    clip_id = "tg_discard_c02"
+    reg.upsert({
+        "clip_id": clip_id,
+        "titulo": "Titulo 2",
+        "canal": "gaules",
+        "video_id": "live_discard2",
+        "owner": "w-pc1",
+        "status": "pendente",
+        "criado_em": T0,
+    })
+
+    # Mock message class para testar edição via msg.edit
+    class _DiscardMsg:
+        def __init__(self, content: str, components: list[Any]):
+            self.content = content
+            self.components = components
+            self.edits: list[dict[str, Any]] = []
+
+        async def edit(self, *, content: str | None = None, view: Any = "UNSET", allowed_mentions: Any = None) -> None:
+            self.edits.append({"content": content, "view": view, "allowed_mentions": allowed_mentions})
+            if content is not None:
+                self.content = content
+            if view is None:
+                self.components = []
+
+    class _DiscardResponse(_FakeInteractionResponse):
+        def __init__(self, msg: _DiscardMsg | None) -> None:
+            super().__init__()
+            self._msg = msg
+            self.edited: list[dict[str, Any]] = []
+
+    class _DiscardInteraction:
+        def __init__(
+            self,
+            custom_id: str,
+            msg: _DiscardMsg | None,
+            *,
+            user_id: int | str = ALLOWED_USER,
+            user_name: str = "Romulo",
+            channel: _FakeChannel | None = None,
+        ):
+            self.type = discord.InteractionType.component
+            self.data = {"custom_id": custom_id, "component_type": 2}
+            self.user = _FakeUser(user_id, name=user_name)
+            self.channel = channel or _FakeChannel(THREAD_ID, parent_id=CHANNEL_ID)
+            self.channel_id = self.channel.id
+            self.message = msg
+            self.response = _DiscardResponse(msg)
+            self.followup = self.response.followup
+
+    orig_content = "🟡 pendente — **Titulo 2**\nID: `tg_discard_c02`"
+    msg = _DiscardMsg(orig_content, [_component_factory(c) for c in _approve_components(clip_id)])
+
+    # Usuário não autorizado
+    i_bad_user = _DiscardInteraction(f"descartar:{clip_id}", msg, user_id=OTHER_USER)
+    asyncio.run(bot.on_interaction(i_bad_user))
+    assert i_bad_user.response.messages == [("sem permissao", True)]
+    assert msg.content == orig_content  # não editado
+
+    # Canal errado
+    i_bad_ch = _DiscardInteraction(f"descartar:{clip_id}", msg, channel=_FakeChannel(OTHER_CHANNEL_ID))
+    asyncio.run(bot.on_interaction(i_bad_ch))
+    assert i_bad_ch.response.messages == [("sem permissao", True)]
+    assert msg.content == orig_content
+
+
+def test_update_button_message_altera_estado_para_agendado_e_publicado(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """T16: _update_button_message troca 🟡 -> 🗓️ (agendado) -> ✅ (publicado) quando ambas plataformas."""
+    import mongomock
+
+    db = mongomock.MongoClient().clipes_lives
+    store = bot_mod.MongoStore(db)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+
+    # Mock message object - usa sentinel para distinguir "não passado" de "explicitamente None"
+    _UNSET = object()
+
+    class MockMessage:
+        def __init__(self, content: str):
+            self.content = content
+            self.edits: list[dict] = []
+
+        async def edit(self, *, content: str | None = None, view: Any = _UNSET, allowed_mentions: Any = None):
+            if content is not None:
+                self.content = content
+            self.edits.append({"content": content, "view": view, "allowed_mentions": allowed_mentions})
+
+    import discord
+    no_mentions = discord.AllowedMentions.none()
+
+    # 1. Estado inicial 🟡 pendente -> clica YouTube (agendado)
+    msg = MockMessage("🟡 pendente — **Titulo teste**\nID: `tg_state_c01`")
+
+    asyncio.run(bot._update_button_message(
+        msg, _FakeUser(ALLOWED_USER, name="Romulo"), ALLOWED_USER,
+        accepted=["youtube"],
+        result="youtube: publicacao enfileirada; agendado para 2026-11-20 10:00 (America/Sao_Paulo)",
+        no_mentions=no_mentions,
+        agendar=True,
+    ))
+
+    # Estado deve ser 🗓️ agendado com data/hora
+    assert "🗓️ agendado (" in msg.content
+    assert "2026-11-20 10:00" in msg.content
+    assert "YouTube por Romulo (agendado)" in msg.content
+    # Botões devem permanecer (ainda não tem TikTok no conteúdo) - view não deve ser None
+    assert msg.edits[-1]["view"] is not None
+
+    # 2. Segundo clique: TikTok também agendado -> ✅ publicado (YouTube, TikTok) e botões removidos
+    # Porque o conteúdo já tem "YouTube por", o has_yt=True, e ao adicionar "TikTok por", has_tt=True
+    msg2 = MockMessage("🗓️ agendado (2026-11-20 10:00) — **Titulo teste**\nID: `tg_state_c01`\nYouTube por Romulo (agendado)")
+    asyncio.run(bot._update_button_message(
+        msg2, _FakeUser(OTHER_USER, name="Maria"), OTHER_USER,
+        accepted=["tiktok"],
+        result="tiktok: publicacao enfileirada; agendado para 2026-11-20 19:00 (America/Sao_Paulo)",
+        no_mentions=no_mentions,
+        agendar=True,
+    ))
+
+    # Estado deve ser ✅ publicado (YouTube, TikTok) porque ambas plataformas estão no conteúdo
+    assert "✅ publicado (YouTube, TikTok)" in msg2.content
+    assert "TikTok por Maria (agendado)" in msg2.content
+    # Botões devem ser removidos (ambas plataformas agora no conteúdo)
+    assert msg2.edits[-1]["view"] is None
+
+    # 3. O estado ✅ publicado também é atualizado por _edit_published_status_message no run_pending
+    # Testado em tests/test_publicacao.py
+
+
+def test_publicar_clip_descartado_retorna_clipe_descartado_sem_enfileirar(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    """T16: publicacao.request recusa clipe descartado com 'clipe descartado'."""
+    import mongomock
+    from clipes.registro import Registro
+    from clipes import publicacao
+
+    db = mongomock.MongoClient().clipes_lives
+    store = bot_mod.MongoStore(db)
+    bot = bot_mod.make_bot(
+        store,
+        allowed_ids=[ALLOWED_USER],
+        channel_id=CHANNEL_ID,
+        guild_id=GUILD_ID,
+        out_root=tmp_path,
+        now=T0,
+    )
+
+    # Criar clipe no registro e depois marcar como descartado
+    reg = Registro(tmp_path, mongo=db)
+    clip_id = "tg_discard_c03"
+    reg.upsert({
+        "clip_id": clip_id,
+        "titulo": "Titulo descartado",
+        "canal": "gaules",
+        "video_id": "live_discard3",
+        "owner": "w-pc1",
+        "criado_em": T0,
+    })
+    reg.marcar(clip_id, status="descartado")
+
+    # Tentar publicar via bot._request_publish (que chama publicacao.request)
+    result = bot._request_publish(clip_id, ALLOWED_USER, THREAD_ID, agendar=True, platforms=publicacao.PLATFORMS)
+    assert result == "clipe descartado"
+
+    # Nenhum request de publicação deve ter sido criado
+    assert db.publish_requests.count_documents({"clip_id": clip_id}) == 0

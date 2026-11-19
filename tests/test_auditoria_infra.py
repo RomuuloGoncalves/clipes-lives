@@ -25,6 +25,7 @@ EXCECOES_COMPOSE: dict[str, str] = {
     "CLIPES_EMBED_ONNX": "fixada no Dockerfile (/opt/models/embed/...)",
     "CLIPES_LLM_GGUF": "fixada no Dockerfile (/opt/models/llm/atual.gguf)",
     "CLIPES_YUNET_ONNX": "fixada no Dockerfile (/opt/models/yunet/...)",
+    "CLIPES_MAX_LIVES": "substituida por CLIPES_SLOTS (AD-019; mantida apenas em codigo legado)",
 }
 
 # Variaveis internas do container definidas no compose que nao pertencem ao .env do usuario.
@@ -76,7 +77,7 @@ def _parse_compose_services(text: str) -> dict[str, dict[str, object]]:
 
         if indent == 2 and stripped.endswith(":"):
             cur_service = stripped[:-1]
-            services[cur_service] = {"user": None, "environment": {}}
+            services[cur_service] = {"user": None, "restart": None, "environment": {}}
             in_env = False
             continue
 
@@ -88,6 +89,9 @@ def _parse_compose_services(text: str) -> dict[str, dict[str, object]]:
             if stripped.startswith("user:"):
                 val = stripped.split(":", 1)[1].strip().strip('"').strip("'")
                 services[cur_service]["user"] = val
+            elif stripped.startswith("restart:"):
+                val = stripped.split(":", 1)[1].strip().strip('"').strip("'")
+                services[cur_service]["restart"] = val
             continue
 
         if indent == 6 and in_env and ":" in stripped:
@@ -169,18 +173,26 @@ def test_m21_variaveis_novas_e_da_tabela_repassadas_no_compose():
         "CLIPES_PUB_MAX_POR_CICLO",
         "CLIPES_BUFFER_CAP_GB",
         "CLIPES_LIVE_CAPTURA_MORTA_S",
+        "CLIPES_SLOTS",
+        "DISCORD_LOG_CHANNEL_ID",
     ]
     for var in esperadas_clipes:
         assert clipes_env.get(var) == f"${{{var}:-}}", f"clipes.environment[{var}] esperado ${{{var}:-}}"
 
     esperadas_bot = [
+        "CLIPES_SLOTS",
         "CLIPES_POLICY_FILE",
+        "DISCORD_LOG_CHANNEL_ID",
         "CLIPES_QUOTA_PATH",
         "CLIPES_PUB_LEASE_S",
         "CLIPES_PUB_MAX_POR_CICLO",
     ]
     for var in esperadas_bot:
         assert bot_env.get(var) == f"${{{var}:-}}", f"bot.environment[{var}] esperado ${{{var}:-}}"
+
+    assert "CLIPES_MAX_LIVES" not in clipes_env
+    assert "CLIPES_MAX_LIVES" not in bot_env
+    assert services["bot"]["restart"] == "unless-stopped"
 
 
 # --- B-24 ---------------------------------------------------------------------
@@ -192,9 +204,13 @@ def test_b24_compose_name_consistente_com_clipar_e_vigia_temp():
     assert top_level[0] == "name: clipes-lives"
 
     label = "label=com.docker.compose.project=clipes-lives"
-    assert label in CLIPAR_PATH.read_text(encoding="utf-8")
+    svc_label = "label=com.docker.compose.service=clipes"
+    clipar_text = CLIPAR_PATH.read_text(encoding="utf-8")
+    assert label in clipar_text
+    assert svc_label in clipar_text
     vigia_text = VIGIA_PATH.read_text(encoding="utf-8")
     assert vigia_text.count(label) >= 3
+    assert vigia_text.count(svc_label) >= 3
 
 
 # --- B-20 ---------------------------------------------------------------------

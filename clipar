@@ -1,5 +1,5 @@
 #!/bin/sh
-# Uso: ./clipar <url> [opcoes]   (ou ./clipar monitor ...)
+# Uso: ./clipar <url> [opcoes]   (ou ./clipar servico ...)
 # Cria a pasta de saida como seu usuario antes do Docker (senao ele a cria como root, com cadeado).
 # Limita a CPU (CLIPES_CPUS, automatico ou usuario) e RAM (CLIPES_MEM), baixa a prioridade e liga o vigia termico.
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -68,7 +68,7 @@ if [ "$("$D/vigia-temp" --check 2>/dev/null)" = "sem-sensor" ]; then
   echo "aviso: sem sensor de temperatura; vigia termico desligado" >&2
 fi
 "$D/vigia-temp" & V=$!
-fim() { kill $V 2>/dev/null; docker unpause $(docker ps -q --filter label=com.docker.compose.project=clipes-lives) >/dev/null 2>&1; }
+fim() { kill $V 2>/dev/null; docker unpause $(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes) >/dev/null 2>&1; }
 trap fim EXIT INT TERM
 
 while :; do

@@ -1,19 +1,24 @@
-"""Nucleo do painel: autorizacao, status e comando. Sem I/O de rede alem do `db` recebido."""
+"""Nucleo do painel: autorizacao, status, comando e alvos. Sem I/O de rede alem do `db` recebido.
+
+Sem imports de `clipes` (a Vercel so instala pymongo): o parser de alvos espelha
+`acompanhar.parse_alvo` + `bot._parse_live_alvo`, e `tests/test_painel.py` confere a paridade.
+"""
 from __future__ import annotations
 
 import base64
 import json
 import math
 import os
+import re
 import secrets
 import threading
 import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Protocol, TypedDict
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlparse, urlsplit
 
-MetodoPainel = Literal["status", "comando"]
+MetodoPainel = Literal["status", "comando", "alvos"]
 
 
 class WorkerStatus(TypedDict):
@@ -25,6 +30,9 @@ class WorkerStatus(TypedDict):
     job_atual: Any
     max_lives: Any
     razao: Any
+    slots: dict[str, Any] | None
+    ocupados: dict[str, Any] | None
+    fila: dict[str, Any] | None
     history: list[dict[str, Any]]
 
 
@@ -35,9 +43,19 @@ class LiveStatus(TypedDict):
     lease_until: str | None
 
 
+class AlvoStatus(TypedDict):
+    _id: Any
+    plataforma: Any
+    entrada: Any
+    owner: Any
+    pc_fixo: Any
+    fase: Any
+
+
 class StatusPayload(TypedDict):
     workers: list[WorkerStatus]
     lives: list[LiveStatus]
+    alvos: list[AlvoStatus]
     jobs_24h: dict[str, int]
 
 
@@ -118,6 +136,10 @@ def _worker_online(worker: Mapping[str, Any], now: datetime, beat_s: float) -> b
     return (now - hb).total_seconds() <= 3 * _worker_beat_s(worker, beat_s)
 
 
+def _mapa_ou_none(valor: Any) -> dict[str, Any] | None:
+    return dict(valor) if isinstance(valor, dict) else None
+
+
 def status(db: Any, now: datetime, beat_s: float = BEAT_S) -> StatusPayload:
     workers: list[WorkerStatus] = []
     for w in db.workers.find():
@@ -127,16 +149,22 @@ def status(db: Any, now: datetime, beat_s: float = BEAT_S) -> StatusPayload:
             "online": _worker_online(w, now, beat_s),
             "heartbeat_at": _iso(hb), "capacity": w.get("capacity"),
             "job_atual": w.get("job_atual"), "max_lives": w.get("max_lives"),
-            "razao": w.get("razao"), "history": _historico(w.get("history")),
+            "razao": w.get("razao"),
+            "slots": _mapa_ou_none(w.get("slots")), "ocupados": _mapa_ou_none(w.get("ocupados")),
+            "fila": _mapa_ou_none(w.get("fila")), "history": _historico(w.get("history")),
         })
     lives: list[LiveStatus] = [{"id": l["_id"], "channel": l.get("channel"), "owner": l["owner"],
               "lease_until": _iso(l.get("lease_until"))}
              for l in db.lives.find({"status": "live", "owner": {"$ne": None},
                                      "lease_until": {"$gte": now}})]
+    alvos: list[AlvoStatus] = [{"_id": a["_id"], "plataforma": a.get("plataforma"),
+                                "entrada": a.get("entrada"), "owner": a.get("owner"),
+                                "pc_fixo": a.get("pc_fixo"), "fase": a.get("fase")}
+                               for a in db.alvos.find({"tipo": "live", "estado": "ativo"}).sort("criado_em", 1)]
     jobs: dict[str, int] = {}
     for j in db.jobs.find({"updated_at": {"$gte": now - timedelta(hours=24)}}):
         jobs[j["status"]] = jobs.get(j["status"], 0) + 1
-    return {"workers": workers, "lives": lives, "jobs_24h": jobs}
+    return {"workers": workers, "lives": lives, "alvos": alvos, "jobs_24h": jobs}
 
 
 def criar_comando(
@@ -179,6 +207,116 @@ def criar_comando(
     if res.upserted_id is None:
         return 409, {"erro": "comando ja pendente"}
     return 202, {"ok": True}
+
+
+# ---- alvos (espelho de acompanhar.parse_alvo + bot._parse_live_alvo; paridade em tests/test_painel.py)
+
+MAX_ALVOS_ATIVOS: int = 30
+_CANAL_RE = re.compile(r"[a-z0-9_]{1,25}")
+_YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,32}")
+_YT_HANDLE_RE = re.compile(r"@([A-Za-z0-9_.-]{1,64})")
+_KICK_SLUG_RE = re.compile(r"[a-z0-9_-]{1,25}")  # espelho de acompanhar._KICK_SLUG_RE (aplicado em minusculas)
+_KICK_RESERVED = frozenset({"video", "videos", "categories", "search", "auth", "clips"})
+_TWITCH_HOSTS = frozenset({"twitch.tv", "www.twitch.tv", "m.twitch.tv"})
+_YT_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com"})
+_KICK_HOSTS = frozenset({"kick.com", "www.kick.com", "m.kick.com"})
+
+
+def _alvo_dict(plataforma: str, chave: str, canal: str, url: str) -> dict[str, str]:
+    return {"plataforma": plataforma, "chave": chave, "canal": canal, "url": url}
+
+
+def _alvo_youtube(vid: str) -> dict[str, str]:
+    return _alvo_dict("youtube", f"yt_{vid}", vid.lower(), f"https://www.youtube.com/watch?v={vid}")
+
+
+def _parse_alvo(raw: Any) -> dict[str, str] | None:
+    """Alvo de live (Twitch, YouTube ou Kick) -> {plataforma, chave, canal, url}; None se invalido."""
+    clean = raw.strip() if isinstance(raw, str) else ""
+    if not clean or any(ch.isspace() for ch in clean):
+        return None
+    if "://" in clean:
+        sp = urlsplit(clean)
+        if sp.scheme.lower() not in ("http", "https") or sp.username or sp.password:
+            return None
+    if "://" not in clean and "/" not in clean and "." not in clean:
+        canal = clean.lstrip("@").lower()
+        if not _CANAL_RE.fullmatch(canal):
+            return None
+        return _alvo_dict("twitch", canal, canal, f"https://www.twitch.tv/{canal}")
+
+    url = clean if "://" in clean else f"https://{clean}"
+    p = urlparse(url)
+    host = p.netloc.lower()
+    path = p.path.strip("/")
+    if host in _TWITCH_HOSTS:
+        if not path or "/" in path or not _CANAL_RE.fullmatch(path.lower()):
+            return None
+        return _alvo_dict("twitch", path.lower(), path.lower(), f"https://www.twitch.tv/{path.lower()}")
+    if host in _YT_HOSTS:
+        parts = [x for x in path.split("/") if x]
+        if parts == ["watch"]:
+            vid = (parse_qs(p.query).get("v") or [""])[0]
+            return _alvo_youtube(vid) if _YT_ID_RE.fullmatch(vid) else None
+        if len(parts) == 2 and parts[0] == "live" and _YT_ID_RE.fullmatch(parts[1]):
+            return _alvo_youtube(parts[1])
+        if (len(parts) == 1 or (len(parts) == 2 and parts[1] == "live")) and (m := _YT_HANDLE_RE.fullmatch(parts[0])):
+            handle = m.group(1)
+            safe = re.sub(r"[^A-Za-z0-9_-]", "_", handle.lower())
+            return _alvo_dict("youtube", f"yt_{safe}", handle.lower(), f"https://www.youtube.com/@{handle}/live")
+        return None
+    if host == "youtu.be":
+        return _alvo_youtube(path) if path and "/" not in path and _YT_ID_RE.fullmatch(path) else None
+
+    # Kick: o bot usa urlsplit (sem `;params`) e aceita so http(s) sem credenciais
+    sk = urlsplit(url)
+    slug = sk.path.strip("/").lower()
+    if (sk.scheme.lower() in ("http", "https") and not sk.username and not sk.password
+            and sk.netloc.lower() in _KICK_HOSTS and slug and "/" not in slug
+            and slug not in _KICK_RESERVED and _KICK_SLUG_RE.fullmatch(slug)):
+        return _alvo_dict("kick", f"kick_{slug}", slug, f"https://kick.com/{slug}")
+    return None
+
+
+def criar_alvo(db: Any, alvo: Any, pc: Any, now: datetime) -> tuple[int, dict[str, Any]]:
+    """Adiciona alvo de live como o bot (`_live_adicionar`): mesmo doc, limite e recusa de duplicado."""
+    parsed = _parse_alvo(alvo)
+    if parsed is None:
+        return 400, {"erro": "alvo invalido"}
+    chave = parsed["chave"]
+    if db.alvos.find_one({"_id": chave, "estado": "ativo"}) is not None:
+        return 409, {"erro": "alvo ja acompanhado"}
+    if db.alvos.count_documents({"tipo": "live", "estado": "ativo"}) >= MAX_ALVOS_ATIVOS:
+        return 409, {"erro": f"limite de {MAX_ALVOS_ATIVOS} alvos ativos atingido"}
+    pc_fixo = pc.strip() if isinstance(pc, str) else ""
+    db.alvos.replace_one({"_id": chave}, {
+        "_id": chave, "tipo": "live", "plataforma": parsed["plataforma"],
+        "entrada": parsed["canal"] if parsed["plataforma"] == "twitch" else parsed["url"],
+        "canal": parsed["canal"], "url": None, "estado": "ativo",
+        "pc_fixo": pc_fixo or None, "owner": None, "lease_until": None, "fase": "sem vaga",
+        "criado_por": "painel", "criado_em": now, "erro": None,
+    }, upsert=True)
+    return 201, {"ok": True, "_id": chave}
+
+
+def remover_alvo(db: Any, alvo_id: Any) -> tuple[int, dict[str, Any]]:
+    """Marca `estado=removido` como o bot (`_live_remover`); o Supervisor para o alvo no proximo ciclo."""
+    if not isinstance(alvo_id, str) or not alvo_id:
+        return 400, {"erro": "alvo invalido"}
+    res = db.alvos.update_one({"_id": alvo_id, "tipo": "live", "estado": "ativo"},
+                              {"$set": {"estado": "removido"}})
+    if res.matched_count == 0:
+        return 404, {"erro": "alvo nao encontrado"}
+    return 200, {"ok": True}
+
+
+def gerir_alvo(db: Any, corpo: Mapping[str, Any], now: datetime) -> tuple[int, dict[str, Any]]:
+    acao = corpo.get("acao")
+    if acao == "adicionar":
+        return criar_alvo(db, corpo.get("alvo"), corpo.get("pc"), now)
+    if acao == "remover":
+        return remover_alvo(db, corpo.get("id"))
+    return 400, {"erro": "acao invalida"}
 
 
 def _chave_cliente(h: _HttpHandler) -> str:
@@ -260,7 +398,7 @@ def tratar(h: _HttpHandler, metodo: MetodoPainel, now: datetime | None = None) -
         _registrar_falha_auth(chave, agora_mono)
         return _enviar(h, 401, {"erro": "nao autorizado"}, {"WWW-Authenticate": 'Basic realm="painel"'})
     _limpar_falhas_auth(chave)
-    if metodo == "comando":
+    if metodo in ("comando", "alvos"):
         if not _origem_valida(h):
             return _enviar(h, 403, {"erro": "origem nao permitida"})
         ctype = (h.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -278,6 +416,8 @@ def tratar(h: _HttpHandler, metodo: MetodoPainel, now: datetime | None = None) -
         except ValueError:
             corpo = {}
         corpo = corpo if isinstance(corpo, dict) else {}
+        if metodo == "alvos":
+            return _enviar(h, *gerir_alvo(db, corpo, now))
         return _enviar(h, *criar_comando(db, corpo.get("worker_id"), corpo.get("confirmar"), now))
     except Exception:  # nunca vazar detalhe (URI/host) na resposta
         return _enviar(h, 500, {"erro": "erro interno"})

@@ -1009,6 +1009,24 @@ def _next_free_quota_slot(
     return after
 
 
+def _is_clip_discarded(found: dict[str, Any], adapted: Any, clip_id: str) -> bool:
+    reg_rec = found.get("registro")
+    if isinstance(reg_rec, dict) and reg_rec.get("status") == "descartado":
+        return True
+    clip_entry = found.get("clip")
+    if isinstance(clip_entry, dict) and clip_entry.get("status") == "descartado":
+        return True
+    db = getattr(adapted, "db", None)
+    if db is not None and hasattr(db, "clips"):
+        try:
+            doc = db.clips.find_one({"$or": [{"_id": clip_id}, {"clip_id": clip_id}]})
+            if isinstance(doc, dict) and doc.get("status") == "descartado":
+                return True
+        except Exception:
+            pass
+    return False
+
+
 def request(
     store: Any,
     clip_id: str,
@@ -1038,6 +1056,8 @@ def request(
     found = find_clip(root, clip_id, store=adapted)
     if found is None:
         return f"clipe {clip_id} nao encontrado"
+    if _is_clip_discarded(found, adapted, clip_id):
+        return "clipe descartado"
 
     now_ts = _now_ts(now)
     pol = _resolve_policy(policy, policy_path, root)
@@ -1251,6 +1271,86 @@ def _send_thread_reply(
         DiscordRest(bot_token).post(str(thread_id), message)
     except Exception:
         pass
+
+
+def _edit_published_status_message(
+    *,
+    found: dict[str, Any],
+    adapted: Any,
+    clip_id: str,
+    plat: str,
+    discord_client: Any | None,
+    reg: Registro | None,
+) -> None:
+    discord_info = (
+        found.get("discord")
+        if isinstance(found.get("discord"), dict)
+        else (found.get("registro") or {}).get("discord")
+        or (found.get("clip") or {}).get("discord")
+        or {}
+    )
+    if not isinstance(discord_info, dict):
+        return
+    d_thread = discord_info.get("thread_id") or found.get("thread_id")
+    d_msg = discord_info.get("message_id")
+    if not (d_thread and d_msg):
+        return
+
+    client = discord_client
+    if client is None:
+        bot_token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
+        if not bot_token:
+            return
+        from .discord_rest import DiscordRest
+
+        client = DiscordRest(bot_token)
+    if not (hasattr(client, "get_message") and hasattr(client, "edit")):
+        return
+
+    labels_map = {"youtube": "YouTube", "tiktok": "TikTok"}
+    published: list[str] = []
+    reg_rec = reg.get(clip_id) if reg is not None else None
+    pubs_dict = (reg_rec.get("publicacoes") if isinstance(reg_rec, dict) else None) or {}
+    for p in PLATFORMS:
+        if p == plat or (isinstance(pubs_dict, dict) and p in pubs_dict):
+            published.append(labels_map.get(p, p))
+        else:
+            existing = adapted.get_request(clip_id, p)
+            if existing is not None and existing.get("status") == "ok":
+                published.append(labels_map.get(p, p))
+
+    new_status = f"✅ publicado ({', '.join(published)})"
+    try:
+        msg = client.get_message(str(d_thread), str(d_msg))
+        orig_content = str((msg or {}).get("content") or "")
+        if not orig_content:
+            return
+        from .notificar import set_clip_status_line
+
+        new_content = set_clip_status_line(orig_content, new_status, prepend_if_missing=True)
+        if new_content != orig_content:
+            client.edit(str(d_thread), str(d_msg), new_content)
+    except Exception:
+        pass
+
+
+def _edit_status_safe(
+    found: dict[str, Any] | None,
+    adapted: Any,
+    clip_id: str,
+    plat: str,
+    discord_client: Any | None,
+    reg: Registro | None,
+) -> None:
+    """Edita o estado no Discord sem nunca falhar o pedido: erro aqui nao pode virar 'erro' do publicado."""
+    if not found:
+        return
+    try:
+        _edit_published_status_message(
+            found=found, adapted=adapted, clip_id=clip_id, plat=plat, discord_client=discord_client, reg=reg,
+        )
+    except Exception as exc:
+        print(f"[publicacao] falha ao editar estado da mensagem de {clip_id} ({type(exc).__name__})", flush=True)
 
 
 def _secret_values(tokens_map: dict[str, Any], extra: Iterable[str] = ()) -> list[str]:
@@ -1496,6 +1596,12 @@ def run_pending(
                     except Exception as exc:
                         print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({type(exc).__name__})", flush=True)
                 finish("ok", dict(partial), f"[{plat}] ok: {prev_url or prev_id}")
+                _edit_status_safe(found, adapted, clip_id, plat, discord_client, reg)
+                continue
+
+            if found is not None and _is_clip_discarded(found, adapted, clip_id):
+                # pedido aceito antes do Descartar: nao publica (request() so recusa na entrada)
+                finish("erro", {"erro": "clipe descartado"}, f"[{plat}] erro: clipe descartado")
                 continue
 
             if not quota_ok(plat, now_ts, quota_path=quota_path, out_root=root, db=quota_db):
@@ -1750,6 +1856,7 @@ def run_pending(
                 link_or_id = url or pub_id
                 reply = _sanitize_text(f"[{plat}] ok: {link_or_id}", secrets)
                 finish("ok", resultado, reply)
+                _edit_status_safe(found, adapted, clip_id, plat, discord_client, reg)
             finally:
                 if tmp_dl is not None:
                     tmp_dl.unlink(missing_ok=True)

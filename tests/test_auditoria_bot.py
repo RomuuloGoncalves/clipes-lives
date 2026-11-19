@@ -167,6 +167,49 @@ def test_on_message_publicar_roda_request_em_thread(tmp_path: Path, monkeypatch)
     assert replies == ["x"]
 
 
+class _Cartao:
+    def __init__(self, content: str):
+        self.content = content
+        self.edits: list[str] = []
+
+    async def edit(self, content: str, **_: Any) -> None:
+        self.edits.append(content)
+        self.content = content
+
+
+class _CanalCartao:
+    def __init__(self, msg: _Cartao):
+        self.msg = msg
+
+    async def fetch_message(self, _message_id: int) -> _Cartao:
+        return self.msg
+
+
+def test_publicar_texto_atualiza_linha_de_estado_do_cartao(tmp_path: Path, monkeypatch):
+    bot = _bot(tmp_path)
+    cartao = _Cartao("🟡 pendente — **Clipe**\nID: `c1_c01`")
+    monkeypatch.setattr(bot, "_request_publish", lambda *_a, **_k: "youtube: publicacao enfileirada (agendado para 2030-01-01 10:00)")
+    monkeypatch.setattr(publicacao, "find_clip", lambda *_a, **_k: {"discord": {"thread_id": "555", "message_id": "777"}})
+    monkeypatch.setattr(bot, "get_channel", lambda cid: _CanalCartao(cartao) if cid == 555 else None)
+
+    async def sem_execucao_local(_result: str) -> None:
+        return None
+
+    monkeypatch.setattr(bot, "_maybe_run_local", sem_execucao_local)
+    replies: list[str] = []
+
+    class _Msg:
+        content = "publicar c1_c01"
+        author = type("A", (), {"id": USER, "bot": False, "display_name": "Ana"})()
+        channel = _Chan(CHANNEL_ID)
+
+        async def reply(self, text: str, **_: Any) -> None:
+            replies.append(text)
+
+    asyncio.run(bot.on_message(_Msg()))
+    assert cartao.edits and cartao.edits[-1].startswith("🗓️ agendado (2030-01-01 10:00)")
+
+
 def test_excecao_no_trabalho_envia_erro_efemero_sem_travar(tmp_path: Path, monkeypatch):
     bot = _bot(tmp_path)
 
@@ -311,3 +354,47 @@ def test_redact_mascara_segredos_de_env(monkeypatch):
     monkeypatch.setenv("CLIPES_MONGO_URI", "mongodb://u:pw@host/db")
     out = bot_mod._redact("erro tok-abcdef123 e mongodb://u:pw@host/db")
     assert "tok-abcdef123" not in out and "pw@host" not in out
+
+
+def test_autorizado_nega_fora_do_canal_sem_defer(tmp_path: Path, monkeypatch):
+    bot = _bot(tmp_path)
+    monkeypatch.setattr(bot, "_request_publish", lambda *a, **k: (_ for _ in ()).throw(AssertionError("nao deveria rodar")))
+    inter = _Inter(user_id=USER)
+    inter.channel = _Chan(999999)
+    inter.channel_id = 999999
+    asyncio.run(bot.tree.get_command("publicar").callback(inter, "c1_c01"))
+    assert inter.log == ["send_message"]
+    assert inter.response.sent == [("sem permissao", True)]
+
+
+def test_clipar_e_status_fazem_defer_antes_do_trabalho_e_em_thread(tmp_path: Path, monkeypatch):
+    bot = _bot(tmp_path)
+    for name, fn_name, args in (
+        ("clipar", "_clipar_vod", ("https://youtu.be/abc",)),
+        ("status", "_format_workers_status", ()),
+    ):
+        inter = _Inter()
+        seen: dict[str, Any] = {}
+
+        def fake(*_a: Any, _inter: Any = inter, _seen: dict[str, Any] = seen, **_k: Any) -> str:
+            _seen["thread"] = threading.current_thread()
+            _seen["log"] = list(_inter.log)
+            return "ok"
+
+        monkeypatch.setattr(bot_mod, fn_name, fake)
+        asyncio.run(bot.tree.get_command(name).callback(inter, *args))
+        assert seen["log"] == ["defer"], name
+        assert seen["thread"] is not threading.main_thread(), name
+        assert inter.log == ["defer", "followup"], name
+        assert inter.sent[0] == ("ok", False)
+
+        # Nao autorizado responde efemero sem defer e sem chamar o helper
+        denied = _Inter(user_id=999)
+        monkeypatch.setattr(
+            bot_mod,
+            fn_name,
+            lambda *a, **k: (_ for _ in ()).throw(AssertionError("nao deveria rodar")),
+        )
+        asyncio.run(bot.tree.get_command(name).callback(denied, *args))
+        assert denied.log == ["send_message"], name
+        assert denied.response.sent == [("sem permissao", True)], name

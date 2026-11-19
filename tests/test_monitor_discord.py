@@ -182,22 +182,25 @@ def test_job_done_2_clipes_posta_cabecalho_thread_2_msgs_e_nao_reposta(tmp_path,
     msg1, msg2 = fake_discord.posts[1], fake_discord.posts[2]
     assert msg1["channel_id"] == thr["id"]
     assert msg1["file"] == out_dir / "clip_01.mp4"
+    assert msg1["content"].startswith("🟡 pendente — **Clutch 1v4 insano**")
     for expected in (
         "v1_c01",
         "Clutch 1v4 insano",
         "IMPOSSIVEL ISSO",
         "9.2",
         "gemini",
-        "Clutch absurdo na mirage",
         "Descricao longa do clutch na mirage.",
         "aguardar",
-        "publicar v1_c01",
     ):
         assert expected in msg1["content"]
+    assert "Legenda:" not in msg1["content"]
+    assert "Clutch absurdo na mirage" not in msg1["content"]
+    assert "publicar v1_c01" not in msg1["content"]
 
     assert msg2["channel_id"] == thr["id"]
     assert msg2["file"] == out_dir / "clip_02.mp4"
-    assert "publicar v1_c02" in msg2["content"]
+    assert "v1_c02" in msg2["content"]
+    assert "publicar v1_c02" not in msg2["content"]
 
     updated_manifest = json.loads((out_dir / "clips.json").read_text(encoding="utf-8"))
     assert updated_manifest["discord"]["thread_id"] == thr["id"]
