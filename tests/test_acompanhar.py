@@ -188,7 +188,7 @@ def test_supervisor_duas_lives_twitch_e_youtube_nunca_dois_em_processing(tmp_pat
         queue_root=queue_root,
         pool=pool,
         pipeline=fake_pipe,
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < (B + 620 if "gaules" in u else B + 920),
         probe=fake_probe,
         now=clock.now,
         sleep=clock.sleep,
@@ -215,7 +215,7 @@ def test_supervisor_duas_lives_twitch_e_youtube_nunca_dois_em_processing(tmp_pat
     assert real_pool.start_on_demand("yt_ytVid99")
     cmds = [p.cmd for p in popen_procs if p.cmd[0] != "ffmpeg"]
     assert cmds[0][0] == "streamlink"
-    assert cmds[1][0] == "yt-dlp" and cmds[1][-1] == "https://www.youtube.com/@CanalYT/live"
+    assert cmds[1][0] == "yt-dlp" and cmds[1][-1] == "https://www.youtube.com/watch?v=ytVid99"
 
 
 def test_supervisor_youtube_policy_por_handle_e_channel_id(tmp_path, monkeypatch, capsys):
@@ -232,7 +232,7 @@ def test_supervisor_youtube_policy_por_handle_e_channel_id(tmp_path, monkeypatch
         tmp_path / "out",
         pool=pool,
         pipeline=lambda d, o: {"clips": []},
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         probe=lambda u: (
             {"id": "vid_one", "channel_id": "UC1", "uploader_id": "@BloqueadoYT", "is_live": True}
             if "vid_one" in u
@@ -269,14 +269,14 @@ def test_live_session_backlog_lost_avisa_discord(tmp_path, monkeypatch, capsys):
         tmp_path / "out",
         pool=pool,
         pipeline=slow_pipe,
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 2500,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
         aviso_fn=avisos.append,
     )
     sup.run()
-    assert f"janela perdida gaules (fila cheia)" in avisos
+    assert "janela perdida gaules (fila cheia)" in avisos
 
 
 # ---- T7: Limite, aguardando, recusa visível, offline, policy, recorder error ----------------------
@@ -288,13 +288,14 @@ def test_tres_alvos_limite_2_recusa_com_1_aviso_e_promove_ao_encerrar(tmp_path, 
     monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
 
     avisos: list[str] = []
-    pool = FakeMultiPool(clock, {"c1": B + 320, "c2": B + 620, "c3": B + 920})
+    stops = {"c1": B + 320, "c2": B + 620, "c3": B + 920}
+    pool = FakeMultiPool(clock, stops)
     sup = acompanhar.Supervisor(
         [acompanhar.parse_alvo("c1"), acompanhar.parse_alvo("c2"), acompanhar.parse_alvo("c3")],
         tmp_path / "out",
         pool=pool,
         pipeline=lambda d, o: {"clips": []},
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < stops[u.rsplit("/", 1)[-1]],
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -335,7 +336,7 @@ def test_alvos_offline_bloqueado_e_erro_ao_gravar(tmp_path, monkeypatch, capsys)
         tmp_path / "out",
         pool=pool,
         pipeline=lambda d, o: {"clips": []},
-        is_live=lambda u: "off" not in u,
+        is_live=lambda u: "off" not in u and clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -421,9 +422,12 @@ def test_follow_live_e_monitor_logam_not_claimed(tmp_path, capsys):
             "ensure_indexes": lambda *a: None,
             "ensure_live": lambda *a, **k: None,
             "claim_live": lambda *a: False,
-            "beat": lambda *a: None,
+            "count_owned_live": lambda *a, **k: 0,
+            "release_expired_own": lambda *a: 0,
+            "beat": lambda *a, **k: None,
             "renew": lambda *a: True,
             "pending_command": lambda *a: None,
+            "run_pending_command": lambda *a, **k: None,
         },
     )()
     asyncio.run(monitor.run_monitor(
@@ -506,7 +510,7 @@ def test_erro_tick_ou_encerrar_remove_so_sessao_com_falha_e_mantem_outra_viva(tm
         pool=pool,
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 620,
         probe=lambda u: {"id": "a1" if "canal_a" in u else "b1", "is_live": True},
         now=clock.now,
         sleep=clock.sleep,
@@ -537,7 +541,7 @@ def test_sigterm_sighup_para_gravadores_e_enforce_cap_no_ciclo(tmp_path, monkeyp
         tmp_path / "out_ok",
         pool=pool_ok,
         pipeline=lambda d, o: {"clips": []},
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),

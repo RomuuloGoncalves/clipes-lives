@@ -128,6 +128,18 @@ def download_vod_audio(url: str, cache_dir: Path) -> Path:
     return wav_path
 
 
+def _is_valid_recording(path: Path, seconds: int) -> tuple[bool, float]:
+    """Valida tamanho minimo (> 10 KB) e duracao via ffprobe (>= max(5s, 50% de seconds))."""
+    if not path.is_file() or path.stat().st_size <= 10240:
+        return False, 0.0
+    try:
+        dur = probe_duration(path)
+    except Exception:
+        return False, 0.0
+    min_dur = max(5.0, seconds * 0.5)
+    return dur >= min_dur, dur
+
+
 def record_live_stream(url: str, live_minutes: float, cache_dir: Path) -> tuple[Path, Path]:
     """Record `live_minutes` from a live stream to disk and extract 16 kHz WAV."""
     seconds = max(30, int(round(live_minutes * 60)))
@@ -145,17 +157,25 @@ def record_live_stream(url: str, live_minutes: float, cache_dir: Path) -> tuple[
                 extract_wav(video_path, wav_path)
             return wav_path, video_path
 
+    # Limpa sobras antigas antes de gravar para o fallback nao reaproveitar arquivo velho
+    for old in cache_dir.glob("live_source.*"):
+        old.unlink(missing_ok=True)
+
     g_cmd = [
         "yt-dlp", "-g", "--no-playlist", "--socket-timeout", "30",
         "-f", "bv*[height<=1080]+ba/b[height<=1080]/best",
         *js_runtime_args(),
         url,
     ]
-    g_res = _run(g_cmd, timeout=60, check=False)
-    urls = [u.strip() for u in g_res.stdout.splitlines() if u.strip().startswith("http")]
+    try:
+        g_res = _run(g_cmd, timeout=60, check=False)
+        urls = [u.strip() for u in g_res.stdout.splitlines() if u.strip().startswith("http")]
+    except subprocess.TimeoutExpired:
+        urls = []
 
     tmp_vid = cache_dir / "live_source.tmp.mkv"
     recorded = False
+    ff_err = ""
     if 1 <= len(urls) <= 2:
         ff_cmd = ["ffmpeg", "-y", "-v", "warning"]
         for stream_url in urls:
@@ -163,15 +183,33 @@ def record_live_stream(url: str, live_minutes: float, cache_dir: Path) -> tuple[
                 "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
                 "-i", stream_url,
             ])
-        ff_cmd.extend(["-t", str(seconds), "-c", "copy", str(tmp_vid)])
-        ff_res = _run(ff_cmd, timeout=seconds + 180, check=False)
-        if ff_res.returncode == 0 and tmp_vid.is_file() and tmp_vid.stat().st_size > 10240:
-            tmp_vid.replace(video_path)
-            recorded = True
+        if len(urls) == 2:
+            ff_cmd.extend(["-map", "0:v:0", "-map", "1:a:0"])
         else:
+            ff_cmd.extend(["-map", "0"])
+        ff_cmd.extend(["-t", str(seconds), "-c", "copy", str(tmp_vid)])
+        ff_res: subprocess.CompletedProcess[str] | None = None
+        try:
+            ff_res = _run(ff_cmd, timeout=seconds + 180, check=False)
+        except subprocess.TimeoutExpired as exc:
+            ff_err = f"ffmpeg timeout ({exc.timeout}s)"
+
+        if ff_res is not None and ff_res.returncode == 0:
+            ok, dur = _is_valid_recording(tmp_vid, seconds)
+            if ok:
+                tmp_vid.replace(video_path)
+                recorded = True
+            else:
+                ff_err = f"ffmpeg gravacao muito curta ({dur:.1f}s < {max(5.0, seconds * 0.5):.1f}s)"
+                tmp_vid.unlink(missing_ok=True)
+        else:
+            if ff_res is not None:
+                ff_err = (ff_res.stderr or ff_res.stdout or f"ffmpeg exit {ff_res.returncode}").strip()
             tmp_vid.unlink(missing_ok=True)
 
     if not recorded:
+        for old in cache_dir.glob("live_source.*"):
+            old.unlink(missing_ok=True)
         # Fallback: yt-dlp native ffmpeg downloader
         dl_cmd = [
             "yt-dlp", "--no-playlist", "--socket-timeout", "30",
@@ -182,12 +220,32 @@ def record_live_stream(url: str, live_minutes: float, cache_dir: Path) -> tuple[
             *js_runtime_args(),
             url,
         ]
-        dl_res = _run(dl_cmd, timeout=seconds + 180, check=False)
-        found = [p for p in cache_dir.glob("live_source.*") if ".tmp." not in p.name]
+        try:
+            dl_res = _run(dl_cmd, timeout=seconds + 180, check=False)
+        except subprocess.TimeoutExpired as exc:
+            for leftover in cache_dir.glob("live_source.*"):
+                leftover.unlink(missing_ok=True)
+            extra = f"; anterior: {ff_err[-300:]}" if ff_err else ""
+            raise RuntimeError(f"Live recording failed: yt-dlp timeout ({exc.timeout}s){extra}") from exc
+
+        found = [
+            p for p in sorted(cache_dir.glob("live_source.*"))
+            if ".tmp." not in p.name and not p.name.endswith(".part")
+        ]
         if not found:
-            err = (dl_res.stderr or dl_res.stdout or "").strip()
+            err = (dl_res.stderr or dl_res.stdout or ff_err or "").strip()
             raise RuntimeError(f"Live recording failed: {err[-600:]}")
-        video_path = found[0]
+        candidate = found[0]
+        ok, dur = _is_valid_recording(candidate, seconds)
+        if not ok:
+            candidate.unlink(missing_ok=True)
+            min_dur = max(5.0, seconds * 0.5)
+            dl_err = (dl_res.stderr or dl_res.stdout or "").strip()
+            detail = f"gravacao muito curta ({dur:.1f}s < {min_dur:.1f}s)"
+            if dl_err:
+                detail = f"{detail}: {dl_err[-400:]}"
+            raise RuntimeError(f"Live recording failed: {detail}")
+        video_path = candidate
 
     extract_wav(video_path, wav_path)
     return wav_path, video_path

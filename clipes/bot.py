@@ -8,6 +8,7 @@ import json
 import os
 import re
 import sys
+import threading
 from collections.abc import Callable, Iterable
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,7 +17,8 @@ from typing import Any
 import discord
 from discord import app_commands
 
-from . import publicacao
+from . import config, publicacao
+from .executor_publicacao import PublishLoop
 from .publicacao import LocalStore, MongoStore
 from .registro import Registro
 
@@ -133,7 +135,7 @@ def _resolve_out_root(store: Any, out_root: Path | str | None) -> Path:
     store_root = getattr(store, "out_root", None)
     if store_root is not None:
         return Path(store_root)
-    return Path(os.environ.get("OUT_DIR") or "out")
+    return config.resolve_out_dir()
 
 
 def _extract_thread_id(channel: Any) -> str | None:
@@ -323,6 +325,62 @@ def _format_search_results(
     return "\n".join(lines)
 
 
+_SECRET_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "MONGO_URI", "API_KEY")
+
+
+def _redact(text: str) -> str:
+    """Mascara segredos de env (token do Discord, URI do Mongo e variaveis com cara de segredo) em mensagens de erro."""
+    for name, value in os.environ.items():
+        value = value.strip()
+        if len(value) >= 6 and (name == "DISCORD_BOT_TOKEN" or any(h in name.upper() for h in _SECRET_ENV_HINTS)):
+            text = text.replace(value, "***")
+    return text
+
+
+async def _reply_now(interaction: Any, text: str, *, ephemeral: bool, no_mentions: Any) -> None:
+    """Resposta imediata; se a interacao ja foi respondida/deferida, usa followup (evita InteractionResponded).
+
+    Caso is_done com defer publico: o primeiro followup vira a propria resposta adiada e herda a visibilidade
+    do defer, entao `ephemeral=True` pode sair publico. Nos handlers daqui a rejeicao vem antes do defer.
+    """
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=ephemeral, allowed_mentions=no_mentions)
+    else:
+        await interaction.response.send_message(text, ephemeral=ephemeral, allowed_mentions=no_mentions)
+
+
+async def _defer_once(interaction: Any, *, thinking: bool = False) -> None:
+    """defer() so se ainda nao respondida. `thinking=True` em botoes: resposta nova (nao edicao) com 'pensando...'."""
+    if interaction.response.is_done():
+        return
+    if thinking:
+        await interaction.response.defer(thinking=True)
+    else:
+        await interaction.response.defer()
+
+
+async def _run_deferred(interaction: Any, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Roda `fn` em thread apos o defer; se falhar, avisa por followup efemero e devolve None (sem deixar 'pensando...')."""
+    try:
+        return await asyncio.to_thread(fn, *args, **kwargs)
+    except Exception as exc:
+        print(f"[bot] erro no handler ({_redact(f'{type(exc).__name__}: {exc}')})", flush=True)
+        try:
+            # o 1o followup apos defer herda a visibilidade do defer (publico): remove o "pensando..." antes
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+        try:
+            await interaction.followup.send(
+                "erro interno ao processar o pedido",
+                ephemeral=True,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except Exception:
+            pass
+        return None
+
+
 class ClipesBot(discord.Client):
     """Discord gateway client hosting `/publicar`, `/listar`, and `publicar <id>`."""
 
@@ -341,6 +399,7 @@ class ClipesBot(discord.Client):
         now: Callable[[], float] | float | None = None,
         run_local: bool = False,
         run_pending_fn: Callable[..., Any] | None = None,
+        local_poll_s: float = 60.0,
     ) -> None:
         super().__init__(intents=intents, allowed_mentions=discord.AllowedMentions.none())
         self.tree = app_commands.CommandTree(self)
@@ -355,6 +414,14 @@ class ClipesBot(discord.Client):
         self.now = now
         self.run_local = run_local
         self.run_pending_fn = run_pending_fn or publicacao.run_pending
+        self.local_poll_s = float(local_poll_s)
+        self._local_run_lock = threading.Lock()
+        self._request_lock = threading.Lock()  # serializa publicacao.request (slots/cota nao sao atomicos)
+        self._publish_loop: PublishLoop | None = (
+            PublishLoop(self._run_local_once, self.local_poll_s, name="bot-publicacao")
+            if self.run_local
+            else None
+        )
 
     async def setup_hook(self) -> None:
         if self.guild_id is not None:
@@ -363,11 +430,22 @@ class ClipesBot(discord.Client):
             await self.tree.sync(guild=guild)
         else:
             await self.tree.sync()
+        if self._publish_loop is not None:
+            self._publish_loop.start()
+
+    async def close(self) -> None:
+        if self._publish_loop is not None:
+            await asyncio.to_thread(self._publish_loop.stop, 10.0)
+        await super().close()
 
     async def _maybe_notify_thread(self, clip_id: str, result: str, current_channel_id: Any) -> None:
         if "publicacao enfileirada" not in result:
             return
-        found = publicacao.find_clip(self.out_root, clip_id, store=self.store)
+        try:
+            found = await asyncio.to_thread(publicacao.find_clip, self.out_root, clip_id, store=self.store)
+        except Exception as exc:
+            print(f"[bot] erro ao localizar clipe para notificar thread ({type(exc).__name__})", flush=True)
+            return
         thread_id = found.get("thread_id") if found else None
         if not thread_id or str(thread_id) == str(current_channel_id or ""):
             return
@@ -381,19 +459,30 @@ class ClipesBot(discord.Client):
             except Exception:
                 pass
 
+    def _run_local_once(self, *, wait: bool = False) -> None:
+        """Executa uma rodada local de run_pending fora do event loop (A-05)."""
+        if not self._local_run_lock.acquire(blocking=wait):
+            return
+        try:
+            self.run_pending_fn(
+                self.store,
+                None,
+                out_root=self.out_root,
+                now=self.now,
+                policy_path=self.policy_path,
+                tokens_path=self.tokens_path,
+                quota_path=self.quota_path,
+            )
+        except Exception as exc:
+            msg = _redact(f"{type(exc).__name__}: {exc}")
+            print(f"[bot] erro na publicacao local ({msg})", flush=True)
+        finally:
+            self._local_run_lock.release()
+
     async def _maybe_run_local(self, result: str) -> None:
         if not self.run_local or "publicacao enfileirada" not in result:
             return
-        await asyncio.to_thread(
-            self.run_pending_fn,
-            self.store,
-            None,
-            out_root=self.out_root,
-            now=self.now,
-            policy_path=self.policy_path,
-            tokens_path=self.tokens_path,
-            quota_path=self.quota_path,
-        )
+        await asyncio.to_thread(self._run_local_once, wait=True)
 
     def _request_publish(
         self,
@@ -404,20 +493,21 @@ class ClipesBot(discord.Client):
         agendar: bool = True,
         platforms: tuple[str, ...] = publicacao.PLATFORMS,
     ) -> str:
-        return publicacao.request(
-            self.store,
-            clip_id,
-            user_id,
-            now=self.now,
-            out_root=self.out_root,
-            allowed_ids=self.allowed_ids,
-            policy_path=self.policy_path,
-            tokens_path=self.tokens_path,
-            quota_path=self.quota_path,
-            thread_id=thread_id,
-            platforms=platforms,
-            agendar=agendar,
-        )
+        with self._request_lock:
+            return publicacao.request(
+                self.store,
+                clip_id,
+                user_id,
+                now=self.now,
+                out_root=self.out_root,
+                allowed_ids=self.allowed_ids,
+                policy_path=self.policy_path,
+                tokens_path=self.tokens_path,
+                quota_path=self.quota_path,
+                thread_id=thread_id,
+                platforms=platforms,
+                agendar=agendar,
+            )
 
     async def on_message(self, message: Any) -> None:
         author = getattr(message, "author", None)
@@ -460,7 +550,7 @@ class ClipesBot(discord.Client):
         clip_id = match.group(1).strip()
         agora = match.group(2) is not None
         thread_id = _extract_thread_id(channel)
-        result = self._request_publish(clip_id, user_id, thread_id, agendar=not agora)
+        result = await asyncio.to_thread(self._request_publish, clip_id, user_id, thread_id, agendar=not agora)
 
         no_mentions = discord.AllowedMentions.none()
         if hasattr(message, "reply"):
@@ -530,18 +620,10 @@ class ClipesBot(discord.Client):
 
         no_mentions = discord.AllowedMentions.none()
         if not _interaction_in_configured_channel(interaction, self.channel_id):
-            await interaction.response.send_message(
-                "canal nao permitido",
-                ephemeral=True,
-                allowed_mentions=no_mentions,
-            )
+            await _reply_now(interaction, "canal nao permitido", ephemeral=True, no_mentions=no_mentions)
             return
         if not _interaction_user_allowed(interaction, self.allowed_ids):
-            await interaction.response.send_message(
-                "sem permissao",
-                ephemeral=True,
-                allowed_mentions=no_mentions,
-            )
+            await _reply_now(interaction, "sem permissao", ephemeral=True, no_mentions=no_mentions)
             return
 
         if toggle_parsed is not None:
@@ -561,10 +643,15 @@ class ClipesBot(discord.Client):
         thread_id = _extract_thread_id(channel)
         user = getattr(interaction, "user", None)
         user_id = getattr(user, "id", "")
-        result = self._request_publish(clip_id, user_id, thread_id, agendar=agendar, platforms=platforms)
-        await interaction.response.send_message(
+        # A-07: defer antes do I/O (o Discord invalida a interacao em 3 s) e resposta por followup
+        await _defer_once(interaction, thinking=True)
+        result = await _run_deferred(
+            interaction, self._request_publish, clip_id, user_id, thread_id, agendar=agendar, platforms=platforms
+        )
+        if result is None:
+            return
+        await interaction.followup.send(
             result,
-            ephemeral=(result == "sem permissao"),
             allowed_mentions=no_mentions,
         )
 
@@ -598,6 +685,7 @@ def make_bot(
     now: Callable[[], float] | float | None = None,
     run_local: bool = False,
     run_pending_fn: Callable[..., Any] | None = None,
+    local_poll_s: float = 60.0,
 ) -> ClipesBot:
     """Create the Discord bot with `message_content` intent, `/publicar`, `/listar`, and `publicar <id>`."""
     resolved_root = _resolve_out_root(store, out_root)
@@ -620,6 +708,7 @@ def make_bot(
         now=now,
         run_local=run_local,
         run_pending_fn=run_pending_fn,
+        local_poll_s=local_poll_s,
     )
 
     @bot.tree.command(name="publicar", description="Publica um clipe como privado no YouTube e no TikTok")
@@ -630,20 +719,24 @@ def make_bot(
     async def publicar_cmd(interaction: discord.Interaction, id: str, agora: bool = False) -> None:
         no_mentions = discord.AllowedMentions.none()
         if not _interaction_in_configured_channel(interaction, bot.channel_id):
-            await interaction.response.send_message(
-                "canal nao permitido",
-                ephemeral=True,
-                allowed_mentions=no_mentions,
-            )
+            await _reply_now(interaction, "canal nao permitido", ephemeral=True, no_mentions=no_mentions)
             return
         clip_id = id.strip()
         channel = getattr(interaction, "channel", None)
         thread_id = _extract_thread_id(channel)
         user_id = getattr(getattr(interaction, "user", None), "id", "")
-        result = bot._request_publish(clip_id, user_id, thread_id, agendar=not agora)
-        await interaction.response.send_message(
+        # A-07: defer antes do I/O; "sem permissao" e checado antes para sair efemero
+        if not _interaction_user_allowed(interaction, bot.allowed_ids):
+            await _reply_now(interaction, "sem permissao", ephemeral=True, no_mentions=no_mentions)
+            return
+        await _defer_once(interaction)
+        result = await _run_deferred(
+            interaction, bot._request_publish, clip_id, user_id, thread_id, agendar=not agora
+        )
+        if result is None:
+            return
+        await interaction.followup.send(
             result,
-            ephemeral=(result == "sem permissao"),
             allowed_mentions=no_mentions,
         )
         current_cid = getattr(interaction, "channel_id", getattr(channel, "id", None))
@@ -654,49 +747,40 @@ def make_bot(
     async def listar_cmd(interaction: discord.Interaction) -> None:
         no_mentions = discord.AllowedMentions.none()
         if not _interaction_in_configured_channel(interaction, bot.channel_id):
-            await interaction.response.send_message(
-                "canal nao permitido",
-                ephemeral=True,
-                allowed_mentions=no_mentions,
-            )
+            await _reply_now(interaction, "canal nao permitido", ephemeral=True, no_mentions=no_mentions)
             return
         if not _interaction_user_allowed(interaction, bot.allowed_ids):
-            await interaction.response.send_message(
-                "sem permissao",
-                ephemeral=True,
-                allowed_mentions=no_mentions,
-            )
+            await _reply_now(interaction, "sem permissao", ephemeral=True, no_mentions=no_mentions)
             return
-        text = _format_recent_clips(bot.out_root, store=bot.store, limit=10)
-        await interaction.response.send_message(text, ephemeral=False, allowed_mentions=no_mentions)
+        await _defer_once(interaction)
+        text = await _run_deferred(interaction, _format_recent_clips, bot.out_root, store=bot.store, limit=10)
+        if text is None:
+            return
+        await interaction.followup.send(text, ephemeral=False, allowed_mentions=no_mentions)
 
     @bot.tree.command(name="buscar", description="Busca clipes no registro por texto")
     @app_commands.describe(texto="Palavras para buscar (minimo 2 caracteres)")
     async def buscar_cmd(interaction: discord.Interaction, texto: str) -> None:
         no_mentions = discord.AllowedMentions.none()
         if not _interaction_in_configured_channel(interaction, bot.channel_id):
-            await interaction.response.send_message(
-                "canal nao permitido",
-                ephemeral=True,
-                allowed_mentions=no_mentions,
-            )
+            await _reply_now(interaction, "canal nao permitido", ephemeral=True, no_mentions=no_mentions)
             return
         if not _interaction_user_allowed(interaction, bot.allowed_ids):
-            await interaction.response.send_message(
-                "sem permissao",
-                ephemeral=True,
-                allowed_mentions=no_mentions,
-            )
+            await _reply_now(interaction, "sem permissao", ephemeral=True, no_mentions=no_mentions)
             return
         gid = _resolve_guild_id(interaction, bot.guild_id)
-        reply = await asyncio.to_thread(
+        await _defer_once(interaction)
+        reply = await _run_deferred(
+            interaction,
             _format_search_results,
             bot.out_root,
             texto,
             store=bot.store,
             guild_id=gid,
         )
-        await interaction.response.send_message(reply, ephemeral=False, allowed_mentions=no_mentions)
+        if reply is None:
+            return
+        await interaction.followup.send(reply, ephemeral=False, allowed_mentions=no_mentions)
 
     return bot
 
@@ -723,7 +807,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[bot] erro: ID do Discord invalido ({exc})", file=sys.stderr, flush=True)
         return 2
 
-    out_root = Path(os.environ.get("OUT_DIR") or "out").expanduser().resolve()
+    out_root = config.resolve_out_dir()
     mongo_uri = os.environ.get("CLIPES_MONGO_URI", "").strip()
 
     store: LocalStore | MongoStore

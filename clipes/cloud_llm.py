@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from clipes import config
 from clipes.llm import _THINK_RE
 
 _URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -79,7 +80,7 @@ def _cota_path() -> Path:
     env = os.environ.get("CLIPES_GEMINI_COTA_FILE", "").strip()
     if env:
         return Path(env)
-    base = _out_dir if _out_dir is not None else Path(os.environ.get("OUT_DIR") or "out")
+    base = config.resolve_out_dir(_out_dir)
     return base / ".gemini_cota.json"
 
 

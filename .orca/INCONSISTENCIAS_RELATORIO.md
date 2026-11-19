@@ -344,3 +344,70 @@ Estado dos testes: na imagem Docker (cópia do repo montada só para leitura) pa
 - **"Bot renova leases":** não renova. O bloqueio síncrono no bot afeta só a interação e o gateway (A-07); o atraso real de lease está no C-02 e no A-03.
 - **"`cache_dir` inválido no `pyproject.toml`"** (apontado na revisão de fontes): `cache_dir` é uma opção válida de `[tool.pytest.ini_options]`. O aviso só apareceu porque o worker rodou com `-p no:cacheprovider`.
 - **"`MongoQueue`":** essa classe não existe. A fila Mongo é implementada por `Coord` (`clipes/coord.py`) junto com o `DiskQueue` local.
+
+---
+
+## Status de implementação
+
+Branch `fix/auditoria-inconsistencias` (a partir de `master` `de8e66a`), commits locais por onda:
+onda 1 `ff6815f`, onda 2 `f1315eb`, onda 3 `298d751`, onda 4 `27752cc`, onda 5 `74fa87e`.
+Suíte (Docker): 510 passed / 1 skipped antes → 761 passed / 1 skipped depois (o `test_real_llama_server_enrich_clips_smoke` falha às vezes por timeout do llama-server sob carga de CPU; falha igual no `master`). ruff F: 21 → 0. mypy (`--platform linux`): 29 → 28.
+
+| Item | Status | Onda/commit | Observação |
+|---|---|---|---|
+| C-01 | corrigido | 2 `f1315eb` | restart do gravador com backoff; `ended` só com `is_live=False`; saída de segurança `CLIPES_LIVE_CAPTURA_MORTA_S` sem `ended` |
+| C-02 | corrigido | 1 `ff6815f` | `PublishLoop` fora do heartbeat; lease ≥ 3×beat; `run_pending(limit=)` |
+| A-01 | corrigido | 1 `ff6815f` | lease/`iniciado_em` no pedido, `except` por pedido, retomada sem reenvio |
+| A-02 | corrigido | 1 `ff6815f` | `count_owned_live`/`release_expired_own` (só na 1ª conexão); painel filtra `lease_until` |
+| A-03 | corrigido | 1 `ff6815f` | keepalive durante todo o `Supervisor.run` |
+| A-04 | corrigido | 3 `298d751` | `clips.json` reescrito com a lista filtrada; `notify_discord` prioriza `result["clips"]` |
+| A-05 | corrigido | 3 `298d751` | `PublishLoop` no `acompanhar` e no bot em modo local |
+| A-06 | corrigido | 3 `298d751` | dia de cota do YouTube em `America/Los_Angeles` (TikTok segue UTC) |
+| A-07 | corrigido | 4 `27752cc`, 5 `74fa87e` | defer + `to_thread` + followup; `find_clip` consulta o registro antes do `rglob` |
+| M-01 | corrigido | 1, 4 | claim refeito após reconexão (monitor e acompanhar) |
+| M-02 | corrigido | 1 | reserva da vaga antes do `await` |
+| M-03 | corrigido | 1 | `Coord.run_pending_command` comum; `expira_em`; painel recusa worker offline |
+| M-04 | corrigido | 1, 2, 4, 5 | cancel devolve o job a `pending`; lock só após join; pool congelado no `liberar` |
+| M-05 | corrigido | 1 | `source.mkv` apagado após o move; `recover_orphans` conclui o move |
+| M-06 | corrigido | 1 | `rev` incremental no espelho do registro |
+| M-07 | corrigido | 1 | jobs sem sessão deste Supervisor não caem no pipeline cru |
+| M-08 | corrigido | 2 | conservador: usa só o trecho contínuo mais recente (descarta segmentos antes do buraco) |
+| M-09 | corrigido | 2 | hold no início da sessão; `CLIPES_BUFFER_CAP_GB`. 720p não adotado (decisão de produto) |
+| M-10 | corrigido | 2 | `alvo.url` fixada em `watch?v=<id>` |
+| M-11 | corrigido | 3 | conta pending/running; cota cheia reagenda (não cria mais `adiado`; legados mantidos) |
+| M-12 | corrigido | 3 | com Mongo: reserva atômica (`$inc` + `$lt`) e estorno; sem Mongo continua por máquina |
+| M-13 | corrigido | 3 | backoff com jitter no init/PUT (YouTube e TikTok) |
+| M-14 | corrigido | 3 | `quota_esgotada` marca o dia; falha de `_record_quota` vira `aviso_cota` |
+| M-15 | corrigido | 2 | `--force-keyframes-at-cuts` na 3ª tentativa; `TimeoutExpired` capturado |
+| M-16 | corrigido | 3 | `max_dur`/`min_dur` no `job.json` e repassados ao CLI |
+| M-17 | corrigido | 4 | `get_default_database` no painel |
+| M-18 | corrigido | 4 | `/api/status` com Basic Auth; `index.html` envia o header |
+| M-19 | corrigido | 4 | `config.resolve_policy_path` (env → `OUT_DIR/policy.json` → legado com aviso) |
+| M-20 | corrigido | 3 | `ready_at`/`criado_em` do registro como fallback |
+| M-21 | corrigido | 4 | variáveis repassadas no compose + teste de cobertura |
+| M-22 | corrigido | 4 | `env_float`/`env_int`; worker grava `beat_s`, painel usa `3×beat_s` |
+| B-01 | corrigido | 1, 2, 4 | `replay_unsynced_jobs` na conexão, após claim e periódico |
+| B-02 | corrigido | 1 | `fsync` no `_write_job` |
+| B-03 | parcial | 5 | import condicional com erro claro; sem lock de Windows (documentado: só Linux/Docker) |
+| B-04 | parcial | 1 | `O_EXCL`; id de instância na lease adiado (mudaria o contrato de `owner`) |
+| B-05 | corrigido | 2 | | 
+| B-06 | corrigido | 3 | `refresh_token` rotacionado persistido sob lock |
+| B-07 | corrigido | 2 | stderr em log por canal com rotação |
+| B-08 | corrigido | 2 | fonte primeiro, depois ffmpeg |
+| B-09 | corrigido | 5 | |
+| B-10 | adiado | — | refatoração grande (`fila.py`/`mongo_util.py`) |
+| B-11 | adiado | — | refatoração grande (ciclo monitor↔cli, `policy.py`) |
+| B-12 | corrigido | 4 | `env_flag` |
+| B-13 | corrigido | 4 | `resolve_out_dir` |
+| B-14 | adiado (documentado) | 5 | tabelas não unificadas para não mudar o visual |
+| B-15 | parcial | 4 | painel tipado; resto adiado |
+| B-16 | corrigido | 4 | aviso para `CLIPES_RETENCAO_H` inválido |
+| B-17 | corrigido | 4 | `env_int` único |
+| B-18 | corrigido | 4 | README/.env.example |
+| B-19 | corrigido | 4 | `WITH_LLM_4B` aponta o GGUF via symlink |
+| B-20 | corrigido | 4 | `HOST_UID`/`HOST_GID` |
+| B-21 | parcial | 4 | `optional-dependencies` declaradas; Dockerfile não instala via pyproject |
+| B-22 | adiado | — | exige KV/Mongo persistente na Vercel |
+| B-23 | adiado | — | mudança de contrato (status/campos) |
+| B-24 | corrigido | 4, 5 | `name: clipes-lives`; `Any` importado |
+| B-25 | corrigido | 2 | |

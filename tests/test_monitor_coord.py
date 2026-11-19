@@ -48,6 +48,8 @@ class FakeProc:
         self.returncode = -15
 
     def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0  # exits by itself (ffmpeg closes on EOF once the source is gone)
         return self.returncode
 
     def kill(self):
@@ -171,6 +173,8 @@ def test_mongo_fora_continua_local_mascara_uri_e_reconecta_em_60s(tmp_path, monk
     """FILA-03 AC 11-12: ServerSelectionTimeoutError falls back to DiskQueue, masks URI in logs, retries after 60s."""
     clock = Clock()
     monkeypatch.setenv("CLIPES_MONGO_URI", SECRET_URI)
+    # o relogio simulado anda 1s por ms real; o fsync do _write_job (B-02) custa ms e faria o teste cruzar os 60s
+    monkeypatch.setattr(monitor.os, "fsync", lambda fd: None)
     out_root = tmp_path / "out"
     queue_root = tmp_path / "q"
 
@@ -215,10 +219,13 @@ def test_mongo_fora_continua_local_mascara_uri_e_reconecta_em_60s(tmp_path, monk
             self.finished.append((job_id, status))
             return True
 
-        def beat(self, alias, capacity, job_atual, max_lives, razao):
+        def beat(self, alias, capacity, job_atual, max_lives, razao, beat_s=None):
             pass
 
-        def pending_command(self):
+        def release_expired_own(self):
+            return 0
+
+        def run_pending_command(self, liberar):
             return None
 
     coord = FailingThenRecoveringCoord()
@@ -544,16 +551,16 @@ def test_heartbeat_3_ciclos_chama_3_beat_e_3_renew_e_renew_falso_para_gravador(t
 
     db = mongomock.MongoClient().db
     coord = Coord(db, "w-hb", now=clock, lease_s=90)
-    other = Coord(db, "w-outro", now=clock, lease_s=90)
+    Coord(db, "w-outro", now=clock, lease_s=90)
 
     beats: list[tuple] = []
     renews: list[tuple[str, bool]] = []
     orig_beat = coord.beat
     orig_renew = coord.renew
 
-    def spy_beat(alias, cap, job_atual, max_lives, razao):
+    def spy_beat(alias, cap, job_atual, max_lives, razao, beat_s=None):
         beats.append((alias, cap, job_atual, max_lives, razao))
-        return orig_beat(alias, cap, job_atual, max_lives, razao)
+        return orig_beat(alias, cap, job_atual, max_lives, razao, beat_s=beat_s)
 
     def spy_renew(live_id):
         ok = orig_renew(live_id)
@@ -834,9 +841,9 @@ def test_follow_live_renova_lease_cria_jobs_e_para_ao_perder_lease(tmp_path, mon
     orig_beat = coord.beat
     orig_renew = coord.renew
 
-    def spy_beat(alias, cap, job_atual, max_lives, razao):
+    def spy_beat(alias, cap, job_atual, max_lives, razao, beat_s=None):
         beats.append((alias, cap, job_atual, max_lives, razao))
-        return orig_beat(alias, cap, job_atual, max_lives, razao)
+        return orig_beat(alias, cap, job_atual, max_lives, razao, beat_s=beat_s)
 
     def spy_renew(live_id):
         ok = orig_renew(live_id)
@@ -1050,7 +1057,7 @@ def test_follow_live_dois_pcs_um_grava_e_respeita_job_existente(tmp_path, monkey
     assert coord1.claim_live("twitch:canal:801") is True
     res2 = monitor.follow_live(
         "canal", tmp_path / "out2", pool=pool2, coord=coord2, stream_id="801",
-        is_live=lambda _: True, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+        is_live=lambda _: clock() < B + 620, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
         capacity_fn=lambda _: {"cpus": 6, "score": 30},
     )
     assert res2 == {"status": "not_claimed", "jobs": []}
@@ -1061,7 +1068,7 @@ def test_follow_live_dois_pcs_um_grava_e_respeita_job_existente(tmp_path, monkey
     res1 = monitor.follow_live(
         "canal", tmp_path / "out1", pool=pool1, coord=coord1, stream_id="801",
         pipeline=lambda d, o: (processed_jobs.append(d.name), {"clips": []})[1],
-        is_live=lambda _: True, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+        is_live=lambda _: clock() < B + 620, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
         capacity_fn=lambda _: {"cpus": 6, "score": 30},
     )
     assert res1["status"] == "ended"
@@ -1213,7 +1220,7 @@ def test_follow_live_failover_dono_cai_segundo_worker_reivindica_sem_recriar_job
     res_b = monitor.follow_live(
         "canal", tmp_path / "out-b", pool=PoolB(),
         pipeline=lambda d, o: (b_jobs.append(d.name), {"clips": []})[1],
-        coord=coord_b, stream_id="999", is_live=lambda _: True,
+        coord=coord_b, stream_id="999", is_live=lambda _: clock() < B + 620,
         now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
         capacity_fn=lambda _: {"cpus": 6, "score": 30},
     )

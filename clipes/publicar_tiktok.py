@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import random
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +21,19 @@ PRIVACY_LEVEL = "SELF_ONLY"
 UNAUDITED_CODE = "unaudited_client_can_only_post_to_private_accounts"
 MAX_STATUS_POLLS = 60
 POLL_INTERVAL_S = 5
+MAX_STATUS_WAIT_S = 600.0
+STATUS_RETRY_DELAY_S = 1.0
+MAX_RETRIES = 5  # 1 tentativa inicial + 5 retentativas = 6 tentativas (faixa 5..8)
+BACKOFF_BASE_S = 1.0
+BACKOFF_MAX_S = 60.0
+
+_RETRYABLE_403_CODES = frozenset({
+    "rateLimitExceeded",
+    "userRateLimitExceeded",
+    "backendError",
+    "rate_limit_exceeded",
+})
+_NETWORK_ERRORS = (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException)
 
 
 def _resolve_token(token: str | Callable[[], str]) -> str:
@@ -36,8 +50,25 @@ def _extract_error_code(raw: bytes) -> str:
     err = payload.get("error") if isinstance(payload, dict) else None
     if isinstance(err, dict):
         code = err.get("code")
-        return str(code) if code else ""
+        if code:
+            return str(code)
+        errors = err.get("errors")
+        if isinstance(errors, list) and errors and isinstance(errors[0], dict):
+            reason = errors[0].get("reason")
+            if reason:
+                return str(reason)
     return ""
+
+
+def _is_retryable_http(code: int, err_code: str = "") -> bool:
+    return (500 <= code < 600) or code == 429 or (code == 403 and err_code in _RETRYABLE_403_CODES)
+
+
+def _backoff_delay(attempt: int, rand: Callable[[], float] = random.random) -> float:
+    """Backoff exponencial com jitter limitado a [1.0, 60.0] segundos."""
+    base = min(BACKOFF_MAX_S, BACKOFF_BASE_S * (2 ** attempt))
+    jitter = max(0.0, min(1.0, float(rand())))
+    return min(BACKOFF_MAX_S, max(BACKOFF_BASE_S, base * (1.0 + 0.5 * jitter)))
 
 
 def _account_error(publish_id: str = "") -> dict[str, Any]:
@@ -59,6 +90,7 @@ def publish(
     sleep: Callable[[float], None] = time.sleep,
     *,
     refresh: Callable[[], str] | None = None,
+    rand: Callable[[], float] = random.random,
 ) -> dict[str, Any]:
     """Upload and direct-post an MP4 clip as private (SELF_ONLY) on TikTok."""
     mp4_path = Path(mp4)
@@ -78,8 +110,16 @@ def publish(
             return False
         return bool(access_token)
 
-    def post_json(url: str, body: dict[str, Any]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    def post_json(
+        url: str,
+        body: dict[str, Any],
+        *,
+        max_retries: int = MAX_RETRIES,
+        use_backoff: bool = True,
+        retry_delay: float = STATUS_RETRY_DELAY_S,
+    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         raw_body = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        retries = 0
         while True:
             req = urllib.request.Request(
                 url,
@@ -108,9 +148,21 @@ def publish(
                 err_code = _extract_error_code(exc.read() if exc.fp else b"")
                 if err_code == UNAUDITED_CODE:
                     return None, _account_error()
+                if _is_retryable_http(exc.code, err_code) and retries < max_retries:
+                    delay = _backoff_delay(retries, rand) if use_backoff else retry_delay
+                    sleep(delay)
+                    retries += 1
+                    continue
                 detail = f"tiktok HTTP {exc.code}" + (f": {err_code}" if err_code else "")
                 return None, {"status": "erro", "erro": detail}
-            except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException, ValueError) as exc:
+            except _NETWORK_ERRORS as exc:
+                if retries < max_retries:
+                    delay = _backoff_delay(retries, rand) if use_backoff else retry_delay
+                    sleep(delay)
+                    retries += 1
+                    continue
+                return None, {"status": "erro", "erro": f"tiktok falha de rede: {type(exc).__name__}"}
+            except ValueError as exc:
                 return None, {"status": "erro", "erro": f"tiktok falha de rede: {type(exc).__name__}"}
 
     info_resp, err = post_json(CREATOR_INFO_URL, {})
@@ -146,33 +198,60 @@ def publish(
         return {"status": "erro", "erro": "tiktok init sem publish_id ou upload_url"}
 
     content_range = f"bytes 0-{max(file_size - 1, 0)}/{file_size}"
-    put_req = urllib.request.Request(
-        upload_url,
-        data=mp4_bytes,
-        headers={
-            "Content-Type": "video/mp4",
-            "Content-Length": str(file_size),
-            "Content-Range": content_range,
-        },
-        method="PUT",
-    )
-    try:
-        with urlopen(put_req, timeout=120) as resp:
-            status = getattr(resp, "status", None) or resp.getcode()
-            if int(status) not in (200, 201, 204):
+    put_retries = 0
+    while True:
+        put_req = urllib.request.Request(
+            upload_url,
+            data=mp4_bytes,
+            headers={
+                "Content-Type": "video/mp4",
+                "Content-Length": str(file_size),
+                "Content-Range": content_range,
+            },
+            method="PUT",
+        )
+        try:
+            with urlopen(put_req, timeout=120) as resp:
+                status = int(getattr(resp, "status", None) or resp.getcode())
+                if status in (200, 201, 204):
+                    break
+                if _is_retryable_http(status) and put_retries < MAX_RETRIES:
+                    sleep(_backoff_delay(put_retries, rand))
+                    put_retries += 1
+                    continue
                 return {"status": "erro", "publish_id": publish_id, "erro": f"tiktok upload HTTP {status}"}
-    except urllib.error.HTTPError as exc:
-        err_code = _extract_error_code(exc.read() if exc.fp else b"")
-        if err_code == UNAUDITED_CODE:
-            return _account_error(publish_id)
-        return {"status": "erro", "publish_id": publish_id, "erro": f"tiktok upload HTTP {exc.code}"}
-    except (urllib.error.URLError, OSError, TimeoutError, http.client.HTTPException) as exc:
-        return {"status": "erro", "publish_id": publish_id, "erro": f"tiktok upload falhou: {type(exc).__name__}"}
+        except urllib.error.HTTPError as exc:
+            err_code = _extract_error_code(exc.read() if exc.fp else b"")
+            if err_code == UNAUDITED_CODE:
+                return _account_error(publish_id)
+            if _is_retryable_http(exc.code, err_code) and put_retries < MAX_RETRIES:
+                sleep(_backoff_delay(put_retries, rand))
+                put_retries += 1
+                continue
+            return {"status": "erro", "publish_id": publish_id, "erro": f"tiktok upload HTTP {exc.code}"}
+        except _NETWORK_ERRORS as exc:
+            if put_retries < MAX_RETRIES:
+                sleep(_backoff_delay(put_retries, rand))
+                put_retries += 1
+                continue
+            return {"status": "erro", "publish_id": publish_id, "erro": f"tiktok upload falhou: {type(exc).__name__}"}
 
+    poll_start = time.monotonic()
+    simulated_sleep_s = 0.0
     for attempt in range(MAX_STATUS_POLLS):
         if attempt > 0:
+            if max(time.monotonic() - poll_start, simulated_sleep_s) + POLL_INTERVAL_S > MAX_STATUS_WAIT_S:
+                break
             sleep(POLL_INTERVAL_S)
-        st_resp, err = post_json(STATUS_FETCH_URL, {"publish_id": publish_id})
+            simulated_sleep_s += POLL_INTERVAL_S
+        # Polling de status: sem backoff exponencial longo (no maximo 1 retry curto)
+        st_resp, err = post_json(
+            STATUS_FETCH_URL,
+            {"publish_id": publish_id},
+            max_retries=1,
+            use_backoff=False,
+            retry_delay=STATUS_RETRY_DELAY_S,
+        )
         if err is not None:
             err.setdefault("publish_id", publish_id)
             return err

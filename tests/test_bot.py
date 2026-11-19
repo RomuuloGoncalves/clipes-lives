@@ -68,12 +68,34 @@ class _FakeMessage:
         self.reply_kwargs.append(kwargs)
 
 
+class _FakeFollowup:
+    """followup.send grava no mesmo log do response (A-07: handlers fazem defer e respondem por followup)."""
+
+    def __init__(self, response: "_FakeInteractionResponse") -> None:
+        self._response = response
+
+    async def send(self, content: str, *, ephemeral: bool = False, **kwargs: Any) -> None:
+        self._response.messages.append((content, ephemeral))
+        self._response.kwargs_list.append(kwargs)
+
+
 class _FakeInteractionResponse:
     def __init__(self) -> None:
         self.messages: list[tuple[str, bool]] = []
         self.kwargs_list: list[dict[str, Any]] = []
+        self.deferred: list[bool] = []
+        self._done = False
+        self.followup = _FakeFollowup(self)
+
+    def is_done(self) -> bool:
+        return self._done
+
+    async def defer(self, *, ephemeral: bool = False, **kwargs: Any) -> None:
+        self.deferred.append(ephemeral)
+        self._done = True
 
     async def send_message(self, content: str, *, ephemeral: bool = False, **kwargs: Any) -> None:
+        self._done = True
         self.messages.append((content, ephemeral))
         self.kwargs_list.append(kwargs)
 
@@ -89,6 +111,7 @@ class _FakeInteraction:
         self.channel = channel or _FakeChannel(CHANNEL_ID)
         self.channel_id = self.channel.id
         self.response = _FakeInteractionResponse()
+        self.followup = self.response.followup
 
 
 def _make_clip(
@@ -407,7 +430,10 @@ def test_slash_publicar_covers_happy_not_found_policy_idempotency_quota_and_offl
     inter_q = _FakeInteraction(user_id=ALLOWED_USER)
     asyncio.run(pub_cmd.callback(inter_q, "q_vid_c01"))
     assert "cota diaria atingida (youtube)" in inter_q.response.messages[0][0]
-    assert db.publish_requests.find_one({"_id": "q_vid_c01:youtube"})["status"] == "adiado"
+    # onda 3: cota cheia nao cria mais `adiado` terminal; o pedido fica pending agendado para o proximo dia
+    doc_q = db.publish_requests.find_one({"_id": "q_vid_c01:youtube"})
+    assert doc_q["status"] == "pending"
+    assert doc_q["agendar_para"] > datetime.fromtimestamp(T0, timezone.utc).replace(tzinfo=None)
 
 
 # --- Slash `/listar` ---
@@ -839,6 +865,7 @@ def test_on_interaction_aprovar_botao_permitido_negado_desconhecido_e_inexistent
             self.channel_id = self.channel.id
             self.message = msg
             self.response = _FakeInteractionResponse()
+            self.followup = self.response.followup
 
     # 1. Unknown prefix or non-component type -> ignored
     i_other_prefix = _FakeComponentInteraction(custom_id="outro:btn1_c01", msg=_FakeComponentMsg("post"))
@@ -944,6 +971,7 @@ def test_on_interaction_publicar_por_destino_yt_tt_ambos_e_sequencia(tmp_path: P
             self.channel_id = THREAD_ID
             self.message = msg
             self.response = _FakeInteractionResponse()
+            self.followup = self.response.followup
 
     recorded_platforms: list[tuple[str, tuple[str, ...]]] = []
     real_request = publicacao.request
@@ -1049,6 +1077,7 @@ def test_on_interaction_publicar_destino_negado_desligada_e_idempotente(tmp_path
             self.channel_id = self.channel.id
             self.message = msg
             self.response = _FakeInteractionResponse()
+            self.followup = self.response.followup
 
     # 1. Channel / user denied on publicar:<dest>:
     for cid in ("publicar:youtube:desl1_c01", "publicar:tiktok:desl1_c01", "publicar:ambos:desl1_c01"):
@@ -1163,6 +1192,7 @@ def test_on_interaction_publicar_destino_mantem_agenda_e_notifica_thread(
             self.channel_id = CHANNEL_ID
             self.message = msg
             self.response = _FakeInteractionResponse()
+            self.followup = self.response.followup
 
     i_yt = _MainChannelInteraction("publicar:youtube:agp1_c01", _Msg("**Titulo agp1_c01**"))
     asyncio.run(bot.on_interaction(i_yt))
@@ -1310,6 +1340,7 @@ def test_bot_respostas_usam_allowed_mentions_none_e_buscar_usa_to_thread(
             self.channel_id = THREAD_ID
             self.message = msg
             self.response = _FakeInteractionResponse()
+            self.followup = self.response.followup
 
     edit_msg = _EditMsg("post")
     i_btn = _BtnInteraction("aprovar:sec1_c01", edit_msg)
@@ -1390,6 +1421,7 @@ def test_on_interaction_toggle_agendar_on_off_destinos_modos_e_legado(
             self.channel_id = self.channel.id
             self.message = msg
             self.response = _ToggleResponse(msg)
+            self.followup = self.response.followup
 
     recorded_agendar: list[tuple[str, bool, tuple[str, ...]]] = []
     real_request = publicacao.request

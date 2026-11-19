@@ -34,7 +34,7 @@ def test_supervisor_coord_lease_ok_twitch_e_youtube_renova_e_libera(tmp_path, mo
         pool=pool,
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         probe=lambda u: (
             {"id": "ytV1", "channel_id": "UC1", "uploader_id": "@CanalYT", "is_live": True}
             if "youtube" in u
@@ -86,7 +86,7 @@ def test_supervisor_coord_lease_negada_fica_aguardando_e_avisa(tmp_path, monkeyp
         pool=pool,
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < (B + 620 if "c1" in u else B + 320),
         probe=lambda u: {"id": "101" if "c1" in u else "202", "is_live": True},
         now=clock.now,
         sleep=clock.sleep,
@@ -128,7 +128,7 @@ def test_supervisor_mongo_cai_segue_local_e_reconecta_apos_60s(tmp_path, monkeyp
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
         stream_id="555",
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 620,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -138,8 +138,9 @@ def test_supervisor_mongo_cai_segue_local_e_reconecta_apos_60s(tmp_path, monkeyp
 
     assert res["status"] == "ended"
     assert res["jobs"] == [f"gaules_{B + 300}", f"gaules_{B + 600}"]
-    # First job ran locally while Mongo was down; second job (after 60s MONGO_RECONNECT_S) synced to Mongo
-    assert db.jobs.find_one({"_id": f"twitch:gaules:555:{B + 300}"}) is None
+    # First job ran locally while Mongo was down and was replayed after reconnect (B-01); second synced directly
+    j1 = db.jobs.find_one({"_id": f"twitch:gaules:555:{B + 300}"})
+    assert j1 is not None and j1["status"] == "rejected"
     assert db.jobs.find_one({"_id": f"twitch:gaules:555:{B + 600}"}) is not None
 
 
@@ -230,7 +231,7 @@ def test_supervisor_keepalive_renova_beat_e_lease_durante_pipeline_lento(tmp_pat
         pipeline=slow_pipe,
         coord=coord,
         stream_id="99",
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),

@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from . import config
 from .registro import Registro, _is_mongo_error, sha256_arquivo
 
 if TYPE_CHECKING:
@@ -89,8 +90,7 @@ def _master_mode() -> str:
 
 
 def _verificar_sha_enabled() -> bool:
-    raw = os.environ.get("CLIPES_REGISTRO_VERIFICAR", "1").strip().lower()
-    return raw not in ("0", "false", "no", "off")
+    return config.env_flag("CLIPES_REGISTRO_VERIFICAR", True)
 
 
 def _resolve_registro_root(out_path: Path | None, out_root: Path | str | None) -> Path | None:
@@ -98,9 +98,8 @@ def _resolve_registro_root(out_path: Path | None, out_root: Path | str | None) -
         return Path(out_root).expanduser().resolve()
     if out_path is None:
         return None
-    env_out = os.environ.get("OUT_DIR", "").strip()
-    if env_out:
-        cand = Path(env_out).expanduser().resolve()
+    if os.environ.get("OUT_DIR", "").strip():
+        cand = config.resolve_out_dir()
         try:
             out_path.resolve().relative_to(cand)
             return cand
@@ -258,6 +257,25 @@ def _run_liberar(
         print(f"[notificar] falha ao liberar arquivos ({_format_safe_err(exc)})", flush=True)
 
 
+def _clip_match_key(clip: dict[str, Any]) -> tuple[Any, ...] | None:
+    """Chave estavel para cruzar clipes de result['clips'] com os do clips.json (A-04)."""
+    cid = clip.get("clip_id")
+    if cid:
+        return ("clip_id", str(cid))
+    idx = clip.get("index")
+    if idx is not None and not isinstance(idx, bool):
+        try:
+            return ("index", int(idx))
+        except (TypeError, ValueError):
+            pass
+    if "start" in clip and "end" in clip:
+        return ("span", clip.get("file"), clip["start"], clip["end"])
+    file_rel = clip.get("file")
+    if file_rel:
+        return ("file", str(file_rel))
+    return None
+
+
 def notify_discord(
     out_dir: Path | str | None,
     *,
@@ -278,20 +296,38 @@ def notify_discord(
     clips_json_path = (out_path / "clips.json") if out_path is not None else None
 
     manifest: dict[str, Any] | None = None
+    manifest_clips: list[dict[str, Any]] | None = None
     if clips_json_path is not None and clips_json_path.is_file():
         try:
             loaded = json.loads(clips_json_path.read_text(encoding="utf-8"))
             if isinstance(loaded, dict):
                 manifest = loaded
-                clips = list(manifest.get("clips") or [])
+                manifest_clips = list(manifest.get("clips") or [])
             else:
                 print(f"[notificar] clips.json invalido em {clips_json_path}", flush=True)
-                clips = list((result or {}).get("clips") or [])
         except Exception as exc:
             print(f"[notificar] falha ao ler clips.json ({_format_safe_err(exc)})", flush=True)
-            clips = list((result or {}).get("clips") or [])
+
+    result_clips = result.get("clips") if isinstance(result, dict) else None
+    if manifest_clips is not None:
+        if isinstance(result_clips, list):
+            # A-04: prioriza result["clips"], preservando os dicts do manifest (estado discord ja gravado)
+            by_key: dict[tuple[Any, ...], dict[str, Any]] = {}
+            for mc in manifest_clips:
+                if isinstance(mc, dict):
+                    mk = _clip_match_key(mc)
+                    if mk is not None and mk not in by_key:
+                        by_key[mk] = mc
+            clips = []
+            for rc in result_clips:
+                if not isinstance(rc, dict):
+                    continue
+                rk = _clip_match_key(rc)
+                clips.append(by_key[rk] if (rk is not None and rk in by_key) else rc)
+        else:
+            clips = manifest_clips
     else:
-        clips = list((result or {}).get("clips") or [])
+        clips = list(result_clips or [])
 
     if not clips:
         return
@@ -667,7 +703,6 @@ def post_aviso(
         from .discord_rest import DiscordRest
 
         client = DiscordRest(token)
-    supports_components = _post_supports_components(client)
     try:
         client.post(target_channel, texto[:2000])
     except Exception as exc:

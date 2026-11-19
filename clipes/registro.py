@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import copy
-import fcntl
 import hashlib
 import json
 import math
@@ -20,6 +19,13 @@ from pathlib import Path
 from typing import Any
 
 from .ingest import sanitize_id
+
+try:  # travas de arquivo so existem em Linux/Docker (B-03)
+    import fcntl
+except ImportError:  # Windows nativo: importar funciona, usar a trava falha com mensagem clara
+    fcntl = None  # type: ignore[assignment]
+
+FCNTL_AUSENTE_MSG = "clipes requer Linux/Docker para travas de arquivo (fcntl)"
 
 VERSAO = 1
 SCHEMA_REGISTRO = 1
@@ -57,6 +63,8 @@ def _locked_path(path: Path) -> Iterator[None]:
     resolved = path.resolve()
     with _PATH_LOCKS_GUARD:
         lock = _PATH_LOCKS.setdefault(resolved, threading.Lock())
+    if fcntl is None:
+        raise RuntimeError(FCNTL_AUSENTE_MSG)
     with lock:
         path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = path.with_name(f".{path.name}.lock")
@@ -166,6 +174,23 @@ def _sync_fingerprint(rec: dict[str, Any]) -> str:
     return json.dumps(cmp, sort_keys=True, default=_json_default)
 
 
+def _next_rev(rec: Any) -> int:
+    """Proxima revisao incremental do registro (sob o lock); docs sem `rev` contam como 0."""
+    try:
+        return int(rec.get("rev") or 0) + 1 if isinstance(rec, dict) else 1
+    except (TypeError, ValueError):
+        return 1
+
+
+def _is_duplicate_key(exc: Exception) -> bool:
+    return type(exc).__name__ == "DuplicateKeyError"
+
+
+def _avisar_retencao(valor: Any) -> None:
+    # retencao invalida desliga a limpeza: nao pode ser silencioso (B-16)
+    print(f"[registro] CLIPES_RETENCAO_H={valor!r} invalido; retencao DESLIGADA (use horas >= 0)", flush=True)
+
+
 class Registro:
     """Persistent index of generated clips in `OUT_DIR/registro.json` with optional Mongo mirror."""
 
@@ -213,6 +238,27 @@ class Registro:
             if isinstance(rec, dict) and rec.get("mongo_synced") is False
         ]
 
+    def _mirror(self, cid: str, rec: dict[str, Any]) -> bool:
+        """Grava no Mongo so se a revisao for mais nova. False = ja ha versao mais nova (nao marcar synced)."""
+        db = self.db
+        if db is None:
+            return False
+        rev = int(rec.get("rev") or 0)
+        flt = {"_id": cid, "$or": [{"rev": {"$exists": False}}, {"rev": {"$lt": rev}}]}
+        try:
+            db.clips.replace_one(flt, _to_mongo_doc(rec), upsert=True)
+            return True
+        except Exception as exc:
+            if not _is_duplicate_key(exc):
+                raise
+        # upsert + filtro nao casou: ja existe doc com rev >= a nossa
+        cur = db.clips.find_one({"_id": cid}, {"rev": 1})
+        try:
+            cur_rev = int((cur or {}).get("rev") or 0)
+        except (TypeError, ValueError):
+            return False
+        return cur is not None and cur_rev == rev
+
     def _sync_mongo(self, pending: list[tuple[str, dict[str, Any], str]]) -> set[str]:
         """Push pending snapshots to Mongo outside the file lock, then mark unchanged ones synced."""
         if self.db is None or not pending:
@@ -222,8 +268,8 @@ class Registro:
         synced: list[tuple[str, str]] = []
         try:
             for cid, rec, fp in pending:
-                self.db.clips.replace_one({"_id": cid}, _to_mongo_doc(rec), upsert=True)
-                synced.append((cid, fp))
+                if self._mirror(cid, rec):
+                    synced.append((cid, fp))
         except Exception as exc:
             if not (_is_mongo_error(exc) or isinstance(exc, OSError)):
                 raise
@@ -308,6 +354,7 @@ class Registro:
                 "discord": discord_info,
                 "publicacoes": publicacoes,
                 "mongo_synced": False,
+                "rev": _next_rev(existing),
             }
             data["clips"][clip_id] = entry
             _atomic_write_json(self.path, data)
@@ -330,6 +377,7 @@ class Registro:
                 return None
             rec["discord"] = sanitized
             rec["mongo_synced"] = False
+            rec["rev"] = _next_rev(rec)
             _atomic_write_json(self.path, data)
             pending = self._pending_snapshots(data)
 
@@ -351,6 +399,7 @@ class Registro:
                 return None
             rec.update(campos)
             rec["mongo_synced"] = False
+            rec["rev"] = _next_rev(rec)
             _atomic_write_json(self.path, data)
             pending = self._pending_snapshots(data)
 
@@ -376,6 +425,7 @@ class Registro:
             }
             rec["publicacoes"] = pubs
             rec["mongo_synced"] = False
+            rec["rev"] = _next_rev(rec)
             _atomic_write_json(self.path, data)
             pending = self._pending_snapshots(data)
 
@@ -453,6 +503,7 @@ class Registro:
             try:
                 hours = float(raw)
             except ValueError:
+                _avisar_retencao(retencao_h)
                 return []
         elif isinstance(retencao_h, bool):
             return []
@@ -460,9 +511,11 @@ class Registro:
             try:
                 hours = float(retencao_h)
             except (TypeError, ValueError):
+                _avisar_retencao(retencao_h)
                 return []
 
         if math.isnan(hours) or math.isinf(hours) or hours < 0:
+            _avisar_retencao(retencao_h)
             return []
 
         now_ts = float(now() if callable(now) else (time.time() if now is None else now))
@@ -527,6 +580,7 @@ class Registro:
 
                 rec["status"] = "so_discord"
                 rec["mongo_synced"] = False
+                rec["rev"] = _next_rev(rec)
                 freed.append(clip_id)
                 mb = freed_bytes / (1024 * 1024)
                 print(f"[registro] liberado {clip_id} ({mb:.1f} MB)", flush=True)

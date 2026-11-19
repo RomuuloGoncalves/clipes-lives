@@ -30,6 +30,8 @@ class FakeProc:
         self.returncode = -15
 
     def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0  # exits by itself (ffmpeg closes on EOF once the source is gone)
         return self.returncode
 
     def kill(self):

@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import time
 import uuid
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from datetime import datetime, time as dt_time, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from . import config
 from .monitor import ChannelPolicy, load_policy
-from .registro import Registro, _atomic_write_json, _json_default, _locked_path, _read_json
+from .registro import Registro, _atomic_write_json, _locked_path, _read_json
 
 PLATFORMS: tuple[str, ...] = ("youtube", "tiktok")
 DEFAULT_DAILY_QUOTAS: dict[str, int] = {"youtube": 6, "tiktok": 5}
@@ -28,6 +28,25 @@ _HTTP_401_RE = re.compile(r"(?:^|\b(?:http(?:/[\d.]+)?|status|code|erro|error)\s
 _ACTIVE_REQUEST_STATUSES: tuple[str, ...] = ("ok", "pending", "running")
 _AGENDA_TIME_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 _UNSET = object()
+DEFAULT_PUB_LEASE_S = 1800.0
+DEFAULT_PUB_MAX_POR_CICLO = 3
+YT_QUOTA_TZ = "America/Los_Angeles"  # a cota da YouTube Data API zera a meia-noite do Pacifico
+
+
+def _pub_lease_s() -> float:
+    try:
+        v = float(os.environ.get("CLIPES_PUB_LEASE_S", ""))
+    except ValueError:
+        return DEFAULT_PUB_LEASE_S
+    return v if v > 0 else DEFAULT_PUB_LEASE_S
+
+
+def _pub_max_por_ciclo() -> int:
+    try:
+        v = int(os.environ.get("CLIPES_PUB_MAX_POR_CICLO", ""))
+    except ValueError:
+        return DEFAULT_PUB_MAX_POR_CICLO
+    return v if v > 0 else DEFAULT_PUB_MAX_POR_CICLO
 
 
 def _now_ts(now: Callable[[], float] | float | None) -> float:
@@ -189,7 +208,7 @@ def _resolve_quota_path(quota_path: Path | str | None, out_root: Path | str | No
     env_path = os.environ.get("CLIPES_QUOTA_PATH", "").strip()
     if env_path:
         return Path(env_path)
-    base = Path(out_root) if out_root is not None else Path(os.environ.get("OUT_DIR") or "out")
+    base = config.resolve_out_dir(out_root)
     return base / ".cotas_publicacao.json"
 
 
@@ -206,6 +225,67 @@ def _daily_limit(plataforma: str, limit: int | None = None) -> int:
     return DEFAULT_DAILY_QUOTAS.get(plataforma, 0)
 
 
+def _quota_tz(plataforma: str) -> tzinfo:
+    """Fuso que define o dia de cota: Pacifico para o YouTube (cota zera la), UTC para o TikTok."""
+    return ZoneInfo(YT_QUOTA_TZ) if plataforma == "youtube" else timezone.utc
+
+
+def _quota_day(plataforma: str, ts: float) -> str:
+    # contadores antigos gravados com chave UTC: aceitos, a transicao dura no maximo um dia
+    return datetime.fromtimestamp(ts, timezone.utc).astimezone(_quota_tz(plataforma)).strftime("%Y-%m-%d")
+
+
+def _next_quota_day_start(plataforma: str, ts: float) -> float:
+    tz = _quota_tz(plataforma)
+    d = datetime.fromtimestamp(ts, timezone.utc).astimezone(tz).date() + timedelta(days=1)
+    return datetime.combine(d, dt_time(0, 0), tzinfo=tz).timestamp()
+
+
+def _quota_db(adapted: Any, quota_path: Path | str | None = None) -> Any:
+    """Mongo do contador de cota (compartilhado entre PCs) quando o store e Mongo; senao None (arquivo local).
+
+    Com Mongo ativo todos os caminhos usam o Mongo e espelham no arquivo local; a leitura usa max(mongo, arquivo).
+    """
+    return adapted.db if isinstance(adapted, MongoStore) else None
+
+
+def _file_used(plataforma: str, day: str, quota_path: Path | str | None, out_root: Path | str | None) -> int:
+    data = _read_json(_resolve_quota_path(quota_path, out_root), {})
+    return int((data.get(day) or {}).get(plataforma, 0)) if isinstance(data, dict) else 0
+
+
+def _file_update(
+    plataforma: str,
+    day: str,
+    quota_path: Path | str | None,
+    out_root: Path | str | None,
+    fn: Callable[[int], int],
+) -> None:
+    path = _resolve_quota_path(quota_path, out_root)
+    with _locked_path(path):
+        data = _read_json(path, {})
+        if not isinstance(data, dict):
+            data = {}
+        day_counts = dict(data.get(day) or {})
+        day_counts[plataforma] = fn(int(day_counts.get(plataforma, 0)))
+        data[day] = day_counts
+        _atomic_write_json(path, data)
+
+
+def _mirror_file(
+    plataforma: str,
+    day: str,
+    quota_path: Path | str | None,
+    out_root: Path | str | None,
+    fn: Callable[[int], int],
+) -> None:
+    """Espelho best-effort no arquivo local quando o contador oficial e o Mongo."""
+    try:
+        _file_update(plataforma, day, quota_path, out_root, fn)
+    except Exception as exc:
+        print(f"[publicacao] falha ao espelhar cota no arquivo local ({type(exc).__name__})", flush=True)
+
+
 def quota_ok(
     plataforma: str,
     now: Callable[[], float] | float | None = None,
@@ -213,14 +293,42 @@ def quota_ok(
     quota_path: Path | str | None = None,
     out_root: Path | str | None = None,
     limit: int | None = None,
+    db: Any = None,
+    extra_used: int = 0,
 ) -> bool:
-    """Return True if today's local publication count for `plataforma` is below the daily cap."""
+    """Return True if today's publication count (+ `extra_used` pedidos ja comprometidos) is below the daily cap.
+
+    O dia e o do Pacifico para o YouTube e UTC para o TikTok. Com `db` (Mongo) o contador oficial fica na
+    colecao `cotas_publicacao` e o uso e max(mongo, arquivo local); sem ele, so o arquivo local.
+    """
     ts = _now_ts(now)
-    day = _dt(ts).strftime("%Y-%m-%d")
-    path = _resolve_quota_path(quota_path, out_root)
-    data = _read_json(path, {})
-    used = int((data.get(day) or {}).get(plataforma, 0)) if isinstance(data, dict) else 0
-    return used < _daily_limit(plataforma, limit)
+    day = _quota_day(plataforma, ts)
+    used = _file_used(plataforma, day, quota_path, out_root)
+    if db is not None:
+        doc = db.cotas_publicacao.find_one({"_id": f"{plataforma}:{day}"}) or {}
+        used = max(used, int(doc.get("usado", 0)))
+    return used + max(0, int(extra_used)) < _daily_limit(plataforma, limit)
+
+
+def _reserve_quota(plataforma: str, now_ts: float, *, db: Any, limit: int | None = None) -> bool:
+    """Reserva atomica de 1 vaga no Mongo ($inc com filtro $lt limite); False se o dia ja esta cheio."""
+    cap = _daily_limit(plataforma, limit)
+    if cap <= 0:
+        return False
+    doc_id = f"{plataforma}:{_quota_day(plataforma, now_ts)}"
+    try:
+        db.cotas_publicacao.update_one({"_id": doc_id, "usado": {"$lt": cap}}, {"$inc": {"usado": 1}}, upsert=True)
+    except Exception as exc:
+        if type(exc).__name__ == "DuplicateKeyError":  # doc existe e o filtro $lt falhou: cheio
+            return False
+        raise
+    return True
+
+
+def _release_quota(plataforma: str, now_ts: float, *, db: Any) -> None:
+    """Estorna uma reserva (upload que falhou sem publicar)."""
+    doc_id = f"{plataforma}:{_quota_day(plataforma, now_ts)}"
+    db.cotas_publicacao.update_one({"_id": doc_id, "usado": {"$gt": 0}}, {"$inc": {"usado": -1}})
 
 
 def _record_quota(
@@ -229,17 +337,68 @@ def _record_quota(
     *,
     quota_path: Path | str | None = None,
     out_root: Path | str | None = None,
+    db: Any = None,
+    mongo_counted: bool = False,
 ) -> None:
-    day = _dt(now_ts).strftime("%Y-%m-%d")
-    path = _resolve_quota_path(quota_path, out_root)
-    with _locked_path(path):
-        data = _read_json(path, {})
-        if not isinstance(data, dict):
-            data = {}
-        day_counts = dict(data.get(day) or {})
-        day_counts[plataforma] = int(day_counts.get(plataforma, 0)) + 1
-        data[day] = day_counts
-        _atomic_write_json(path, data)
+    """Conta 1 publicacao. Com `db`: $inc no Mongo (salvo `mongo_counted`, ja reservado) + espelho no arquivo."""
+    day = _quota_day(plataforma, now_ts)
+    if db is not None:
+        if not mongo_counted:
+            db.cotas_publicacao.update_one({"_id": f"{plataforma}:{day}"}, {"$inc": {"usado": 1}}, upsert=True)
+        _mirror_file(plataforma, day, quota_path, out_root, lambda n: n + 1)
+        return
+    _file_update(plataforma, day, quota_path, out_root, lambda n: n + 1)
+
+
+def _mark_quota_exhausted(
+    plataforma: str,
+    now_ts: float,
+    *,
+    quota_path: Path | str | None = None,
+    out_root: Path | str | None = None,
+    limit: int | None = None,
+    db: Any = None,
+) -> None:
+    """Marca o dia de cota como esgotado (a API respondeu quotaExceeded), no Mongo e/ou no arquivo local."""
+    day = _quota_day(plataforma, now_ts)
+    cap = _daily_limit(plataforma, limit)
+    if db is not None:
+        db.cotas_publicacao.update_one({"_id": f"{plataforma}:{day}"}, {"$max": {"usado": cap}}, upsert=True)
+        _mirror_file(plataforma, day, quota_path, out_root, lambda n: max(n, cap))
+        return
+    _file_update(plataforma, day, quota_path, out_root, lambda n: max(n, cap))
+
+
+def _is_quota_exhausted(res_or_text: Any) -> bool:
+    """Detecta o sinal de cota esgotada do publicador (flag `quota_esgotada` ou texto do erro)."""
+    if isinstance(res_or_text, dict):
+        if res_or_text.get("quota_esgotada"):
+            return True
+        text = str(res_or_text.get("erro") or res_or_text.get("error") or "")
+    else:
+        text = str(res_or_text or "")
+    return "quotaExceeded" in text or "uploadLimitExceeded" in text
+
+
+def _committed_count(adapted: Any, plataforma: str, day: str, now_ts: float, exclude_id: str | None = None) -> int:
+    """Pedidos `pending`/`running` da plataforma cujo dia de cota e `day` (sem agendamento = hoje)."""
+    fn = getattr(adapted, "active_requests", None)
+    if not callable(fn):
+        return 0
+    try:
+        docs = list(fn(plataforma))
+    except TypeError:
+        return 0
+    n = 0
+    for d in docs:
+        if not isinstance(d, dict) or (exclude_id is not None and d.get("_id") == exclude_id):
+            continue
+        ts = _parse_ts(d.get("agendar_para"))
+        # atrasado/sem agendamento vai rodar agora: conta para hoje, nao para um dia passado
+        eff = max(ts, now_ts) if ts is not None else now_ts
+        if _quota_day(plataforma, eff) == day:
+            n += 1
+    return n
 
 
 def _extract_channel(manifest: dict[str, Any], clip: dict[str, Any], job: dict[str, Any] | None) -> str:
@@ -376,6 +535,13 @@ class LocalStore:
                 out.append(datetime.fromtimestamp(ts, timezone.utc))
         return out
 
+    def active_requests(self, plataforma: str) -> list[dict[str, Any]]:
+        """Pedidos `pending`/`running` da plataforma (para contar a cota ja comprometida)."""
+        return [
+            dict(r) for r in self._load()["requests"].values()
+            if r.get("status") in ("pending", "running") and r.get("plataforma") == plataforma
+        ]
+
     def active_clip_ids(self) -> set[str]:
         reqs = self._load()["requests"].values()
         return {
@@ -384,8 +550,14 @@ class LocalStore:
             if r.get("status") in ("pending", "running") and r.get("clip_id")
         }
 
-    def claim_request(self, req_id: str, worker_id: str | None = None) -> dict[str, Any] | None:
-        """Atomically transition a `pending` request to `running`, returning it or None."""
+    def claim_request(
+        self,
+        req_id: str,
+        worker_id: str | None = None,
+        now: Callable[[], float] | float | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically transition a `pending` request to `running` (with lease), returning it or None."""
+        now_ts = _now_ts(now)
         with _locked_path(self.path):
             data = self._load()
             existing = data["requests"].get(req_id)
@@ -394,8 +566,31 @@ class LocalStore:
             if worker_id is not None and existing.get("owner") != worker_id:
                 return None
             existing["status"] = "running"
+            existing["iniciado_em"] = _dt(now_ts)
+            existing["lease_until"] = _dt(now_ts + _pub_lease_s())
             self._save(data)
             return dict(existing)
+
+    def release_expired(self, worker_id: str | None, now: Callable[[], float] | float | None = None) -> int:
+        """Devolve a `pending` pedidos `running` com lease vencida (ou legados sem lease)."""
+        now_ts = _now_ts(now)
+        n = 0
+        with _locked_path(self.path):
+            data = self._load()
+            for r in data["requests"].values():
+                if r.get("status") != "running":
+                    continue
+                if worker_id is not None and r.get("owner") != worker_id:
+                    continue
+                lease_ts = _parse_ts(r.get("lease_until"))
+                if lease_ts is not None and lease_ts >= now_ts:
+                    continue
+                r["status"] = "pending"
+                r.pop("lease_until", None)
+                n += 1
+            if n:
+                self._save(data)
+        return n
 
     def update_request(self, req_id: str, fields: dict[str, Any]) -> None:
         with _locked_path(self.path):
@@ -481,6 +676,13 @@ class MongoStore:
                 out.append(datetime.fromtimestamp(ts, timezone.utc))
         return out
 
+    def active_requests(self, plataforma: str) -> list[dict[str, Any]]:
+        """Pedidos `pending`/`running` da plataforma (para contar a cota ja comprometida)."""
+        return list(self.db.publish_requests.find(
+            {"status": {"$in": ["pending", "running"]}, "plataforma": plataforma},
+            {"agendar_para": 1},
+        ))
+
     def active_clip_ids(self) -> set[str]:
         docs = self.db.publish_requests.find(
             {"status": {"$in": ["pending", "running"]}},
@@ -488,18 +690,47 @@ class MongoStore:
         )
         return {str(d["clip_id"]) for d in docs if d.get("clip_id")}
 
-    def claim_request(self, req_id: str, worker_id: str | None = None) -> dict[str, Any] | None:
-        """Atomically transition a `pending` request to `running`, returning it or None."""
+    def claim_request(
+        self,
+        req_id: str,
+        worker_id: str | None = None,
+        now: Callable[[], float] | float | None = None,
+    ) -> dict[str, Any] | None:
+        """Atomically transition a `pending` request to `running` (with lease), returning it or None."""
         from pymongo import ReturnDocument
 
+        now_ts = _now_ts(now)
         query: dict[str, Any] = {"_id": req_id, "status": "pending"}
         if worker_id is not None:
             query["owner"] = worker_id
         return self.db.publish_requests.find_one_and_update(
             query,
-            {"$set": {"status": "running"}},
+            {"$set": {
+                "status": "running",
+                "iniciado_em": _dt(now_ts),
+                "lease_until": _dt(now_ts + _pub_lease_s()),
+            }},
             return_document=ReturnDocument.AFTER,
         )
+
+    def release_expired(self, worker_id: str | None, now: Callable[[], float] | float | None = None) -> int:
+        """Devolve a `pending` pedidos `running` com lease vencida (ou legados sem lease)."""
+        now_dt = _dt(_now_ts(now))
+        query: dict[str, Any] = {
+            "status": "running",
+            "$or": [
+                {"lease_until": {"$exists": False}},
+                {"lease_until": None},
+                {"lease_until": {"$lt": now_dt}},
+            ],
+        }
+        if worker_id is not None:
+            query["owner"] = worker_id
+        res = self.db.publish_requests.update_many(
+            query,
+            {"$set": {"status": "pending"}, "$unset": {"lease_until": ""}},
+        )
+        return int(getattr(res, "modified_count", 0) or 0)
 
     def update_request(self, req_id: str, fields: dict[str, Any]) -> None:
         self.db.publish_requests.update_one({"_id": req_id}, {"$set": fields})
@@ -558,6 +789,26 @@ def _adapt_store(store: Any) -> LocalStore | MongoStore:
     return MongoStore(store)
 
 
+def _candidate_clips_paths(root: Path, reg_rec: dict[str, Any] | None) -> Iterator[Path]:
+    """clips.json ao lado do mp4 apontado pelo registro primeiro; rglob (lazy) so se nao achar (A-07)."""
+    hinted: Path | None = None
+    arquivo = str((reg_rec or {}).get("arquivo") or "").strip()
+    if arquivo:
+        cand = (root / arquivo).parent / "clips.json"
+        try:
+            cand_res = cand.resolve()
+            dentro = cand_res.is_relative_to(root.resolve())
+        except OSError:
+            dentro = False
+        if dentro and cand.is_file():  # arquivo absoluto ou com '..' fora de out_root: ignora
+            hinted = cand_res
+            yield cand
+    for path in sorted(root.rglob("clips.json")):
+        if hinted is not None and path.resolve() == hinted:
+            continue
+        yield path
+
+
 def find_clip(out_root: Path | str | None, clip_id: str, *, store: Any = None) -> dict[str, Any] | None:
     """Locate `clip_id` across `clips.json`, `registro.json`, and optional Mongo store."""
     cid = (clip_id or "").strip()
@@ -573,7 +824,7 @@ def find_clip(out_root: Path | str | None, clip_id: str, *, store: Any = None) -
     if root is not None and root.is_dir():
         jobs_by_dir = _load_done_jobs_by_output_dir(root)
         default_owner = _local_worker_id(root)
-        for clips_path in sorted(root.rglob("clips.json")):
+        for clips_path in _candidate_clips_paths(root, reg_rec):
             manifest = _read_json(clips_path, None)
             if not isinstance(manifest, dict):
                 continue
@@ -600,6 +851,16 @@ def find_clip(out_root: Path | str | None, clip_id: str, *, store: Any = None) -
                 discord_meta = entry.get("discord") if isinstance(entry.get("discord"), dict) else {}
                 manifest_discord = manifest.get("discord") if isinstance(manifest.get("discord"), dict) else {}
                 merged_discord = {**reg_discord, **discord_meta}
+                # fallback no registro (M-20): o manifest do CLI nao tem ready_at/created_at e o embargo
+                # delay_h seria contornado
+                rec = reg_rec or {}
+                ready_raw = (
+                    entry.get("ready_at")
+                    if entry.get("ready_at") is not None
+                    else (job or {}).get("ready_at", manifest.get("ready_at"))
+                )
+                if ready_raw is None:
+                    ready_raw = rec.get("ready_at")
                 return {
                     "clip_id": cid,
                     "clip": entry,
@@ -607,12 +868,13 @@ def find_clip(out_root: Path | str | None, clip_id: str, *, store: Any = None) -
                     "clips_json_path": clips_path,
                     "mp4_path": mp4_path,
                     "channel": _extract_channel(manifest, entry, job),
-                    "created_at": _parse_ts((job or {}).get("created_at") or manifest.get("created_at")),
-                    "ready_at": _parse_ts(
-                        entry.get("ready_at")
-                        if entry.get("ready_at") is not None
-                        else (job or {}).get("ready_at", manifest.get("ready_at"))
+                    "created_at": _parse_ts(
+                        (job or {}).get("created_at")
+                        or manifest.get("created_at")
+                        or rec.get("criado_em")
+                        or rec.get("created_at")
                     ),
+                    "ready_at": _parse_ts(ready_raw),
                     "owner": (job or {}).get("owner") or entry.get("owner") or manifest.get("owner") or default_owner,
                     "thread_id": discord_meta.get("thread_id") or reg_discord.get("thread_id") or manifest_discord.get("thread_id"),
                     "discord": merged_discord,
@@ -661,8 +923,9 @@ def _resolve_policy(policy: ChannelPolicy | None, policy_path: Path | str | None
         return policy
     if policy_path is not None:
         return load_policy(Path(policy_path))
-    if out_root is not None and (out_root / "policy.json").is_file():
-        return load_policy(out_root / "policy.json")
+    path = config.resolve_policy_path(out_root, legacy=Path("policy.json"))  # legado: cwd (como o acompanhar)
+    if path.is_file():
+        return load_policy(path)
     return ChannelPolicy()
 
 
@@ -712,6 +975,38 @@ def _occupied_slots_for_platform(adapted: Any, plat: str) -> list[datetime]:
                 out.append(datetime.fromtimestamp(ts, timezone.utc))
         return out
     return []
+
+
+def _next_free_quota_slot(
+    adapted: Any,
+    plat: str,
+    now_ts: float,
+    *,
+    req_id: str | None = None,
+    quota_path: Path | str | None = None,
+    out_root: Path | str | None = None,
+    tz: tzinfo | str | None = None,
+    start_ts: float | None = None,
+) -> float:
+    """Primeiro slot (ou inicio do proximo dia de cota) com cota livre, contando pedidos ja comprometidos.
+
+    `start_ts` (padrao: agora) e o instante a partir do qual procurar.
+    """
+    tz_obj, _ = _resolve_tz(tz)
+    horarios = ler_horarios()
+    db = _quota_db(adapted)
+    after = now_ts if start_ts is None else start_ts
+    for _ in range(120):
+        if horarios:
+            ocupados = _occupied_slots_for_platform(adapted, plat)
+            cand = proximo_horario(after, horarios, ocupados, tz_obj, folga_min=0).timestamp()
+        else:
+            cand = after
+        extra = _committed_count(adapted, plat, _quota_day(plat, cand), now_ts, exclude_id=req_id)
+        if quota_ok(plat, cand, quota_path=quota_path, out_root=out_root, db=db, extra_used=extra):
+            return cand
+        after = _next_quota_day_start(plat, cand)
+    return after
 
 
 def request(
@@ -785,21 +1080,21 @@ def request(
                 slot_dt = proximo_horario(agora_dt, horarios, ocupados, tz_obj)
 
         quota_ts = slot_dt.timestamp() if slot_dt is not None else now_ts
-        if not quota_ok(plat, quota_ts, quota_path=quota_path, out_root=root):
-            adapted.enqueue_request({
-                "_id": f"{clip_id}:{plat}",
-                "clip_id": clip_id,
-                "plataforma": plat,
-                "owner": owner,
-                "pedido_por": str(user_id),
-                "status": "adiado",
-                "resultado": {"erro": "cota_diaria"},
-                "thread_id": eff_thread_id,
-                "criado_em": _dt(now_ts),
-                "concluido_em": _dt(now_ts),
-            })
-            messages.append(f"cota diaria atingida ({plat})")
-            continue
+        # conta tambem os pedidos pending/running do mesmo dia de cota (M-11)
+        committed = _committed_count(
+            adapted, plat, _quota_day(plat, quota_ts), now_ts, exclude_id=f"{clip_id}:{plat}"
+        )
+        cota_cheia = not quota_ok(
+            plat, quota_ts, quota_path=quota_path, out_root=root,
+            db=_quota_db(adapted), extra_used=committed,
+        )
+        if cota_cheia and not (existing is not None and existing.get("status") in ("pending", "running")):
+            # nao cria mais `adiado` terminal: agenda no proximo slot/dia com cota livre.
+            # (pedidos `adiado` legados continuam ignorados por find_pending/run_pending; um novo request os recria)
+            slot_ts = _next_free_quota_slot(
+                adapted, plat, now_ts, req_id=f"{clip_id}:{plat}", quota_path=quota_path, out_root=root, tz=tz_obj
+            )
+            slot_dt = datetime.fromtimestamp(slot_ts, timezone.utc).astimezone(tz_obj)
 
         doc: dict[str, Any] = {
             "_id": f"{clip_id}:{plat}",
@@ -824,7 +1119,9 @@ def request(
             sched_suffix = f"; agendado para {stored_dt.strftime('%Y-%m-%d %H:%M')} ({tz_name})"
 
         online, host_label = adapted.worker_status(owner, now_ts, stale_s=worker_stale_s)
-        if not online:
+        if cota_cheia:
+            messages.append(f"cota diaria atingida ({plat}){sched_suffix}")
+        elif not online:
             messages.append(f"{plat}: PC {host_label} offline; pedido fica na fila{sched_suffix}")
         else:
             messages.append(f"{plat}: publicacao enfileirada{sched_suffix}")
@@ -844,12 +1141,11 @@ def _default_refresh(
     from . import oauth  # lazy: module from T4
 
     resolved_tokens = Path(tokens_path) if tokens_path is not None else None
+    # devolve o dict (access_token + refresh_token rotacionado, se vier) para quem persiste os tokens
     if plataforma == "youtube":
-        access_token = oauth.refresh_google(refresh_tok, tokens_path=resolved_tokens)
-        return {"access_token": access_token}
+        return dict(oauth.refresh_google_tokens(refresh_tok, tokens_path=resolved_tokens))
     if plataforma == "tiktok":
-        access_token = oauth.refresh_tiktok(refresh_tok, tokens_path=resolved_tokens)
-        return {"access_token": access_token}
+        return dict(oauth.refresh_tiktok_tokens(refresh_tok, tokens_path=resolved_tokens))
     raise ValueError(f"unknown platform: {plataforma}")
 
 
@@ -1020,7 +1316,7 @@ def _download_from_discord(
             reg.marcar(clip_id, status="perdido")
         return None, "clipe_perdido", "clipe perdido: mensagem do Discord apagada"
 
-    base_out = root if root is not None else Path(os.environ.get("OUT_DIR") or "out")
+    base_out = config.resolve_out_dir(root)
     tmp_dl = base_out / ".tmp_publicar" / f"{clip_id}_{plat}_{uuid.uuid4().hex[:8]}.mp4"
     expected_size = int(found.get("tamanho") or discord_info.get("size") or att.get("size") or 0)
     max_bytes = (expected_size + 1024) if expected_size > 0 else 25 * 1024 * 1024
@@ -1063,8 +1359,12 @@ def run_pending(
     save_tokens_fn: Callable[[dict[str, Any], Path | str | None], None] | None = None,
     discord_post: Callable[[str, str], Any] | None = None,
     discord_client: Any | None = None,
+    limit: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Execute pending publish requests owned by `worker_id` and reply in the clip thread."""
+    """Execute pending publish requests owned by `worker_id` and reply in the clip thread.
+
+    Processa no maximo `limit` pedidos por chamada (padrao `CLIPES_PUB_MAX_POR_CICLO`, 3).
+    """
     adapted = _adapt_store(store)
     root = Path(out_root) if out_root is not None else getattr(adapted, "out_root", None)
     pol = _resolve_policy(policy, policy_path, root)
@@ -1074,6 +1374,10 @@ def run_pending(
     outcomes: list[dict[str, Any]] = []
 
     now_fn_ts = _now_ts(now)
+    max_n = limit if limit is not None and limit > 0 else _pub_max_por_ciclo()
+    release_fn = getattr(adapted, "release_expired", None)
+    if callable(release_fn):
+        release_fn(worker_id, now=now_fn_ts)
     if isinstance(adapted, (LocalStore, MongoStore)):
         pending_reqs = adapted.find_pending(worker_id=worker_id, now=now_fn_ts)
     else:
@@ -1082,7 +1386,10 @@ def run_pending(
         except TypeError:
             pending_reqs = adapted.find_pending(worker_id=worker_id)
 
+    processed = 0
     for req in pending_reqs:
+        if processed >= max_n:
+            break
         now_ts = _now_ts(now)
         sched_ts = _parse_ts(req.get("agendar_para"))
         if sched_ts is not None and sched_ts > now_ts:
@@ -1094,8 +1401,13 @@ def run_pending(
 
         claim_fn = getattr(adapted, "claim_request", None)
         if callable(claim_fn):
-            if claim_fn(req_id, worker_id=worker_id) is None:
+            if isinstance(adapted, (LocalStore, MongoStore)):
+                claimed = claim_fn(req_id, worker_id=worker_id, now=now_ts)
+            else:
+                claimed = claim_fn(req_id, worker_id=worker_id)
+            if claimed is None:
                 continue
+        processed += 1
 
         def finish(status: str, resultado: dict[str, Any], reply: str) -> None:
             adapted.update_request(req_id, {
@@ -1113,101 +1425,104 @@ def run_pending(
                 "message": reply,
             })
 
-        found = find_clip(root, clip_id, store=adapted)
-        eff_thread_id = thread_id or (found.get("thread_id") if found else None)
+        def defer_quota(motivo: str, *, proximo_dia: bool = False) -> None:
+            """Cota do dia esgotada: devolve o pedido a `pending` no proximo slot com cota livre (M-11).
 
-        if not quota_ok(plat, now_ts, quota_path=quota_path, out_root=root):
-            finish("adiado", {"erro": "cota_diaria"}, f"[{plat}] adiado: cota diaria atingida ({plat})")
-            continue
-
-        if found is None:
-            finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
-            continue
-
-        channel = found.get("channel") or ""
-        if not pol.permits(channel):
-            finish("erro", {"erro": "bloqueado pela politica"}, f"[{plat}] erro: bloqueado pela politica")
-            continue
-
-        ready_at = _effective_ready_at(found, pol)
-        if ready_at is not None and now_ts < ready_at:
-            adapted.update_request(req_id, {"status": "pending"})
-            continue
-
-        mp4_raw = found.get("mp4_path")
-        mp4_path = Path(mp4_raw) if mp4_raw is not None else None
-        tmp_dl: Path | None = None
-        if mp4_path is None or not mp4_path.is_file():
-            tmp_dl, dl_err, dl_reply = _download_from_discord(
-                found=found,
-                root=root,
-                clip_id=clip_id,
-                plat=plat,
-                discord_client=discord_client,
-                reg=reg,
+            `proximo_dia`: o dia atual esta esgotado por certo (API); comeca do proximo dia de cota.
+            """
+            nonlocal processed
+            slot_ts = _next_free_quota_slot(
+                adapted, plat, now_ts, req_id=req_id, quota_path=quota_path, out_root=root,
+                start_ts=_next_quota_day_start(plat, now_ts) if proximo_dia else None,
             )
-            if tmp_dl is None:
-                finish("erro_arquivo", {"erro": dl_err or "arquivo_ausente"}, dl_reply or f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
-                continue
-            mp4_path = tmp_dl
+            adapted.update_request(req_id, {
+                "status": "pending",
+                "agendar_para": _dt(slot_ts),
+                "lease_until": None,
+                "iniciado_em": None,
+            })
+            processed -= 1  # nao publicou de fato: nao consome o limit
+            tz_obj_q, tz_name_q = _resolve_tz(None)
+            slot_str = datetime.fromtimestamp(slot_ts, timezone.utc).astimezone(tz_obj_q).strftime("%Y-%m-%d %H:%M")
+            reply = f"[{plat}] cota diaria atingida ({motivo}); reagendado para {slot_str} ({tz_name_q})"
+            _send_thread_reply(discord_post, eff_thread_id, reply)
+            outcomes.append({
+                "_id": req_id,
+                "clip_id": clip_id,
+                "plataforma": plat,
+                "status": "pending",
+                "resultado": {"erro": "cota_diaria", "agendar_para": slot_str},
+                "message": reply,
+            })
 
-        try:
-            tok_map = _load_tokens(tokens, tokens_path)
-            plat_tok = dict(tok_map.get(plat) or {})
-            secrets = _secret_values(tok_map)
+        quota_db = _quota_db(adapted)
+        quota_reserved = False  # vaga reservada no Mongo antes do upload (M-12)
+        quota_consumed = False  # upload feito (ou dia esgotado): nao estornar
 
-            def do_refresh() -> str:
-                ref_fn = (refreshers or {}).get(plat) or (
-                    lambda p, t: _default_refresh(p, t, tokens_path=tokens_path)
-                )
-                refreshed = ref_fn(plat, plat_tok)
-                if isinstance(refreshed, str):
-                    new_access = refreshed
-                    new_refresh = ""
-                elif isinstance(refreshed, dict):
-                    new_access = str(refreshed.get("access_token") or "")
-                    new_refresh = str(refreshed.get("refresh_token") or "")
-                else:
-                    new_access = ""
-                    new_refresh = ""
-                if not new_access:
-                    raise RuntimeError("refresh returned no access_token")
-                plat_tok["access_token"] = new_access
-                if new_refresh:
-                    plat_tok["refresh_token"] = new_refresh
-                    tok_map[plat] = plat_tok
-                    save_fn(tok_map, tokens_path)
-                else:
-                    tok_map[plat] = plat_tok
-                secrets.extend(_secret_values(tok_map))
-                return str(new_access)
-
-            access_token = plat_tok.get("access_token")
-            if not access_token:
-                if not plat_tok.get("refresh_token"):
-                    finish("erro_auth", {"erro": "sem_token"}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
-                    continue
-                try:
-                    access_token = do_refresh()
-                except Exception as exc:
-                    safe_err = _sanitize_text(str(exc), secrets)
-                    finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
-                    continue
-
-            pub_fn = (publishers or {}).get(plat)
-            clip_entry = found["clip"]
-
-            def invoke(tok: str) -> dict[str, Any]:
-                if pub_fn is not None:
-                    return _call_publisher(pub_fn, plat, mp4_path, clip_entry, tok)
-                return _default_publish(plat, mp4_path, clip_entry, tok, refresh=do_refresh)
-
+        def mark_quota_exhausted() -> None:
+            """API respondeu quotaExceeded: esgota o dia (M-14) e reagenda sem subir o video de novo."""
+            nonlocal quota_consumed
+            quota_consumed = True  # a reserva fica (dia esgotado), nao estorna
             try:
-                res = invoke(str(access_token))
-            except FileNotFoundError:
-                if tmp_dl is not None:
-                    finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
-                    continue
+                _mark_quota_exhausted(plat, now_ts, quota_path=quota_path, out_root=root, db=quota_db)
+            except Exception as exc:
+                print(f"[publicacao] falha ao marcar cota esgotada ({type(exc).__name__})", flush=True)
+            defer_quota(f"{plat}, API", proximo_dia=True)
+
+        eff_thread_id = thread_id
+        secrets: list[str] = []
+        raw_prev = req.get("resultado")
+        prev: dict[str, Any] = raw_prev if isinstance(raw_prev, dict) else {}
+        partial: dict[str, Any] = dict(prev) if (prev.get("video_id") or prev.get("publish_id")) else {}
+        try:
+            found = find_clip(root, clip_id, store=adapted)
+            eff_thread_id = thread_id or (found.get("thread_id") if found else None)
+            if partial:
+                # ja subiu numa tentativa anterior (crash antes do finish): nao reenviar, so a contabilidade
+                prev_id = str(partial.get("video_id") or partial.get("publish_id"))
+                prev_url = str(partial.get("url") or "")
+                priv = str(partial.get("privacidade") or ("private" if plat == "youtube" else "SELF_ONLY"))
+                try:
+                    _record_clip_publication(
+                        (found or {}).get("clips_json_path"),
+                        clip_id,
+                        {"plataforma": plat, "id": prev_id, "privacidade": priv, **({"url": prev_url} if prev_url else {})},
+                    )
+                except Exception as exc:
+                    print(f"[publicacao] falha ao atualizar clips.json de {clip_id} ({type(exc).__name__})", flush=True)
+                if reg is not None:
+                    try:
+                        reg.registrar_publicacao(clip_id, plat, {"id": prev_id, "url": prev_url, "em": now_ts})
+                    except Exception as exc:
+                        print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({type(exc).__name__})", flush=True)
+                finish("ok", dict(partial), f"[{plat}] ok: {prev_url or prev_id}")
+                continue
+
+            if not quota_ok(plat, now_ts, quota_path=quota_path, out_root=root, db=quota_db):
+                defer_quota(plat)
+                continue
+
+            if found is None:
+                finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
+                continue
+
+            channel = found.get("channel") or ""
+            if not pol.permits(channel):
+                finish("erro", {"erro": "bloqueado pela politica"}, f"[{plat}] erro: bloqueado pela politica")
+                continue
+
+            ready_at = _effective_ready_at(found, pol)
+            if ready_at is not None and now_ts < ready_at:
+                adapted.update_request(
+                    req_id, {"status": "pending", "lease_until": None, "iniciado_em": None}
+                )
+                processed -= 1  # nao tomado de fato: nao consome o limit
+                continue
+
+            mp4_raw = found.get("mp4_path")
+            mp4_path = Path(mp4_raw) if mp4_raw is not None else None
+            tmp_dl: Path | None = None
+            if mp4_path is None or not mp4_path.is_file():
                 tmp_dl, dl_err, dl_reply = _download_from_discord(
                     found=found,
                     root=root,
@@ -1215,110 +1530,241 @@ def run_pending(
                     plat=plat,
                     discord_client=discord_client,
                     reg=reg,
-                    secrets=secrets,
                 )
                 if tmp_dl is None:
                     finish("erro_arquivo", {"erro": dl_err or "arquivo_ausente"}, dl_reply or f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
                     continue
                 mp4_path = tmp_dl
+
+            try:
+                tok_map = _load_tokens(tokens, tokens_path)
+                plat_tok = dict(tok_map.get(plat) or {})
+                secrets = _secret_values(tok_map)
+
+                def persist_refresh(new_refresh: str) -> None:
+                    """Grava so o refresh_token rotacionado da plataforma, sobre o arquivo atual (sem snapshot velho)."""
+                    if save_tokens_fn is None:
+                        from . import oauth
+
+                        oauth._update_platform_tokens(
+                            _resolve_tokens_path(tokens_path), plat, {"refresh_token": new_refresh}
+                        )
+                        return
+                    fresh = dict(_load_tokens(None, tokens_path))
+                    fresh[plat] = {**dict(fresh.get(plat) or {}), "refresh_token": new_refresh}
+                    save_fn(fresh, tokens_path)
+
+                def do_refresh() -> str:
+                    ref_fn = (refreshers or {}).get(plat) or (
+                        lambda p, t: _default_refresh(p, t, tokens_path=tokens_path)
+                    )
+                    refreshed = ref_fn(plat, plat_tok)
+                    if isinstance(refreshed, str):
+                        new_access = refreshed
+                        new_refresh = ""
+                    elif isinstance(refreshed, dict):
+                        new_access = str(refreshed.get("access_token") or "")
+                        new_refresh = str(refreshed.get("refresh_token") or "")
+                    else:
+                        new_access = ""
+                        new_refresh = ""
+                    if not new_access:
+                        raise RuntimeError("refresh returned no access_token")
+                    plat_tok["access_token"] = new_access
+                    tok_map[plat] = plat_tok
+                    if new_refresh:
+                        plat_tok["refresh_token"] = new_refresh
+                        persist_refresh(new_refresh)
+                    secrets.extend(_secret_values(tok_map))
+                    return str(new_access)
+
+                access_token = plat_tok.get("access_token")
+                if not access_token:
+                    if not plat_tok.get("refresh_token"):
+                        finish("erro_auth", {"erro": "sem_token"}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                        continue
+                    try:
+                        access_token = do_refresh()
+                    except Exception as exc:
+                        safe_err = _sanitize_text(str(exc), secrets)
+                        finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                        continue
+
+                if quota_db is not None:
+                    if not _reserve_quota(plat, now_ts, db=quota_db):
+                        defer_quota(plat)
+                        continue
+                    quota_reserved = True
+
+                pub_fn = (publishers or {}).get(plat)
+                clip_entry = found["clip"]
+
+                def invoke(tok: str) -> dict[str, Any]:
+                    if pub_fn is not None:
+                        return _call_publisher(pub_fn, plat, mp4_path, clip_entry, tok)
+                    return _default_publish(plat, mp4_path, clip_entry, tok, refresh=do_refresh)
+
                 try:
                     res = invoke(str(access_token))
-                except Exception as exc_retry:
-                    if _is_401_error(exc_retry):
+                except FileNotFoundError:
+                    if tmp_dl is not None:
+                        finish("erro_arquivo", {"erro": "arquivo_ausente"}, f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
+                        continue
+                    tmp_dl, dl_err, dl_reply = _download_from_discord(
+                        found=found,
+                        root=root,
+                        clip_id=clip_id,
+                        plat=plat,
+                        discord_client=discord_client,
+                        reg=reg,
+                        secrets=secrets,
+                    )
+                    if tmp_dl is None:
+                        finish("erro_arquivo", {"erro": dl_err or "arquivo_ausente"}, dl_reply or f"[{plat}] erro_arquivo: .mp4 ausente para {clip_id}")
+                        continue
+                    mp4_path = tmp_dl
+                    try:
+                        res = invoke(str(access_token))
+                    except Exception as exc_retry:
+                        if _is_401_error(exc_retry):
+                            try:
+                                access_token = do_refresh()
+                                res = invoke(access_token)
+                            except Exception as exc2:
+                                safe_err = _sanitize_text(str(exc2), secrets)
+                                if _is_quota_exhausted(safe_err):
+                                    mark_quota_exhausted()
+                                    continue
+                                if _is_account_error(exc2):
+                                    finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                                else:
+                                    finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+                                continue
+                        elif _is_account_error(exc_retry):
+                            safe_err = _sanitize_text(str(exc_retry), secrets)
+                            finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                            continue
+                        else:
+                            safe_err = _sanitize_text(str(exc_retry), secrets)
+                            if _is_quota_exhausted(safe_err):
+                                mark_quota_exhausted()
+                                continue
+                            finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
+                            continue
+                except Exception as exc:
+                    if _is_401_error(exc):
                         try:
                             access_token = do_refresh()
                             res = invoke(access_token)
                         except Exception as exc2:
                             safe_err = _sanitize_text(str(exc2), secrets)
+                            if _is_quota_exhausted(safe_err):
+                                mark_quota_exhausted()
+                                continue
                             if _is_account_error(exc2):
                                 finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
                             else:
                                 finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
                             continue
-                    elif _is_account_error(exc_retry):
-                        safe_err = _sanitize_text(str(exc_retry), secrets)
+                    elif _is_account_error(exc):
+                        safe_err = _sanitize_text(str(exc), secrets)
                         finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
                         continue
                     else:
-                        safe_err = _sanitize_text(str(exc_retry), secrets)
+                        safe_err = _sanitize_text(str(exc), secrets)
+                        if _is_quota_exhausted(safe_err):
+                            mark_quota_exhausted()
+                            continue
                         finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
                         continue
-            except Exception as exc:
-                if _is_401_error(exc):
-                    try:
-                        access_token = do_refresh()
-                        res = invoke(access_token)
-                    except Exception as exc2:
-                        safe_err = _sanitize_text(str(exc2), secrets)
-                        if _is_account_error(exc2):
-                            finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
-                        else:
-                            finish("erro_auth", {"erro": safe_err}, f"[{plat}] erro_auth: refaca clipes auth {plat}")
+
+                if isinstance(res, dict) and res.get("status") in ("erro_conta", "erro_auth", "erro"):
+                    st = str(res["status"])
+                    if _is_quota_exhausted(res):
+                        mark_quota_exhausted()
                         continue
-                elif _is_account_error(exc):
-                    safe_err = _sanitize_text(str(exc), secrets)
-                    finish("erro_conta", {"erro": safe_err}, f"[{plat}] erro_conta: deixe a conta do TikTok como privada")
+                    safe_err = _sanitize_text(str(res.get("error") or res.get("erro") or st), secrets)
+                    if st == "erro_conta":
+                        msg = f"[{plat}] erro_conta: deixe a conta do TikTok como privada"
+                    elif st == "erro_auth":
+                        msg = f"[{plat}] erro_auth: refaca clipes auth {plat}"
+                    else:
+                        msg = f"[{plat}] erro: {safe_err}"
+                    finish(st, {"erro": safe_err}, msg)
                     continue
-                else:
-                    safe_err = _sanitize_text(str(exc), secrets)
-                    finish("erro", {"erro": safe_err}, f"[{plat}] erro: {safe_err}")
-                    continue
 
-            if isinstance(res, dict) and res.get("status") in ("erro_conta", "erro_auth", "erro"):
-                st = str(res["status"])
-                safe_err = _sanitize_text(str(res.get("error") or res.get("erro") or st), secrets)
-                if st == "erro_conta":
-                    msg = f"[{plat}] erro_conta: deixe a conta do TikTok como privada"
-                elif st == "erro_auth":
-                    msg = f"[{plat}] erro_auth: refaca clipes auth {plat}"
-                else:
-                    msg = f"[{plat}] erro: {safe_err}"
-                finish(st, {"erro": safe_err}, msg)
-                continue
-
-            try:
-                _record_quota(plat, now_ts, quota_path=quota_path, out_root=root)
-            except Exception as exc:
-                safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
-                print(f"[publicacao] falha ao registrar cota de {clip_id} ({safe_err})", flush=True)
-            pub_id = str(res.get("video_id") or res.get("publish_id") or res.get("id") or "")
-            if plat == "youtube":
-                priv = "private"
-                url = str(res.get("url") or (f"https://youtube.com/shorts/{pub_id}" if pub_id else ""))
-                resultado: dict[str, Any] = {"video_id": pub_id, "privacidade": priv}
-                if url:
-                    resultado["url"] = url
-            else:
-                priv = "SELF_ONLY"
-                url = str(res.get("url") or "")
-                resultado = {"publish_id": pub_id, "privacidade": priv}
-                if url:
-                    resultado["url"] = url
-
-            try:
-                _record_clip_publication(
-                    found.get("clips_json_path"),
-                    clip_id,
-                    {"plataforma": plat, "id": pub_id, "privacidade": priv, **({"url": url} if url else {})},
-                )
-            except Exception as exc:
-                safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
-                print(f"[publicacao] falha ao atualizar clips.json de {clip_id} ({safe_err})", flush=True)
-            if reg is not None:
+                quota_consumed = True
+                aviso_cota: str | None = None
                 try:
-                    reg.registrar_publicacao(
+                    _record_quota(
+                        plat, now_ts, quota_path=quota_path, out_root=root, db=quota_db,
+                        mongo_counted=quota_reserved,
+                    )
+                except Exception as exc:
+                    aviso_cota = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+                    print(f"[publicacao] falha ao registrar cota de {clip_id} ({aviso_cota})", flush=True)
+                pub_id = str(res.get("video_id") or res.get("publish_id") or res.get("id") or "")
+                if plat == "youtube":
+                    priv = "private"
+                    url = str(res.get("url") or (f"https://youtube.com/shorts/{pub_id}" if pub_id else ""))
+                    resultado: dict[str, Any] = {"video_id": pub_id, "privacidade": priv}
+                    if url:
+                        resultado["url"] = url
+                else:
+                    priv = "SELF_ONLY"
+                    url = str(res.get("url") or "")
+                    resultado = {"publish_id": pub_id, "privacidade": priv}
+                    if url:
+                        resultado["url"] = url
+                if aviso_cota:
+                    resultado["aviso_cota"] = aviso_cota  # upload ok, mas a cota nao foi contada
+
+                if pub_id:
+                    # grava o id ja publicado: se cair antes do finish, a retomada nao reenvia
+                    try:
+                        adapted.update_request(req_id, {"resultado": dict(resultado)})
+                        partial = dict(resultado)
+                    except Exception as exc:
+                        if type(exc).__module__.split(".")[0] in ("pymongo", "mongomock"):
+                            raise
+                        print(f"[publicacao] falha ao gravar resultado parcial de {clip_id}", flush=True)
+                try:
+                    _record_clip_publication(
+                        found.get("clips_json_path"),
                         clip_id,
-                        plat,
-                        {"id": pub_id, "url": url, "em": now_ts},
+                        {"plataforma": plat, "id": pub_id, "privacidade": priv, **({"url": url} if url else {})},
                     )
                 except Exception as exc:
                     safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
-                    print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({safe_err})", flush=True)
-            link_or_id = url or pub_id
-            reply = _sanitize_text(f"[{plat}] ok: {link_or_id}", secrets)
-            finish("ok", resultado, reply)
+                    print(f"[publicacao] falha ao atualizar clips.json de {clip_id} ({safe_err})", flush=True)
+                if reg is not None:
+                    try:
+                        reg.registrar_publicacao(
+                            clip_id,
+                            plat,
+                            {"id": pub_id, "url": url, "em": now_ts},
+                        )
+                    except Exception as exc:
+                        safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+                        print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({safe_err})", flush=True)
+                link_or_id = url or pub_id
+                reply = _sanitize_text(f"[{plat}] ok: {link_or_id}", secrets)
+                finish("ok", resultado, reply)
+            finally:
+                if tmp_dl is not None:
+                    tmp_dl.unlink(missing_ok=True)
+
+        except Exception as exc:
+            if type(exc).__module__.split(".")[0] in ("pymongo", "mongomock"):
+                raise
+            safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
+            print(f"[publicacao] falha inesperada em {req_id} ({safe_err})", flush=True)
+            finish("erro", {**partial, "erro": safe_err}, f"[{plat}] erro: {safe_err}")
         finally:
-            if tmp_dl is not None:
-                tmp_dl.unlink(missing_ok=True)
+            if quota_reserved and not quota_consumed and quota_db is not None:
+                try:
+                    _release_quota(plat, now_ts, db=quota_db)  # upload falhou sem publicar: devolve a vaga
+                except Exception as exc:
+                    print(f"[publicacao] falha ao estornar cota ({type(exc).__name__})", flush=True)
 
     return outcomes

@@ -13,26 +13,22 @@ import shutil
 import ssl
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
+from . import config
+from .executor_publicacao import PublishLoop
 from .ingest import BOT_AUTHORS, _compact_chat_rows, js_runtime_args, probe_duration, probe_metadata, sanitize_id
-from .janelas import filter_emitted, owns, window_end
-from .notificar import (
-    _format_clip_discord_message,
-    _policy_status_text,
-    _write_json_atomic,
-    notify_discord,
-)
+from .notificar import notify_discord
 
 MAX_CHANNELS = 80
 HELIX_MIN_INTERVAL_S = 60.0
@@ -49,6 +45,8 @@ BASELINE_S = 180
 BASELINE_SKIP_S = 15
 CHAT_KEEP_S = 400.0  # pre-roll 180s + post-roll 120s + margin
 SEGMENT_S = 10
+SEGMENT_GAP_TOLERANCE_S = SEGMENT_S / 2  # segments cut on keyframes: spacing may exceed SEGMENT_S a bit
+LOG_MAX_BYTES = 5_000_000  # recorder stderr log per channel, rotated to .log.1 past this
 BUFFER_S = 480
 PRE_ROLL_S = 180
 POST_ROLL_MIN_S = 60
@@ -369,7 +367,8 @@ def streamlink_cmd(channel: str) -> list[str]:
 
 def ytdlp_live_cmd(url: str) -> list[str]:
     return [
-        "yt-dlp", "-q", "--no-part", "-f", "b[height<=1080]/b",
+        "yt-dlp", "-q", "--no-progress", "--no-part", "-f", "b[height<=1080]/b",
+        "--retries", "infinite", "--fragment-retries", "infinite", "--socket-timeout", "30",
         "--hls-use-mpegts", *js_runtime_args(), "-o", "-", url,
     ]
 
@@ -389,6 +388,7 @@ class _Recording:
     seg_dir: Path
     procs: list[Any]
     on_demand: bool
+    log: Any = None  # handle do log de stderr do canal (fechado no _stop)
 
     def alive(self) -> bool:
         return all(proc.poll() is None for proc in self.procs)
@@ -414,56 +414,105 @@ class RollingRecorderPool:
         self.source_cmd = source_cmd
         self.recordings: dict[str, _Recording] = {}
         self.holds: dict[str, float] = {}  # channel -> oldest timestamp cleanup must keep
+        self._gate = threading.Lock()  # serializa start x freeze (liberar roda em outra thread)
+        self.frozen = False  # liberar: nenhum gravador novo depois do stop_all
 
     def _start(self, channel: str, on_demand: bool) -> None:
         if not (CHANNEL_RE.fullmatch(channel) or _YT_KEY_RE.fullmatch(channel)):
             raise ValueError(f"invalid channel name: {channel!r}")
         seg_dir = self.buf_root / channel
         seg_dir.mkdir(parents=True, exist_ok=True)
+        log = self._open_log(channel)
+        err = log if log is not None else subprocess.DEVNULL
         # own session: Ctrl+C on the monitor does not hit the recorders, _stop terminates them in order
-        source = self.popen(self.source_cmd(channel), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            start_new_session=True)
         try:
-            sink = self.popen(segment_cmd(seg_dir), stdin=source.stdout, stderr=subprocess.DEVNULL,
+            source = self.popen(self.source_cmd(channel), stdout=subprocess.PIPE, stderr=err,
+                                start_new_session=True)
+        except BaseException:
+            if log is not None:
+                log.close()
+            raise
+        try:
+            sink = self.popen(segment_cmd(seg_dir), stdin=source.stdout, stderr=err,
                               start_new_session=True)
         except BaseException:
             source.kill()
             source.wait()
-            shutil.rmtree(seg_dir, ignore_errors=True)
+            if log is not None:
+                log.close()
+            if not any(seg_dir.glob("*.ts")):  # keep the buffer of a restart that failed
+                shutil.rmtree(seg_dir, ignore_errors=True)
             raise
         finally:
             source.stdout.close()  # streamlink gets SIGPIPE if ffmpeg dies
-        self.recordings[channel] = _Recording(channel, seg_dir, [source, sink], on_demand)
+        self.recordings[channel] = _Recording(channel, seg_dir, [source, sink], on_demand, log)
+
+    def _open_log(self, channel: str):
+        """stderr log of the channel's source+ffmpeg (append; rotated to .log.1 past LOG_MAX_BYTES)."""
+        path = self.buf_root / f"{channel}.log"
+        try:
+            if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+                os.replace(path, path.with_name(path.name + ".1"))
+            return open(path, "ab")
+        except OSError as exc:
+            print(f"[monitor] log do gravador de {channel} indisponivel: {exc}", flush=True)
+            return None
 
     def _stop(self, channel: str, remove_buffer: bool) -> None:
-        rec = self.recordings.pop(channel)
-        for proc in rec.procs:  # streamlink first so ffmpeg sees EOF and closes the last segment
-            proc.terminate()
+        rec = self.recordings.pop(channel, None)
+        if rec is None:  # parado em paralelo (liberar na thread x tick_loop)
+            return
+        source, *rest = rec.procs
         for proc in rec.procs:
+            code = proc.poll()
+            if code is not None:
+                print(f"[monitor] gravador de {channel} tinha morrido (returncode={code})", flush=True)
+        # source first, wait for it, so ffmpeg sees EOF and closes the last segment
+        source.terminate()
+        try:
+            source.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            source.kill()
+            source.wait()  # reap: no zombie left behind
+        for proc in rest:
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()  # reap: no zombie left behind
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        if rec.log is not None:
+            try:
+                rec.log.close()
+            except OSError:
+                pass
         if remove_buffer:
             shutil.rmtree(rec.seg_dir, ignore_errors=True)
 
     def _try_start(self, channel: str, on_demand: bool) -> bool:
-        try:
-            self._start(channel, on_demand)
-        except (OSError, ValueError) as exc:  # streamlink/ffmpeg missing, bad name
-            print(f"[monitor] recorder for {channel} failed to start: {exc}", flush=True)
-            return False
-        return True
+        with self._gate:
+            if self.frozen:
+                return False
+            try:
+                self._start(channel, on_demand)
+            except (OSError, ValueError) as exc:  # streamlink/ffmpeg missing, bad name
+                print(f"[monitor] recorder for {channel} failed to start: {exc}", flush=True)
+                return False
+            return True
 
     def set_hot(self, ranked_channels: list[str]) -> None:
         """Keep recorders only for the `max_hot` most active channels; drop (and delete) the rest.
 
         Hot channels with an in-flight capture (hold) keep their slot whatever their rank.
         """
-        held = [c for c, r in self.recordings.items() if not r.on_demand and c in self.holds]
+        if self.frozen:
+            return
+        held = [c for c, r in list(self.recordings.items()) if not r.on_demand and c in self.holds]
         wanted = (held + [c for c in ranked_channels if c not in held])[: self.max_hot]
-        for channel in [c for c, r in self.recordings.items() if not r.on_demand and c not in wanted]:
+        for channel in [c for c, r in list(self.recordings.items()) if not r.on_demand and c not in wanted]:
             self._stop(channel, remove_buffer=True)
         for channel in wanted:
             rec = self.recordings.get(channel)
@@ -479,9 +528,18 @@ class RollingRecorderPool:
         """True when `channel` is being recorded (already, or via the free on-demand slot)."""
         if channel in self.recordings:
             return True
-        if sum(1 for r in self.recordings.values() if r.on_demand) >= self.max_on_demand:
+        if sum(1 for r in list(self.recordings.values()) if r.on_demand) >= self.max_on_demand:
             return False
         return self._try_start(channel, on_demand=True)
+
+    def restart_on_demand(self, channel: str) -> bool:
+        """Restart the channel's recorder keeping its buffer and slot kind; True when it is recording again."""
+        rec = self.recordings.get(channel)
+        if rec is None:
+            return self.start_on_demand(channel)
+        on_demand = rec.on_demand
+        self._stop(channel, remove_buffer=False)
+        return self._try_start(channel, on_demand=on_demand)
 
     def release_on_demand(self, channel: str) -> None:
         rec = self.recordings.get(channel)
@@ -496,6 +554,12 @@ class RollingRecorderPool:
         for channel in list(self.recordings):
             self._stop(channel, remove_buffer=True)
 
+    def freeze(self) -> None:
+        """Para tudo e impede novos gravadores (tick_loop/capturas em voo nao religam durante o liberar)."""
+        with self._gate:
+            self.frozen = True
+        self.stop_all()  # fora do lock: nao trava o event loop; _start em curso ja registrou em recordings
+
     def stop_channel(self, channel: str) -> None:
         self.release_hold(channel)
         if channel in self.recordings:
@@ -509,7 +573,7 @@ class RollingRecorderPool:
     def cleanup(self, now: float | None = None) -> None:
         """Delete segments older than the buffer, except those held for an in-flight job."""
         now = time.time() if now is None else now
-        for channel in {c for c in self.recordings} | set(self.holds):
+        for channel in set(list(self.recordings)) | set(list(self.holds)):
             hold_from = self.holds.get(channel)
             for start, path in self.segments(channel):
                 if hold_from is not None and start + SEGMENT_S > hold_from:
@@ -549,6 +613,16 @@ class RollingRecorderPool:
         chosen = [(s, p) for s, p in self.segments(channel) if s + SEGMENT_S > start_ts and s <= end_ts]
         if not chosen:
             raise ValueError(f"no buffered segments for {channel} in [{start_ts}, {end_ts}]")
+        # a gap would shift the concat (video_start + t stops being absolute time): keep the latest continuous run
+        first = 0
+        for i in range(len(chosen) - 1, 0, -1):
+            if chosen[i][0] - chosen[i - 1][0] > SEGMENT_S + SEGMENT_GAP_TOLERANCE_S:
+                first = i
+                break
+        if first:
+            print(f"[monitor] {channel}: buraco no buffer, descartando {first} segmento(s) anteriores a "
+                  f"{chosen[first][0]}", flush=True)
+            chosen = chosen[first:]
         return chosen
 
     def video_start_ts(self, channel: str, start_ts: float, end_ts: float) -> float:
@@ -687,7 +761,10 @@ def _read_job(job_dir: Path) -> dict[str, Any]:
 
 def _write_job(job_dir: Path, job: dict[str, Any]) -> None:
     tmp = job_dir / "job.json.tmp"
-    tmp.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(job, ensure_ascii=False, indent=2))
+        fh.flush()
+        os.fsync(fh.fileno())  # o rename so e atomico/duravel se os dados ja estao no disco
     tmp.replace(job_dir / "job.json")
 
 
@@ -696,6 +773,7 @@ class DiskQueue:
 
     def __init__(self, queue_root: Path):
         self.root = queue_root
+        self.mutex = threading.RLock()  # worker, replay (reconexao) e recover mexem no mesmo job.json
         for state in QUEUE_STATES:
             (queue_root / state).mkdir(parents=True, exist_ok=True)
 
@@ -732,10 +810,11 @@ class DiskQueue:
                 self._move(job_dir, "rejected")
         for *_, job_dir in sorted(pending):
             try:
-                job = _read_job(job_dir)
-                job["status"] = "processing"
-                _write_job(job_dir, job)
-                return self._move(job_dir, "processing")
+                with self.mutex:
+                    job = _read_job(job_dir)
+                    job["status"] = "processing"
+                    _write_job(job_dir, job)
+                    return self._move(job_dir, "processing")
             except OSError:  # vanished meanwhile
                 continue
         return None
@@ -744,22 +823,46 @@ class DiskQueue:
         """Merge `manifest` into job.json and move the job to done/ or rejected/."""
         if status not in ("done", "rejected"):
             raise ValueError(f"invalid final status: {status}")
-        job = {**_read_job(job_dir), **manifest, "status": status}
-        _write_job(job_dir, job)
-        (job_dir / "source.mkv").unlink(missing_ok=True)  # ~200 MB per job: the clips live in out/, the source is not needed
-        return self._move(job_dir, status)
+        with self.mutex:
+            job = {**_read_job(job_dir), **manifest, "status": status}
+            _write_job(job_dir, job)
+            dst = self._move(job_dir, status)
+        # ~200 MB per job: the clips live in out/, the source is not needed. Only after the move, so a crash
+        # in between never leaves a final job without its source in processing/ (M-05)
+        (dst / "source.mkv").unlink(missing_ok=True)
+        return dst
+
+    def requeue(self, job_dir: Path) -> Path:
+        """Return a claimed job (processing/) to pending/ untouched (stop/liberar interrupted its pipeline)."""
+        with self.mutex:
+            job = _read_job(job_dir)
+            job["status"] = "pending"
+            _write_job(job_dir, job)
+            return self._move(job_dir, "pending")
 
     def recover_orphans(self) -> int:
-        """Put jobs left in processing/ by a crash back into pending/."""
+        """Put jobs left in processing/ by a crash back into pending/.
+
+        A job whose job.json already carries a final status (crash between the write and the move in
+        `complete`) just finishes the move to done//rejected/ instead of being reprocessed without a source.
+        """
         orphans = list((self.root / "processing").iterdir())
         for job_dir in orphans:
-            try:
-                job = _read_job(job_dir)
-                job["status"] = "pending"
-                _write_job(job_dir, job)
-            except (OSError, ValueError, TypeError):  # corrupt: claim_next will reject it
-                pass
-            self._move(job_dir, "pending")
+            target = "pending"
+            with self.mutex:
+                try:
+                    job = _read_job(job_dir)
+                    if job.get("status") in ("done", "rejected"):
+                        target = job["status"]
+                        job["coord_synced"] = False  # o finish_job pode nunca ter ido ao Mongo: replay sincroniza
+                    else:
+                        job["status"] = "pending"
+                    _write_job(job_dir, job)
+                except (OSError, ValueError, TypeError):  # corrupt: claim_next will reject it
+                    pass
+                dst = self._move(job_dir, target)
+            if target != "pending":
+                (dst / "source.mkv").unlink(missing_ok=True)
         return len(orphans)
 
     def index(self, state: str = "done") -> list[dict[str, Any]]:
@@ -779,7 +882,27 @@ def run_local_pipeline(job_dir: Path, out_root: Path) -> dict[str, Any]:
         ingested["result"] = ingest_local(job_dir, out_root, enable_chat)
         return ingested["result"]
 
-    args = cli.build_parser().parse_args([job_dir.name, "--out-dir", str(out_root)])
+    cli_args = [job_dir.name, "--out-dir", str(out_root)]
+    job_path = job_dir / "job.json"
+    if job_path.is_file():
+        try:
+            job_meta = _read_job(job_dir)
+        except (OSError, ValueError):
+            job_meta = {}
+        if isinstance(job_meta, dict):
+            # M-16: repassa max_dur/min_dur gravados no job.json (jobs antigos sem o campo usam o padrao do CLI)
+            for key, flag in (("max_dur", "--max-dur"), ("min_dur", "--min-dur")):
+                raw_dur = job_meta.get(key)
+                if raw_dur is None or isinstance(raw_dur, bool):
+                    continue
+                try:
+                    dur_val = float(raw_dur)
+                except (TypeError, ValueError):
+                    continue
+                if math.isfinite(dur_val) and dur_val > 0:
+                    cli_args.extend([flag, str(dur_val)])
+
+    args = cli.build_parser().parse_args(cli_args)
     original_ingest = cli.ingest
     cli.ingest = ingest_job
     try:
@@ -790,6 +913,58 @@ def run_local_pipeline(job_dir: Path, out_root: Path) -> dict[str, Any]:
         raise RuntimeError(f"pipeline exited with {exit_code}")
     out_dir = ingested["result"].out_dir
     return {**json.loads((out_dir / "clips.json").read_text(encoding="utf-8")), "output_dir": str(out_dir)}
+
+
+def replay_unsynced_jobs(
+    queue: DiskQueue,
+    coord: Any,
+    *,
+    skip_lives: "set[str] | frozenset[str] | tuple[str, ...]" = (),
+    out_root: Path | None = None,
+    live_remap: "dict[str, str] | None" = None,
+) -> int:
+    """Envia ao Mongo os jobs locais com `coord_synced=False` (criados com o Mongo fora do ar). Devolve quantos.
+
+    Idempotente: `add_job` ignora duplicado; jobs ja finais (done/rejected) tem o status final sincronizado via
+    start_job + finish_job (no-op se o Mongo ja os terminou). Marca `coord_synced=True`/`live_id`/`mongo_job_id` no
+    job.json ao conseguir. Jobs de lives em `skip_lives` (lease perdida) ficam como estao. Erro de Mongo SOBE para o
+    chamador (que marca offline e tenta de novo na proxima reconexao). Jobs em processing/ ficam para o worker,
+    que marca `coord_synced=False` se nao conseguir sincronizar o status final. `live_remap` troca o live_id de
+    fallback (`twitch:<canal>`) pelo id real depois do claim. Cada job e lido, enviado e gravado sob `queue.mutex`
+    (o mesmo do `claim_next`), entao o worker nao move o job no meio do envio.
+    """
+    synced = 0
+    remap = live_remap or {}
+    for state in ("pending", "done", "rejected"):
+        for job_dir in sorted((queue.root / state).iterdir()):
+            with queue.mutex:
+                try:
+                    job = _read_job(job_dir)
+                except (OSError, ValueError, TypeError):
+                    continue
+                if job.get("coord_synced") is not False:
+                    continue
+                channel = job.get("channel") or ""
+                old_live = job.get("live_id") or f"twitch:{channel}"
+                live_id = remap.get(old_live, old_live)
+                if live_id in skip_lives or old_live in skip_lives:
+                    continue
+                w_end = int(job.get("window_end") or job.get("created_at") or 0)
+                w_start = int(job.get("window_start") or (w_end - PRE_ROLL_S))
+                mongo_job_id = job.get("mongo_job_id")
+                if not mongo_job_id or live_id != old_live:
+                    mongo_job_id = f"{live_id}:{w_end}"
+                coord.add_job(mongo_job_id, live_id, (w_start, w_end), float(job.get("z_score") or 0.0))
+                if state != "pending" and coord.start_job(mongo_job_id):
+                    result = {"clips": job.get("clips"), "score": job.get("score"),
+                              "output_dir": _rel_output_dir(job.get("output_dir"), out_root) if out_root else job.get("output_dir")}
+                    if job.get("reject_reason"):
+                        result["reject_reason"] = job["reject_reason"]
+                    coord.finish_job(mongo_job_id, state, result)
+                job.update(live_id=live_id, mongo_job_id=mongo_job_id, coord_synced=True)
+                _write_job(job_dir, job)
+                synced += 1
+    return synced
 
 
 MONGO_RECONNECT_S = 60.0
@@ -832,16 +1007,37 @@ def _rel_output_dir(output_dir: str | Path | None, out_root: Path) -> str | None
         return str(output_dir)
 
 
+def _effective_lease_s(beat_s: float | None = None) -> float:
+    """CLIPES_LEASE_S garantindo lease >= 3 * beat (um beat perdido nao pode soltar a live)."""
+    beat = max(1.0, config.env_float("CLIPES_BEAT_S", 20.0, min_value=1.0) if beat_s is None else float(beat_s))
+    lease_s = config.env_float("CLIPES_LEASE_S", 90.0, min_value=1e-9)
+    if lease_s < 3 * beat:
+        print(f"[fila] CLIPES_LEASE_S={lease_s:g} < 3*beat ({beat:g}s); usando {3 * beat:g}s", flush=True)
+        return 3 * beat
+    return lease_s
+
+
 class _CoordSession:
     """Optional MongoDB coordination wrapper with lazy import and 60s fallback retry."""
 
-    def __init__(self, out_root: Path, *, coord: Any | None = None, now: Callable[[], float] = time.time):
+    def __init__(
+        self,
+        out_root: Path,
+        *,
+        coord: Any | None = None,
+        now: Callable[[], float] = time.time,
+        beat_s: float | None = None,
+        on_connect: Callable[[Any], Any] | None = None,
+    ):
         self.out_root = out_root
         self.uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
         self.coord = coord
         self.now = now
+        self.beat_s = beat_s
+        self.on_connect = on_connect  # roda a cada (re)conexao com o Coord (ex.: replay de jobs sem sync)
         self.configured = coord is not None or self.uri is not None
         self.online = False
+        self.released_expired = False
         self.next_retry = 0.0
 
     @property
@@ -859,9 +1055,15 @@ class _CoordSession:
 
                 client = pymongo.MongoClient(self.uri, maxPoolSize=5, serverSelectionTimeoutMS=5000)
                 db = client.get_default_database(default="clipes_lives")
-                lease_s = float(os.environ.get("CLIPES_LEASE_S", "90"))
+                lease_s = _effective_lease_s(self.beat_s)
                 self.coord = Coord(db, get_worker_id(self.out_root), now=self.now, lease_s=lease_s)
             self.coord.ensure_indexes()
+            if not self.released_expired:
+                # so na inicializacao: numa reconexao posterior as lives ativas deste PC (owned_lives) nao podem ser soltas
+                self.coord.release_expired_own()  # sobras de crash (lease vencida) nao contam no max_lives
+                self.released_expired = True
+            if self.on_connect is not None:
+                self.on_connect(self.coord)
         except Exception as exc:
             if _is_mongo_error(exc) or isinstance(exc, OSError):
                 self.mark_offline(exc)
@@ -905,6 +1107,19 @@ def _notify_discord_job(
     )
 
 
+def _flag_if_unsynced(job_dir: Path, unsynced: bool, queue: DiskQueue) -> None:
+    """Job final cujo status nao chegou ao Mongo: coord_synced=False para o replay da proxima conexao."""
+    if not unsynced:
+        return
+    try:
+        with queue.mutex:
+            job = _read_job(job_dir)
+            job["coord_synced"] = False
+            _write_job(job_dir, job)
+    except (OSError, ValueError, TypeError):
+        pass
+
+
 def run_worker_step(
     queue: DiskQueue,
     out_root: Path,
@@ -918,18 +1133,29 @@ def run_worker_step(
     discord_client: Any | None = None,
     discord_channel_id: str | None = None,
     preview_fn: Callable[..., Path | None] | None = None,
+    cancel: threading.Event | None = None,
 ) -> bool:
-    """Process one pending job end to end (never publishes). False when the queue is empty."""
+    """Process one pending job end to end (never publishes). False when the queue is empty.
+
+    `cancel` (liberar/shutdown): if the pipeline fails while it is set, the job goes back to pending/ and
+    nothing is marked rejected/failed (M-04).
+    """
     job_dir = queue.claim_next()
     if job_dir is None:
         return False
     job = _read_job(job_dir)
+    if cancel is not None and cancel.is_set():  # nem gasta um attempt do start_job
+        queue.requeue(job_dir)
+        return True
     channel = job["channel"]
     mongo_job_id = job.get("mongo_job_id") or job["job_id"]
     live_id = job.get("live_id")
     use_coord = coord if (coord is not None and job.get("coord_synced") is not False) else None
 
+    unsynced = [coord is None and job.get("coord_synced") is True]  # processado sem Mongo: replay sobe depois
+
     def report_mongo_error(exc: BaseException) -> None:
+        unsynced[0] = True  # status final nao chegou ao Mongo: replay_unsynced_jobs tenta de novo
         if on_mongo_error is not None:
             on_mongo_error(exc)
         else:
@@ -945,7 +1171,8 @@ def run_worker_step(
                 if not _is_mongo_error(exc):
                     raise
                 report_mongo_error(exc)
-        queue.complete(job_dir, "rejected", {"reject_reason": "blocked_by_policy"})
+        blocked_dir = queue.complete(job_dir, "rejected", {"reject_reason": "blocked_by_policy"})
+        _flag_if_unsynced(blocked_dir, unsynced[0], queue)
         return True
 
     if use_coord is not None:
@@ -961,13 +1188,20 @@ def run_worker_step(
                 queue.complete(job_dir, "rejected", {"reject_reason": "coord_denied"})
                 return True
 
+    if cancel is not None and cancel.is_set():  # liberar/encerramento chegou durante o start_job: nem comeca
+        queue.requeue(job_dir)
+        return True
     started = time.perf_counter()
     if on_job_active is not None:
         on_job_active(mongo_job_id)
     try:
         result = pipeline(job_dir, out_root)
     except Exception as exc:  # a broken job must not stop the worker
-        queue.complete(job_dir, "rejected", {
+        if cancel is not None and cancel.is_set():
+            queue.requeue(job_dir)  # interrupted on purpose (children killed): not the job's fault
+            print(f"[fila] job {mongo_job_id} devolvido a pending (interrompido)", flush=True)
+            return True
+        failed_dir = queue.complete(job_dir, "rejected", {
             "reject_reason": "pipeline_error",
             "error": f"{type(exc).__name__}: {exc}"[-500:],
             "worker_s": round(time.perf_counter() - started, 2),
@@ -979,6 +1213,7 @@ def run_worker_step(
                 if not _is_mongo_error(mexc):
                     raise
                 report_mongo_error(mexc)
+        _flag_if_unsynced(failed_dir, unsynced[0], queue)
         return True
     finally:
         if on_job_active is not None:
@@ -1002,6 +1237,7 @@ def run_worker_step(
             if not _is_mongo_error(mexc):
                 raise
             report_mongo_error(mexc)
+    _flag_if_unsynced(completed_dir, unsynced[0] and not (lost_lives and live_id in lost_lives), queue)
     if final_status == "done":
         _notify_discord_job(
             completed_dir,
@@ -1139,14 +1375,35 @@ def follow_live(
 
 # --- main loop and `python -m clipes monitor` entrypoint ------------------------------------------
 
-BUFFER_CAP_BYTES = 1_500_000_000  # global ceiling for queue/.buffer
+def buffer_cap_bytes() -> int:
+    """Global ceiling for queue/.buffer: CLIPES_BUFFER_CAP_GB (default 1.5; invalid -> default)."""
+    raw = os.environ.get("CLIPES_BUFFER_CAP_GB", "").strip()
+    if raw:
+        try:
+            gb = float(raw)
+            if gb > 0 and gb != float("inf"):
+                return int(gb * 1_000_000_000)
+        except ValueError:
+            pass
+        print(f"[monitor] CLIPES_BUFFER_CAP_GB invalido ({raw!r}); usando 1.5", flush=True)
+    return 1_500_000_000
+
+
+BUFFER_CAP_BYTES = buffer_cap_bytes()
 RANK_INTERVAL_S = 10.0
 WORKER_IDLE_S = 5.0
+REPLAY_EVERY_BEATS = 5  # a cada N beats, reenvia jobs com coord_synced=False
+WORKER_JOIN_S = 60.0  # espera maxima pela thread do worker no encerramento
 
 
 def _lock_worker(queue_root: Path):
     """Exclusive flock on queue_root/.worker.lock: a second monitor on the same queue fails fast."""
-    import fcntl
+    from .registro import FCNTL_AUSENTE_MSG
+
+    try:
+        import fcntl
+    except ImportError:
+        raise RuntimeError(FCNTL_AUSENTE_MSG) from None
 
     lock = open(queue_root / ".worker.lock", "w")
     try:
@@ -1256,6 +1513,11 @@ async def run_monitor(
     claiming_tasks: dict[str, asyncio.Task[bool]] = {}
     claim_retry_at: dict[str, float] = {}
     lost_lives: set[str] = set()
+    reserving: dict[str, None] = {}  # canais com claim em andamento, em ordem de chegada: ocupam vaga do max_lives (M-02)
+    unleased: set[str] = set()  # canais gravando sem lease (Mongo fora do ar): reclamam ao reconectar (M-01)
+    cancel = threading.Event()  # liberar/encerramento: o job em andamento volta a pending em vez de rejected (M-04)
+    worker_busy = threading.Lock()  # preso pela thread do worker enquanto roda um job
+    publish_loop: PublishLoop | None = None
 
     def on_join(channel: str, t: float) -> None:
         detector = detectors.get(channel)
@@ -1267,11 +1529,15 @@ async def run_monitor(
         if detector is not None:
             detector.record_message(t, author, text)
 
+    def _replay_skip() -> set[str]:
+        """Lives cujos jobs nao devem subir ao Mongo: perdidas ou com o claim ainda nao decidido."""
+        return {*lost_lives, *(f"twitch:{c}" for c in unleased)}
+
     queue = pool = lock = coord_session = None
     cap_getter = capacity_fn
     max_lives_getter = max_lives_fn
     worker_alias = alias or os.environ.get("CLIPES_ALIAS", "").strip()
-    beat_interval = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20") if beat_s is None else beat_s))
+    beat_interval = max(1.0, config.env_float("CLIPES_BEAT_S", 20.0, min_value=1.0) if beat_s is None else float(beat_s))
     child_killer = kill_children or _terminate_child_processes
     current_job: list[str | None] = [None]
     if not dry_run:
@@ -1283,7 +1549,10 @@ async def run_monitor(
         staging.mkdir(exist_ok=True)
         shutil.rmtree(queue_root / ".buffer", ignore_errors=True)  # segments of a previous run are stale
         pool = RollingRecorderPool(queue_root / ".buffer", max_hot=max(0, min(max_recorders, 3)), popen=popen)
-        coord_session = _CoordSession(out_root, coord=coord, now=now)
+        coord_session = _CoordSession(
+            out_root, coord=coord, now=now, beat_s=beat_interval,
+            on_connect=lambda c: replay_unsynced_jobs(queue, c, skip_lives=_replay_skip(), out_root=out_root),
+        )
         if coord_session.configured:
             if cap_getter is None:
                 from .capacidade import capacity as cap_getter
@@ -1293,6 +1562,11 @@ async def run_monitor(
                 from .capacidade import worker_id as get_worker_id
                 worker_alias = get_worker_id(out_root)
             coord_session.connect()
+
+    def over_limit(channel: str, ml: int) -> bool:
+        """True se `channel` nao cabe no max_lives: lives donas + reservas que chegaram antes dele."""
+        ahead = list(reserving).index(channel) if channel in reserving else len(reserving)
+        return len(owned_lives) + ahead >= ml
 
     def _current_limits() -> tuple[dict[str, Any], int]:
         cap = cap_getter(out_root) if cap_getter is not None else {"cpus": 1, "score": 1}
@@ -1309,14 +1583,17 @@ async def run_monitor(
                 return True
             if channel in owned_lives:
                 return True
+            reserving[channel] = None  # reserva ANTES do primeiro await: o tick_loop e as outras tasks ja a enxergam
             cap, ml = await _current_limits_async()
-            if len(owned_lives) >= ml:
+            if over_limit(channel, ml):
                 print(f"[live] nao acompanhada {channel}: limite max_lives={ml}", flush=True)
+                unleased.discard(channel)
                 return False
             sid = await asyncio.to_thread(_resolve_stream_id, channel, stream_ids, probe)
             if not sid:
                 print(f"[live] nao acompanhada {channel}: stream_id indisponivel", flush=True)
                 claim_retry_at[channel] = now() + 30.0
+                unleased.discard(channel)
                 return False
             live_id = f"twitch:{channel}:{sid}"
             try:
@@ -1327,18 +1604,21 @@ async def run_monitor(
                 if not _is_mongo_error(exc):
                     raise
                 coord_session.mark_offline(exc)
+                unleased.add(channel)
                 return True
             await _wait_claim(30.0 / max(1.0, float(cap.get("score") or 1)), now=now, sleep=sleep, stop=stop)
             if stop.is_set():
                 return False
             active_coord = coord_session.active
             if active_coord is None:
+                unleased.add(channel)
                 return True
             _, ml = await _current_limits_async()
             if channel in owned_lives:
                 return True
-            if len(owned_lives) >= ml:
+            if over_limit(channel, ml):
                 print(f"[live] nao acompanhada {channel}: limite max_lives={ml}", flush=True)
+                unleased.discard(channel)
                 return False
             try:
                 claimed = await asyncio.to_thread(active_coord.claim_live, live_id)
@@ -1346,15 +1626,34 @@ async def run_monitor(
                 if not _is_mongo_error(exc):
                     raise
                 coord_session.mark_offline(exc)
+                unleased.add(channel)
                 return True
             if claimed:
                 owned_lives[channel] = live_id
                 lost_lives.discard(live_id)
+                # claim aceito: o id de fallback deixa de ser pulado pelo replay (e passa a mapear para o id real)
+                was_unleased = channel in unleased or f"twitch:{channel}" in lost_lives
+                lost_lives.discard(f"twitch:{channel}")
+                unleased.discard(channel)
+                if was_unleased and queue is not None:  # jobs gravados sem lease passam a pertencer a esta live
+                    try:
+                        await asyncio.to_thread(
+                            replay_unsynced_jobs, queue, active_coord, skip_lives=_replay_skip(),
+                            out_root=out_root, live_remap={f"twitch:{channel}": live_id},
+                        )
+                    except Exception as exc:
+                        if not _is_mongo_error(exc) or coord_session is None:
+                            raise
+                        coord_session.mark_offline(exc)
                 return True
             print(f"[live] nao acompanhada {channel}: lease com outro PC", flush=True)
+            if channel in unleased:  # gravava sem lease e outro PC e o dono: para de gravar e nao sobe os jobs dele
+                unleased.discard(channel)
+                lost_lives.update((f"twitch:{channel}", live_id))  # id de fallback e id real: o replay pula os dois
             claim_retry_at[channel] = now() + 30.0
             return False
         finally:
+            reserving.pop(channel, None)
             claiming_tasks.pop(channel, None)
 
     async def ensure_claimed(channel: str) -> bool:
@@ -1399,12 +1698,12 @@ async def run_monitor(
                             if not _is_mongo_error(exc):
                                 raise
                             coord_session.mark_offline(exc)
-                            job["coord_synced"] = False
+                            job.update(live_id=live_id, mongo_job_id=mongo_job_id, coord_synced=False)
                         else:
                             job.update(live_id=live_id, mongo_job_id=mongo_job_id, coord_synced=True)
                         _write_job(job_dir, job)
                     elif job.get("status") != "rejected":
-                        job["coord_synced"] = False
+                        job.update(live_id=live_id, coord_synced=False)  # replay_unsynced_jobs sobe quando der
                         _write_job(job_dir, job)
                 print(f"[monitor] queued {queue.enqueue(job_dir)}", flush=True)
         except Exception as exc:  # one failed capture must not stop the monitor
@@ -1415,6 +1714,9 @@ async def run_monitor(
     async def tick_loop() -> None:
         last_rank = float("-inf")
         while not stop.is_set():
+            if cancel.is_set():  # liberar em curso: nao religa gravadores nem abre capturas
+                await sleep(1.0)
+                continue
             t = now()
             if coord_session is not None and coord_session.configured and not coord_session.online and t >= coord_session.next_retry:
                 await asyncio.to_thread(coord_session.maybe_reconnect)
@@ -1436,14 +1738,23 @@ async def run_monitor(
                 if coord_session is not None and coord_session.active is not None:
                     _, ml = await _current_limits_async()
                     for c in active:
-                        if (c not in owned_lives and c not in claiming_tasks
-                                and len(owned_lives) < ml and t >= claim_retry_at.get(c, 0.0)):
+                        if c in owned_lives or c in claiming_tasks or t < claim_retry_at.get(c, 0.0):
+                            continue
+                        if len(owned_lives) + len(reserving) < ml:
                             task = asyncio.create_task(ensure_claimed(c))
                             captures.add(task)
                             task.add_done_callback(captures.discard)
-                    hot_targets = [c for c in active if c in owned_lives]
+                        else:
+                            unleased.discard(c)  # sem vaga: nao grava sem lease
+                    # canais que gravavam sem lease seguem quentes enquanto o claim pos-reconexao decide;
+                    # se for negado (outro PC dono) saem de `unleased` e deixam de gravar
+                    hot_targets = [c for c in active if c in owned_lives or c in unleased]
                 else:
                     hot_targets = active
+                    if coord_session is not None and coord_session.configured:
+                        unleased.update(c for c in active if c not in owned_lives)
+                if cancel.is_set():  # liberar chegou durante os awaits acima
+                    continue
                 pool.set_hot(hot_targets)
                 if coord_session is not None and coord_session.active is not None:
                     for c in list(owned_lives):
@@ -1460,21 +1771,72 @@ async def run_monitor(
                 last_rank = t
             await sleep(1.0)
 
-    async def worker_loop() -> None:
-        while not stop.is_set():
-            active_coord = coord_session.active if coord_session is not None else None
-            on_err = coord_session.mark_offline if coord_session is not None else None
-            if not await asyncio.to_thread(
-                run_worker_step, queue, out_root, policy, pipeline,
+    def worker_step_sync(active_coord: Any, on_err: Callable[[BaseException], None] | None) -> bool:
+        with worker_busy:  # o finally de run_monitor so solta o lock da fila depois deste job terminar
+            return run_worker_step(
+                queue, out_root, policy, pipeline,
                 coord=active_coord, on_mongo_error=on_err, lost_lives=lost_lives,
                 on_job_active=lambda jid: current_job.__setitem__(0, jid),
                 discord_client=discord_client, discord_channel_id=discord_channel_id,
-                preview_fn=preview_fn,
-            ):
+                preview_fn=preview_fn, cancel=cancel,
+            )
+
+    async def worker_loop() -> None:
+        while not stop.is_set():
+            if cancel.is_set():
+                # liberar em curso: nao processa mais jobs, mas a task NAO termina (terminar encerraria o
+                # run_monitor normalmente e engoliria o SystemExit(75) que o heartbeat esta prestes a levantar)
                 await sleep(WORKER_IDLE_S)
+                continue
+            active_coord = coord_session.active if coord_session is not None else None
+            on_err = coord_session.mark_offline if coord_session is not None else None
+            if not await asyncio.to_thread(worker_step_sync, active_coord, on_err):
+                await sleep(WORKER_IDLE_S)
+
+    def liberar() -> None:
+        """Comando `liberar` do painel: cancela o job em andamento (volta a pending), para gravadores e filhos."""
+        cancel.set()
+        if pool is not None:
+            pool.freeze()
+        child_killer()
+
+    def publish_once() -> None:
+        """Uma rodada de publicacao (thread propria do PublishLoop, fora do heartbeat: C-02)."""
+        active_coord = coord_session.active if coord_session is not None else None
+        if active_coord is None:
+            return
+        runner = run_pending_fn
+        if runner is None:
+            from . import publicacao
+
+            runner = publicacao.run_pending
+        discord_post = (
+            (lambda tid, msg: discord_client.post(tid, msg))
+            if discord_client is not None
+            else None
+        )
+        try:
+            runner(
+                active_coord,
+                active_coord.worker_id,
+                out_root=out_root,
+                now=now,
+                policy=policy,
+                discord_post=discord_post,
+            )
+        except Exception as exc:
+            if _is_mongo_error(exc):
+                coord_session.mark_offline(exc)
+            else:
+                uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
+                print(f"[publicar] erro na publicacao ({_sanitize_error(exc, uri)})", flush=True)
+
+    if not dry_run and coord_session is not None and coord_session.configured:
+        publish_loop = PublishLoop(publish_once, 0, name="publicacao")  # sem timer: o heartbeat dispara run_now()
 
     async def heartbeat_loop() -> None:
         last_beat = float("-inf")
+        beats_done = 0
         while not stop.is_set():
             t = now()
             active_coord = coord_session.active if coord_session is not None else None
@@ -1484,56 +1846,37 @@ async def run_monitor(
                 razao = _read_perfil_razao(out_root, cap.get("cpus"))
                 try:
                     await asyncio.to_thread(
-                        active_coord.beat, worker_alias, cap, current_job[0], ml, razao
+                        active_coord.beat, worker_alias, cap, current_job[0], ml, razao, beat_s=beat_interval
                     )
                     for ch, live_id in list(owned_lives.items()):
                         ok = await asyncio.to_thread(active_coord.renew, live_id)
                         if not ok:
                             print(f"[fila] lease perdida {live_id}", flush=True)
                             owned_lives.pop(ch, None)
+                            unleased.discard(ch)  # lease perdida: nao religa o gravador como "sem lease"
                             lost_lives.add(live_id)
                             if pool is not None:
                                 pool.stop_channel(ch)
-                    cmd = await asyncio.to_thread(active_coord.pending_command)
+                    beats_done += 1
+                    if queue is not None and beats_done % REPLAY_EVERY_BEATS == 0:
+                        # job que terminou sem sincronizar com o Mongo online nao espera a proxima reconexao
+                        await asyncio.to_thread(
+                            replay_unsynced_jobs, queue, active_coord, skip_lives=_replay_skip(), out_root=out_root
+                        )
+                    action = await asyncio.to_thread(active_coord.run_pending_command, liberar)
                 except Exception as exc:
                     if not _is_mongo_error(exc):
                         raise
                     coord_session.mark_offline(exc)
+                    if cancel.is_set():  # liberar ja cancelou tudo: nao vira processo zumbi so porque o "feito" falhou
+                        print("[comando] liberar recursos (Mongo caiu ao marcar feito)", flush=True)
+                        raise SystemExit(75)
                 else:
-                    if cmd and cmd.get("acao") == "liberar":
-                        await asyncio.to_thread(active_coord.mark_command, cmd["_id"], "executando")
-                        if pool is not None:
-                            pool.stop_all()
-                        await asyncio.to_thread(child_killer)
-                        await asyncio.to_thread(active_coord.mark_command, cmd["_id"], "feito")
+                    if action == "liberar":
                         print("[comando] liberar recursos", flush=True)
                         raise SystemExit(75)
-                    runner = run_pending_fn
-                    if runner is None:
-                        from . import publicacao
-
-                        runner = publicacao.run_pending
-                    discord_post = (
-                        (lambda tid, msg: discord_client.post(tid, msg))
-                        if discord_client is not None
-                        else None
-                    )
-                    try:
-                        await asyncio.to_thread(
-                            runner,
-                            active_coord,
-                            active_coord.worker_id,
-                            out_root=out_root,
-                            now=now,
-                            policy=policy,
-                            discord_post=discord_post,
-                        )
-                    except Exception as exc:
-                        if _is_mongo_error(exc):
-                            coord_session.mark_offline(exc)
-                        else:
-                            uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
-                            print(f"[publicar] erro no heartbeat ({_sanitize_error(exc, uri)})", flush=True)
+                    if publish_loop is not None:
+                        publish_loop.run_now()  # nao bloqueia: upload longo nao atrasa o renew
             wait_rem = beat_interval if active_coord is None else max(1.0, beat_interval - (now() - last_beat))
             await sleep(max(1.0, wait_rem))
 
@@ -1551,12 +1894,15 @@ async def run_monitor(
             task.result()  # re-raise a crashed loop
     finally:
         stop.set()
+        cancel.set()  # um pipeline que falhe daqui em diante volta a pending em vez de rejected
         pending = [*tasks, stopper, *captures, *claiming_tasks.values()]
         for task in pending:
             task.cancel()
         await asyncio.gather(*pending, return_exceptions=True)
         if pool is not None:
             pool.stop_all()
+        if publish_loop is not None:
+            publish_loop.stop(timeout=10.0)
         if coord_session is not None and coord_session.active is not None:
             for live_id in list(owned_lives.values()):
                 try:
@@ -1564,7 +1910,12 @@ async def run_monitor(
                 except Exception:
                     pass
         if lock is not None:
-            lock.close()
+            # a thread do worker pode ainda estar num job (ASR em processo): so solta o lock depois dela
+            if await asyncio.to_thread(worker_busy.acquire, True, WORKER_JOIN_S):
+                worker_busy.release()
+                lock.close()
+            else:
+                print(f"[monitor] worker ainda ocupado apos {WORKER_JOIN_S:g}s; lock da fila mantido", flush=True)
 
 
 def _connect_coord_for_follow(out_root: Path) -> Any | None:
@@ -1583,7 +1934,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Vigia chats da Twitch, grava picos em buffer rolante e enfileira jobs (sem publicar).",
     )
     p.add_argument("--channels-file", type=Path, default=Path("channels.txt"), help="1 canal por linha")
-    p.add_argument("--policy-file", type=Path, default=None, help="Padrão: policy.json ao lado de --channels-file")
+    p.add_argument("--policy-file", type=Path, default=None, help="Padrão: CLIPES_POLICY_FILE, senão <OUT_DIR>/policy.json (legado ao lado do channels.txt/cwd só se o padrão não existir)")
     p.add_argument("--game-id", default=None, help="Filtro de categoria do Helix (só com TWITCH_CLIENT_ID/SECRET no env)")
     p.add_argument("--max-recorders", type=int, default=3, help="Canais quentes gravando (máx. 3, + 1 sob demanda)")
     p.add_argument("--out-dir", default=None, help="Padrão: OUT_DIR ou ./out")
@@ -1592,8 +1943,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--follow", default=None, help="Acompanha um único canal em janelas contínuas até acabar")
     args = p.parse_args(argv)
 
-    out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
-    policy = load_policy(args.policy_file or args.channels_file.with_name("policy.json"))
+    out_root = config.resolve_out_dir(args.out_dir)
+    policy = load_policy(args.policy_file or config.resolve_policy_path(out_root, legacy=args.channels_file.with_name("policy.json")))
     queue_root = args.queue_dir.expanduser().resolve() if args.queue_dir else None
     if args.follow is not None:
         channel = _live_channel(args.follow)

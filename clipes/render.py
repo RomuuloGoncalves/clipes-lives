@@ -11,6 +11,7 @@ import unicodedata
 from pathlib import Path
 from typing import Any
 
+from . import config
 from .ingest import js_runtime_args
 from .models import SnappedClip, Word
 
@@ -54,6 +55,9 @@ class _SplitStyle:
     hook_on_cam: bool
 
 
+# B-14: estilo/geometria do caminho de render por filter_complex (render_clip/preview, via _SPLIT_STYLES).
+# Diverge de layout.VARIANTES (name_y, etc.) de proposito: layout.py e a tabela do recorte split_layout (cam/jogo);
+# unificar mudaria o visual dos clipes, por isso as duas tabelas ficam separadas (adiado).
 _SPLIT_STYLES: dict[str, _SplitStyle] = {
     "split-cheio": _SplitStyle(
         bar_bg="",
@@ -157,11 +161,9 @@ class BarConfig:
 
 def bar_config() -> BarConfig | None:
     """Read brand bar configuration from env; returns None when disabled."""
-    raw_bar = os.environ.get("CLIPES_BAR", "").strip().lower()
     raw_name = os.environ.get("CLIPES_BRAND_NAME", "").strip()
-    if raw_bar in ("0", "false", "no", "off"):
-        return None
-    if not (raw_bar in ("1", "true", "yes", "on") or bool(raw_name)):
+    # tri-estado: CLIPES_BAR explicito manda; vazio/invalido cai em "ligada so se houver CLIPES_BRAND_NAME"
+    if not config.env_flag("CLIPES_BAR", bool(raw_name)):
         return None
 
     handle = f"@{raw_name}" if raw_name and not raw_name.startswith("@") else raw_name
@@ -323,8 +325,7 @@ def _ass_escape(text: str) -> str:
 
 def is_hook_top_enabled() -> bool:
     """Top hook overlay is enabled by default unless CLIPES_HOOK_TOP is '0', 'false', 'no', or 'off'."""
-    val = os.environ.get("CLIPES_HOOK_TOP", "1").strip().lower()
-    return val not in ("0", "false", "no", "off")
+    return config.env_flag("CLIPES_HOOK_TOP", True)
 
 
 def _truncate_ellipsis(text: str, max_chars: int) -> str:
@@ -707,7 +708,7 @@ def download_clip_window(
         ],
         [
             "yt-dlp", "--no-playlist", "--socket-timeout", "30",
-            "--download-sections", section,
+            "--download-sections", section, "--force-keyframes-at-cuts",
             "-f", "b[height<=1080]/best",
             "-o", tmpl,
             *js_runtime_args(),
@@ -721,7 +722,19 @@ def download_clip_window(
             time.sleep(2.0 * i)
             for leftover in tmp_dir.glob(f"seg_{idx:02d}.*"):
                 leftover.unlink(missing_ok=True)
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        except subprocess.TimeoutExpired as exc:
+            # Limpa sobras da tentativa que deu timeout antes de seguir para a proxima
+            for leftover in tmp_dir.glob(f"seg_{idx:02d}.*"):
+                leftover.unlink(missing_ok=True)
+            stderr_raw = exc.stderr or exc.output or ""
+            if isinstance(stderr_raw, bytes):
+                stderr_txt = stderr_raw.decode("utf-8", errors="replace").strip()
+            else:
+                stderr_txt = str(stderr_raw).strip()
+            last_err = f"timeout ({exc.timeout}s): {stderr_txt}" if stderr_txt else f"timeout ({exc.timeout}s)"
+            continue
         files = [p for p in tmp_dir.glob(f"seg_{idx:02d}.*") if not p.name.endswith(".part")]
         if res.returncode == 0 and files:
             return files[0]
@@ -736,8 +749,7 @@ def _escape_ffmpeg_filter_path(path: Path) -> str:
 
 def is_blur_bg_enabled() -> bool:
     """Blurred background only when CLIPES_BLUR_BG is explicitly enabled ('1', 'true', 'yes', 'on'). Default: black bars."""
-    val = os.environ.get("CLIPES_BLUR_BG", "0").strip().lower()
-    return val in ("1", "true", "yes", "on")
+    return config.env_flag("CLIPES_BLUR_BG", False)
 
 
 def _circular_logo_filter(size: int = 150) -> str:

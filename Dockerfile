@@ -8,7 +8,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     XDG_CACHE_HOME=/cache \
     HF_HOME=/cache/huggingface \
     HF_HUB_CACHE=/opt/models/hf \
-    CLIPES_LLM_GGUF=/opt/models/llm/Qwen3-1.7B-Q4_K_M.gguf \
+    CLIPES_LLM_GGUF=/opt/models/llm/atual.gguf \
     CLIPES_EMBED_ONNX=/opt/models/embed/onnx/model_quint8_avx2.onnx \
     CLIPES_YUNET_ONNX=/opt/models/yunet/face_detection_yunet_2023mar.onnx \
     PATH=/opt/llama:$PATH \
@@ -42,7 +42,7 @@ RUN pip install --upgrade pip && pip install \
 # ASR: whisper small (padrao) + large-v3-turbo (opcional, CLIPES_WHISPER_MODEL=large-v3-turbo)
 RUN python3 -c "from faster_whisper import download_model as d; [d(m, cache_dir='/opt/models/hf') for m in ('small','large-v3-turbo')]"
 
-# LLM local (Apache-2.0) + llama.cpp (binario CPU). WITH_LLM_4B=1 adiciona o Qwen3-4B-Instruct-2507 (qualidade maior, ~4.5 GB de RAM).
+# LLM local (Apache-2.0) + llama.cpp (binario CPU). WITH_LLM_4B=1 baixa e ativa o Qwen3-4B-Instruct-2507 (qualidade maior, ~4.5 GB de RAM).
 ARG WITH_LLM_4B=0
 RUN python3 -c "\
 import platform, urllib.request, tarfile, io, os; \
@@ -52,8 +52,11 @@ data = urllib.request.urlopen(f'https://github.com/ggml-org/llama.cpp/releases/d
 os.makedirs('/opt/llama', exist_ok=True); \
 t = tarfile.open(fileobj=io.BytesIO(data)); \
 [setattr(m, 'name', m.name.split('/', 1)[-1]) for m in t.getmembers()]; t.extractall('/opt/llama'); \
-h('unsloth/Qwen3-1.7B-GGUF', 'Qwen3-1.7B-Q4_K_M.gguf', local_dir='/opt/models/llm'); \
-os.environ.get('WITH_LLM_4B') == '1' and h('unsloth/Qwen3-4B-Instruct-2507-GGUF', 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', local_dir='/opt/models/llm')"
+alvo = h('unsloth/Qwen3-1.7B-GGUF', 'Qwen3-1.7B-Q4_K_M.gguf', local_dir='/opt/models/llm'); \
+alvo = h('unsloth/Qwen3-4B-Instruct-2507-GGUF', 'Qwen3-4B-Instruct-2507-Q4_K_M.gguf', local_dir='/opt/models/llm') if os.environ.get('WITH_LLM_4B') == '1' else alvo; \
+link = '/opt/models/llm/atual.gguf'; \
+os.path.lexists(link) and os.unlink(link); \
+os.symlink(alvo, link)"
 
 # Embeddings (segmentacao de assunto, ONNX int8, Apache-2.0) e detector de rosto YuNet (reenquadramento vertical)
 RUN python3 -c "\

@@ -52,6 +52,8 @@ class Variante:
         return CANVAS_H - self.bar_h - self.cam_h
 
 
+# B-14: tabela usada pelo calculo de recorte (split_layout/alturas). render._SPLIT_STYLES guarda a geometria de
+# texto/barra do filter_complex e tem valores proprios (name_y etc.); nao unificadas para nao mudar o visual (adiado).
 VARIANTES: dict[str, Variante] = {
     "split-cheio": Variante(
         name="split-cheio",

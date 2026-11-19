@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from . import cloud_llm
+from . import cloud_llm, config
 from .asr import transcribe_candidates, transcribe_fast_blocks
 from .candidates import pick_candidate_peaks, pick_quota_candidates
 from .eval import evaluate_clips
@@ -257,7 +257,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
         print("Erro: --min-per-hour >= 0 e --asr-budget-ratio em (0.05, 1.0].", file=sys.stderr)
         return 2
 
-    out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
+    out_root = config.resolve_out_dir(args.out_dir)
     cloud_llm.set_out_dir(out_root)
     if getattr(args, "ate_acabar", False):
         meta = probe_metadata(args.url)
@@ -587,9 +587,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
 def _notify_cli_discord(args: argparse.Namespace) -> None:
     from .publicacao import _resolve_policy
 
-    out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
-    policy_file = (os.environ.get("CLIPES_POLICY_FILE") or "").strip() or None
-    policy = _resolve_policy(None, policy_file, out_root)
+    out_root = config.resolve_out_dir(args.out_dir)
+    policy = _resolve_policy(None, None, out_root)
     notify_discord(Path(args.output_dir), policy=policy)
 
 

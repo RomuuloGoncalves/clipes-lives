@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import os
 import stat
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -298,7 +298,9 @@ def test_quota_full_marks_adiado_without_calling_api(tmp_path: Path, monkeypatch
     res2 = request(store, "live2_c01", ALLOWED_USER, T0 + 5, out_root=tmp_path, tokens_path=tokens_path, quota_path=quota_path)
     assert "cota diaria atingida (youtube)" in res2
     doc2 = db.publish_requests.find_one({"_id": "live2_c01:youtube"})
-    assert doc2["status"] == "adiado"
+    # onda 3: nao cria mais `adiado` terminal; fica pending no proximo dia de cota
+    assert doc2["status"] == "pending"
+    assert doc2["agendar_para"] > datetime.fromtimestamp(T0 + 5, timezone.utc).replace(tzinfo=None)
     assert len(api_calls) == 1
 
 
@@ -566,7 +568,6 @@ def test_run_pending_default_refresh_uses_oauth_without_injected_refreshers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     """B1: real _default_refresh -> oauth.refresh_google / refresh_tiktok -> urlopen path."""
-    import io
     import urllib.parse
     import urllib.request
 
@@ -964,20 +965,20 @@ def test_run_pending_without_injected_publishers_refreshes_on_401_and_succeeds(
     yt_refresh_calls = 0
     tt_refresh_calls = 0
 
-    def fake_refresh_google(refresh_tok: str, tokens_path: Path | None = None) -> str:
+    def fake_refresh_google(refresh_tok: str, tokens_path: Path | None = None) -> dict[str, str]:
         nonlocal yt_refresh_calls
         yt_refresh_calls += 1
         assert refresh_tok == yt_refresh_token
-        return new_yt_token
+        return {"access_token": new_yt_token}
 
-    def fake_refresh_tiktok(refresh_tok: str, tokens_path: Path | None = None) -> str:
+    def fake_refresh_tiktok(refresh_tok: str, tokens_path: Path | None = None) -> dict[str, str]:
         nonlocal tt_refresh_calls
         tt_refresh_calls += 1
         assert refresh_tok == tt_refresh_token
-        return new_tt_token
+        return {"access_token": new_tt_token}
 
-    monkeypatch.setattr(oauth, "refresh_google", fake_refresh_google)
-    monkeypatch.setattr(oauth, "refresh_tiktok", fake_refresh_tiktok)
+    monkeypatch.setattr(oauth, "refresh_google_tokens", fake_refresh_google)
+    monkeypatch.setattr(oauth, "refresh_tiktok_tokens", fake_refresh_tiktok)
     monkeypatch.setattr("clipes.publicar_youtube.probe_duration", lambda _: 45.0)
 
     class _FakeHttpResp:
