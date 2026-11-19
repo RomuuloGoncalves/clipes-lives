@@ -707,7 +707,7 @@ def download_clip_window(
         ],
         [
             "yt-dlp", "--no-playlist", "--socket-timeout", "30",
-            "--download-sections", section,
+            "--download-sections", section, "--force-keyframes-at-cuts",
             "-f", "b[height<=1080]/best",
             "-o", tmpl,
             *js_runtime_args(),
@@ -721,7 +721,19 @@ def download_clip_window(
             time.sleep(2.0 * i)
             for leftover in tmp_dir.glob(f"seg_{idx:02d}.*"):
                 leftover.unlink(missing_ok=True)
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=600, check=False)
+        except subprocess.TimeoutExpired as exc:
+            # Limpa sobras da tentativa que deu timeout antes de seguir para a proxima
+            for leftover in tmp_dir.glob(f"seg_{idx:02d}.*"):
+                leftover.unlink(missing_ok=True)
+            stderr_raw = exc.stderr or exc.output or ""
+            if isinstance(stderr_raw, bytes):
+                stderr_txt = stderr_raw.decode("utf-8", errors="replace").strip()
+            else:
+                stderr_txt = str(stderr_raw).strip()
+            last_err = f"timeout ({exc.timeout}s): {stderr_txt}" if stderr_txt else f"timeout ({exc.timeout}s)"
+            continue
         files = [p for p in tmp_dir.glob(f"seg_{idx:02d}.*") if not p.name.endswith(".part")]
         if res.returncode == 0 and files:
             return files[0]

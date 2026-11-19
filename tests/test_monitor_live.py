@@ -58,7 +58,7 @@ def run(tmp_path, monkeypatch, *, stop_after, pipeline, free_gb=100, jump=None):
     pool = FakePool(clock, B + stop_after)
     res = monitor.follow_live(
         "https://www.twitch.tv/Canal", tmp_path / "out", pool=pool, pipeline=pipeline(clock),
-        is_live=lambda u: True, now=clock.now, sleep=clock.sleep, min_free_gb=5,
+        is_live=lambda u: clock.t < B + stop_after, now=clock.now, sleep=clock.sleep, min_free_gb=5,
         disk_usage=lambda p: SimpleNamespace(free=free_gb * 1e9),
     )
     return res, tmp_path / "out" / "queue"
@@ -204,7 +204,7 @@ def test_follow_live_respects_policy_blocked_and_delay(tmp_path, monkeypatch):
 
     res = monitor.follow_live(
         "canal", tmp_path / "out", pool=pool, pipeline=pipe_one,
-        is_live=lambda u: True, now=clock.now, sleep=clock.sleep, min_free_gb=5,
+        is_live=lambda u: clock.t < B + 320, now=clock.now, sleep=clock.sleep, min_free_gb=5,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
         policy=monitor.ChannelPolicy(delay_h={"canal": 6.0}),
     )

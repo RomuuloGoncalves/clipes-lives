@@ -28,6 +28,22 @@ from .perfil import max_lives as perfil_max_lives
 _YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,32}")
 _YT_HANDLE_RE = re.compile(r"@([A-Za-z0-9_.-]{1,64})")
 
+RECORDER_RESTART_BASE_S = 5.0
+RECORDER_RESTART_MAX_S = 60.0
+LIVE_CAPTURA_MORTA_S = 900.0
+
+
+def _captura_morta_s() -> float:
+    raw = os.environ.get("CLIPES_LIVE_CAPTURA_MORTA_S", "").strip()
+    if not raw:
+        return LIVE_CAPTURA_MORTA_S
+    try:
+        val = float(raw)
+    except ValueError:
+        print(f"[live] CLIPES_LIVE_CAPTURA_MORTA_S invalido ({raw!r}); usando {LIVE_CAPTURA_MORTA_S:g}s", flush=True)
+        return LIVE_CAPTURA_MORTA_S
+    return val if val > 0 else LIVE_CAPTURA_MORTA_S
+
 
 @dataclass
 class Alvo:
@@ -235,6 +251,7 @@ class LiveSession:
         pending_stream_id: str | None = None,
         has_coord: bool = False,
         on_backlog_lost: Callable[[Alvo, str], None] | None = None,
+        captura_morta_s: float | None = None,
     ) -> None:
         self.alvo = alvo
         self.key = alvo.chave
@@ -255,6 +272,7 @@ class LiveSession:
         self.pending_stream_id = pending_stream_id
         self.has_coord = has_coord
         self.on_backlog_lost = on_backlog_lost
+        self.captura_morta_s = _captura_morta_s() if captura_morta_s is None else float(captura_morta_s)
         self.emitted_path = out_root / f".emitted_{sanitize_id(self.key)}.json"
         self.jobs: list[str] = []
         self.t0 = 0.0
@@ -263,6 +281,10 @@ class LiveSession:
         self.live_ok = True
         self.since: dict[str, float] = {}
         self.live_ended = False
+        self._restart_attempts = 0
+        self._next_restart_at = float("-inf")
+        self._restart_newest: float | None = None
+        self._last_window_seg: int | None = None
         self._lease_lost_event = threading.Event()
 
     @property
@@ -280,10 +302,16 @@ class LiveSession:
         if not self.pool.start_on_demand(self.key):
             raise RuntimeError(f"nao foi possivel gravar {self.key}")
         self.t0 = self.now()
+        self.pool.hold(self.key, self.t0)
         self.next_e = window_end(self.t0, self.step) + self.step
         self.last_check = self.t0 - monitor.LIVE_IS_LIVE_EVERY_S
         self.live_ok = True
         self.since = {}
+        self.live_ended = False
+        self._restart_attempts = 0
+        self._next_restart_at = float("-inf")
+        self._restart_newest = None
+        self._last_window_seg = None
 
     def pending(self) -> list[Path]:
         found = []
@@ -374,14 +402,17 @@ class LiveSession:
                     if not monitor._is_mongo_error(exc):
                         raise
                     self.on_mongo_error(exc)
-                    job["coord_synced"] = False
+                    job.update(live_id=self.live_id, mongo_job_id=mongo_job_id, coord_synced=False)
                 else:
                     if not added:
                         shutil.rmtree(job_dir, ignore_errors=True)
                         return
                     job.update(live_id=self.live_id, mongo_job_id=mongo_job_id, coord_synced=True)
-            elif self.has_coord:
+            elif self.has_coord and job["status"] != "rejected":
                 job["coord_synced"] = False
+                lid = self.live_id or self.pending_live_id
+                if lid is not None:
+                    job.update(live_id=lid, mongo_job_id=f"{lid}:{int(e)}")
 
             if self.lease_lost:
                 shutil.rmtree(job_dir, ignore_errors=True)
@@ -440,9 +471,36 @@ class LiveSession:
 
         segs = self.pool.segments(self.key)
         newest = segs[-1][0] + monitor.SEGMENT_S if segs else self.t0
+        exited = not self.pool.is_recording(self.key)
+
+        if not exited:
+            # So zera o backoff quando aparecer segmento novo apos o restart
+            if self._restart_newest is not None and newest > self._restart_newest:
+                self._restart_attempts = 0
+                self._next_restart_at = float("-inf")
+                self._restart_newest = None
+        elif self.live_ok and t >= self._next_restart_at:
+            restart_fn = getattr(self.pool, "restart_on_demand", None)
+            if callable(restart_fn):
+                if self._restart_newest is not None and newest > self._restart_newest:
+                    self._restart_attempts = 0
+                delay = min(RECORDER_RESTART_MAX_S, RECORDER_RESTART_BASE_S * (2 ** self._restart_attempts))
+                self._restart_attempts += 1
+                self._next_restart_at = t + delay
+                self._restart_newest = newest
+                restarted = bool(restart_fn(self.key))
+                print(
+                    f"[live] gravador {self.key} caiu com live ativa; reinicio {'ok' if restarted else 'falhou'} "
+                    f"(tentativa {self._restart_attempts}, proximo backoff {delay:g}s)",
+                    flush=True,
+                )
+
+        # Mantem o sinal 'captura' ligado (preservando a 1a queda) enquanto houver restart sem segmento novo
+        awaiting_new_seg = self._restart_newest is not None and newest <= self._restart_newest
+        silent = t - newest >= monitor.LIVE_NO_SEGMENT_S
+        captura_falha = exited or silent or awaiting_new_seg
         signals = {
-            "exited": not self.pool.is_recording(self.key),
-            "silent": t - newest >= monitor.LIVE_NO_SEGMENT_S,
+            "captura": captura_falha,
             "offline": not self.live_ok,
         }
         for k, v in signals.items():
@@ -450,17 +508,42 @@ class LiveSession:
                 self.since.setdefault(k, t)
             else:
                 self.since.pop(k, None)
-        if len(self.since) >= 2 or any(t - v >= monitor.LIVE_END_PERSIST_S for v in self.since.values()):
+
+        offline_since = self.since.get("offline")
+        captura_since = self.since.get("captura")
+        # Fim confirmado pela plataforma (is_live=False): offline + captura ou offline persistindo
+        if offline_since is not None and (
+            captura_since is not None or t - offline_since >= monitor.LIVE_END_PERSIST_S
+        ):
             self.live_ended = True
+            return False
+        # Saida de seguranca: captura morta por muito tempo sem offline confirmado -> encerra sem live_ended
+        if captura_since is not None and t - captura_since >= self.captura_morta_s:
+            print(
+                f"[live] captura morta ha {t - captura_since:.0f}s sem confirmacao offline ({self.key}); "
+                "encerrando sem ended",
+                flush=True,
+            )
+            self.live_ended = False
             return False
 
         while t >= self.next_e:
             if self.lease_lost:
                 break
-            if self.disk_usage(self.out_root).free < self.min_free * 1e9:
+            last_seg = segs[-1][0] if segs else None
+            has_new_seg = last_seg is not None and (
+                self._last_window_seg is None or last_seg > self._last_window_seg
+            )
+            if captura_falha and not has_new_seg:
+                print(f"[live] janela pulada: captura sem segmento novo ({self.key})", flush=True)
+            elif self.disk_usage(self.out_root).free < self.min_free * 1e9:
                 print("[live] janela pulada: disco", flush=True)
             else:
                 self.fechar_janela(float(self.next_e), last=False)
+                if last_seg is not None:
+                    covered = min(last_seg, int(self.next_e))
+                    if self._last_window_seg is None or covered > self._last_window_seg:
+                        self._last_window_seg = covered
             self.next_e += self.step
         return True
 
@@ -567,6 +650,7 @@ class Supervisor:
         self._pending_lease_lost: set[str] = set()
         self._alvo_by_key: dict[str, Alvo] = {a.chave: a for a in self.alvos}
         self._mongo_offline_until = float("-inf")
+        self._need_replay = self.coord is not None
         self._current_job: list[str | None] = [None]
         self._jobs: list[str] = []
         self._last_refusal_reason: str | None = None
@@ -581,8 +665,49 @@ class Supervisor:
 
     def _on_mongo_err(self, exc: BaseException) -> None:
         self._mongo_offline_until = self.now() + monitor.MONGO_RECONNECT_S
+        self._need_replay = True
         uri = os.environ.get("CLIPES_MONGO_URI", "").strip() or None
         print(f"[fila] Mongo indisponivel ({monitor._sanitize_error(exc, uri)}); seguindo local", flush=True)
+
+    def _replay_unsynced(self, queue: monitor.DiskQueue, c_active: Any) -> None:
+        """Reenvia ao Mongo os jobs locais com coord_synced=False quando o Coord esta ativo (B-01)."""
+        if not self._need_replay:
+            return
+        with self._lock:
+            sessions = list(self._all_sessions.values())
+            active = set(self._active.values())
+            lost = set(self._lost_lives)
+        skip = set(lost)
+        remap: dict[str, str] = {}
+        has_unclaimed = False
+        for sess in sessions:
+            if sess.live_id is None:
+                if not sess.lease_lost and sess in active:
+                    has_unclaimed = True
+                if sess.pending_live_id:
+                    skip.add(sess.pending_live_id)
+                skip.add(f"twitch:{sess.alvo.canal}")
+            else:
+                remap[f"twitch:{sess.alvo.canal}"] = sess.live_id
+        fn = monitor.replay_unsynced_jobs
+        try:
+            params = inspect.signature(fn).parameters
+            has_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            kwargs: dict[str, Any] = {}
+            if has_kw or "skip_lives" in params:
+                kwargs["skip_lives"] = skip
+            if has_kw or "out_root" in params:
+                kwargs["out_root"] = self.out_root
+            if has_kw or "live_remap" in params:
+                kwargs["live_remap"] = remap
+            fn(queue, c_active, **kwargs)
+        except Exception as exc:
+            if not monitor._is_mongo_error(exc):
+                raise
+            self._on_mongo_err(exc)
+        else:
+            if not has_unclaimed:
+                self._need_replay = False
 
     def _cap(self) -> dict[str, Any]:
         if self.cap_fn is not None:
@@ -634,6 +759,7 @@ class Supervisor:
         if meta.get("id"):
             alvo.video_id = str(meta["id"])
             alvo.chave = f"yt_{alvo.video_id}"
+            alvo.url = f"https://www.youtube.com/watch?v={alvo.video_id}"
         if meta.get("channel_id"):
             alvo.channel_id = str(meta["channel_id"])
         handle = str(meta.get("uploader_id") or meta.get("channel") or "").strip().lstrip("@").lower()
@@ -872,6 +998,7 @@ class Supervisor:
             sess.live_id = lid
             sess.pending_live_id = None
             sess.pending_stream_id = None
+            self._need_replay = True
             return True
 
         self._handle_lease_lost(key, sess, pool, msg=f"[fila] lease perdida {lid} (negada apos reconexao)")
@@ -994,6 +1121,8 @@ class Supervisor:
                 is_live_fn = self.is_live_arg or (lambda u: bool(probe_fn(u).get("is_live")))
 
                 if pool is None:
+                    shutil.rmtree(queue.root / ".buffer", ignore_errors=True)  # sobras de execucao anterior (B-25)
+
                     def _source_cmd(key: str) -> list[str]:
                         alvo = self._alvo_by_key.get(key)
                         if alvo is not None and alvo.plataforma == "youtube":
@@ -1030,6 +1159,10 @@ class Supervisor:
                             if not monitor._is_mongo_error(exc):
                                 raise
                             self._on_mongo_err(exc)
+                    # B-01: sincroniza jobs locais pendentes de execucao anterior / offline
+                    c_init = self._coord_active()
+                    if c_init is not None:
+                        self._replay_unsynced(queue, c_init)
 
                 # A-03: keepalive continuo durante todo o run() (beat + renew das sessoes ativas)
                 if self.coord is not None:
@@ -1156,6 +1289,10 @@ class Supervisor:
                                 print("[comando] liberar recursos", flush=True)
                                 raise SystemExit(75)
 
+                    c_replay = self._coord_active()
+                    if c_replay is not None and self._need_replay:
+                        self._replay_unsynced(queue, c_replay)
+
                     for key, sess in list(self._active.items()):
                         try:
                             ended = not sess.tick(t)
@@ -1207,6 +1344,10 @@ class Supervisor:
                 while self._has_own_pending(queue, skip_lost=True):
                     if not self._process_one(queue, pipeline_fn, skip_lost=True):
                         break
+
+                c_end = self._coord_active()
+                if c_end is not None and self._need_replay:
+                    self._replay_unsynced(queue, c_end)
 
                 all_jobs: list[str] = []
                 for sess in self._all_sessions.values():

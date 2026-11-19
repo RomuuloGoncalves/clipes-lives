@@ -48,6 +48,8 @@ class FakeProc:
         self.returncode = -15
 
     def wait(self, timeout=None):
+        if self.returncode is None:
+            self.returncode = 0  # exits by itself (ffmpeg closes on EOF once the source is gone)
         return self.returncode
 
     def kill(self):
@@ -1055,7 +1057,7 @@ def test_follow_live_dois_pcs_um_grava_e_respeita_job_existente(tmp_path, monkey
     assert coord1.claim_live("twitch:canal:801") is True
     res2 = monitor.follow_live(
         "canal", tmp_path / "out2", pool=pool2, coord=coord2, stream_id="801",
-        is_live=lambda _: True, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+        is_live=lambda _: clock() < B + 620, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
         capacity_fn=lambda _: {"cpus": 6, "score": 30},
     )
     assert res2 == {"status": "not_claimed", "jobs": []}
@@ -1066,7 +1068,7 @@ def test_follow_live_dois_pcs_um_grava_e_respeita_job_existente(tmp_path, monkey
     res1 = monitor.follow_live(
         "canal", tmp_path / "out1", pool=pool1, coord=coord1, stream_id="801",
         pipeline=lambda d, o: (processed_jobs.append(d.name), {"clips": []})[1],
-        is_live=lambda _: True, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
+        is_live=lambda _: clock() < B + 620, now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
         capacity_fn=lambda _: {"cpus": 6, "score": 30},
     )
     assert res1["status"] == "ended"
@@ -1218,7 +1220,7 @@ def test_follow_live_failover_dono_cai_segundo_worker_reivindica_sem_recriar_job
     res_b = monitor.follow_live(
         "canal", tmp_path / "out-b", pool=PoolB(),
         pipeline=lambda d, o: (b_jobs.append(d.name), {"clips": []})[1],
-        coord=coord_b, stream_id="999", is_live=lambda _: True,
+        coord=coord_b, stream_id="999", is_live=lambda _: clock() < B + 620,
         now=clock, sleep=lambda d: setattr(clock, "t", clock.t + d),
         capacity_fn=lambda _: {"cpus": 6, "score": 30},
     )

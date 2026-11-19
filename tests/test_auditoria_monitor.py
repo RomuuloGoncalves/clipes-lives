@@ -100,6 +100,7 @@ def test_heartbeat_segue_batendo_enquanto_o_upload_esta_travado(tmp_path):
     coord.beat = spy_beat
     started, release = threading.Event(), threading.Event()
     pending_calls: list[int] = []
+    calls_while_blocked: list[int] = []
 
     def slow_run_pending(*args, **kwargs):
         pending_calls.append(1)
@@ -123,6 +124,7 @@ def test_heartbeat_segue_batendo_enquanto_o_upload_esta_travado(tmp_path):
                 break
             await asyncio.sleep(0.002)
         blocked_during_beats = started.is_set() and not release.is_set()
+        calls_while_blocked.append(len(pending_calls))  # antes de soltar: depois disso o heartbeat pode abrir outra rodada
         release.set()
         stop.set()
         await task
@@ -130,7 +132,7 @@ def test_heartbeat_segue_batendo_enquanto_o_upload_esta_travado(tmp_path):
 
     assert asyncio.run(driver()) is True
     assert len(beats) >= 4  # antes: 1 beat e o heartbeat ficava preso no run_pending
-    assert len(pending_calls) == 1  # trava "ja rodando": rodadas seguintes nao empilharam
+    assert calls_while_blocked == [1]  # trava "ja rodando": rodadas seguintes nao empilharam
     assert set(beats) == {20.0}  # beat_s vai para o doc do worker
     assert db.workers.find_one({"_id": "w-c02"})["beat_s"] == 20.0
 
@@ -770,3 +772,40 @@ def test_publish_loop_run_now_nao_inicia_rodada_depois_de_stop():
         t.join()
     assert len(runs) == after_stop  # nenhuma thread de rodada nasceu depois de stop() retornar
     assert after_stop >= 1
+
+
+def test_liberar_lento_ainda_sai_com_75_mesmo_com_o_worker_cancelado(tmp_path):
+    """liberar liga o cancel; a task do worker nao pode terminar sozinha e encerrar o monitor com codigo 0."""
+    clock = Clock()
+
+    class SlowLiberarCoord:
+        worker_id = "w-slow"
+
+        def ensure_indexes(self):
+            pass
+
+        def release_expired_own(self):
+            return 0
+
+        def beat(self, *args, **kwargs):
+            pass
+
+        def renew(self, live_id):
+            return True
+
+        def run_pending_command(self, liberar):
+            liberar()
+            time.sleep(0.3)  # o comando demora a ser marcado `feito`; o worker ja viu o cancel
+            return "liberar"
+
+    async def irc(channels, on_message, stop):
+        while not stop.is_set():
+            await clock.sleep(1)
+
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(monitor.run_monitor(
+            ["canal"], tmp_path / "out", monitor.ChannelPolicy(), queue_root=tmp_path / "q",
+            irc=irc, popen=FakePopen(), pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+            coord=SlowLiberarCoord(), capacity_fn=lambda _: CAP, kill_children=lambda: None,
+        ))
+    assert exc.value.code == 75

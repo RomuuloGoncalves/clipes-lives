@@ -67,7 +67,7 @@ def test_a03_keepalive_renova_durante_is_live_e_fechar_janela_e_para_no_finally(
                 time.sleep(0.18)
             finally:
                 phase[0] = "idle"
-        return True
+        return clock.t < B + 320
 
     class SlowConcatPool(FakeMultiPool):
         def __init__(self, *args, **kwargs):
@@ -135,7 +135,7 @@ def test_a03_beat_s_do_env_e_gravado_no_documento_workers(tmp_path, monkeypatch)
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
         stream_id="302",
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -223,7 +223,7 @@ def test_a02_live_orfa_vencida_e_liberada_no_start_e_nao_bloqueia_max_lives(tmp_
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
         stream_id="2",
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -299,7 +299,7 @@ def test_a02_erro_mongo_em_release_expired_own_e_fake_coord_minimo(tmp_path, mon
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
         stream_id="10",
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -344,7 +344,7 @@ def test_a02_erro_mongo_em_release_expired_own_e_fake_coord_minimo(tmp_path, mon
         pipeline=lambda d, o: {"clips": []},
         coord=MinimalCoord(),
         stream_id="11",
-        is_live=lambda u: True,
+        is_live=lambda u: clock2.t < B + 320,
         now=clock2.now,
         sleep=clock2.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -386,7 +386,7 @@ def test_m01_claim_falha_por_mongo_reivindica_ao_reconectar(tmp_path, monkeypatc
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
         stream_id="501",
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -561,7 +561,7 @@ def test_m03_comando_liberar_expirado_e_ignorado_e_marcado_expirado(tmp_path, mo
         pipeline=lambda d, o: {"clips": []},
         coord=coord,
         stream_id="9",
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -638,7 +638,7 @@ def test_m07_nao_processa_jobs_alheios_nem_picos_do_monitor(tmp_path, monkeypatc
         queue_root=queue_root,
         pool=pool,
         pipeline=fake_pipe,
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 320,
         now=clock.now,
         sleep=clock.sleep,
         disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
@@ -781,7 +781,7 @@ def test_m07_a03_multi_live_com_uma_lease_perdida_nao_processa_pending_da_perdid
         pool=pool,
         pipeline=fake_pipe,
         coord=coord,
-        is_live=lambda u: True,
+        is_live=lambda u: clock.t < B + 620,
         probe=lambda u: {"id": "1" if "a_ativa" in u else "2", "is_live": True},
         now=clock.now,
         sleep=clock.sleep,

@@ -51,6 +51,8 @@ BASELINE_S = 180
 BASELINE_SKIP_S = 15
 CHAT_KEEP_S = 400.0  # pre-roll 180s + post-roll 120s + margin
 SEGMENT_S = 10
+SEGMENT_GAP_TOLERANCE_S = SEGMENT_S / 2  # segments cut on keyframes: spacing may exceed SEGMENT_S a bit
+LOG_MAX_BYTES = 5_000_000  # recorder stderr log per channel, rotated to .log.1 past this
 BUFFER_S = 480
 PRE_ROLL_S = 180
 POST_ROLL_MIN_S = 60
@@ -371,7 +373,8 @@ def streamlink_cmd(channel: str) -> list[str]:
 
 def ytdlp_live_cmd(url: str) -> list[str]:
     return [
-        "yt-dlp", "-q", "--no-part", "-f", "b[height<=1080]/b",
+        "yt-dlp", "-q", "--no-progress", "--no-part", "-f", "b[height<=1080]/b",
+        "--retries", "infinite", "--fragment-retries", "infinite", "--socket-timeout", "30",
         "--hls-use-mpegts", *js_runtime_args(), "-o", "-", url,
     ]
 
@@ -391,6 +394,7 @@ class _Recording:
     seg_dir: Path
     procs: list[Any]
     on_demand: bool
+    log: Any = None  # handle do log de stderr do canal (fechado no _stop)
 
     def alive(self) -> bool:
         return all(proc.poll() is None for proc in self.procs)
@@ -422,31 +426,71 @@ class RollingRecorderPool:
             raise ValueError(f"invalid channel name: {channel!r}")
         seg_dir = self.buf_root / channel
         seg_dir.mkdir(parents=True, exist_ok=True)
+        log = self._open_log(channel)
+        err = log if log is not None else subprocess.DEVNULL
         # own session: Ctrl+C on the monitor does not hit the recorders, _stop terminates them in order
-        source = self.popen(self.source_cmd(channel), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                            start_new_session=True)
         try:
-            sink = self.popen(segment_cmd(seg_dir), stdin=source.stdout, stderr=subprocess.DEVNULL,
+            source = self.popen(self.source_cmd(channel), stdout=subprocess.PIPE, stderr=err,
+                                start_new_session=True)
+        except BaseException:
+            if log is not None:
+                log.close()
+            raise
+        try:
+            sink = self.popen(segment_cmd(seg_dir), stdin=source.stdout, stderr=err,
                               start_new_session=True)
         except BaseException:
             source.kill()
             source.wait()
-            shutil.rmtree(seg_dir, ignore_errors=True)
+            if log is not None:
+                log.close()
+            if not any(seg_dir.glob("*.ts")):  # keep the buffer of a restart that failed
+                shutil.rmtree(seg_dir, ignore_errors=True)
             raise
         finally:
             source.stdout.close()  # streamlink gets SIGPIPE if ffmpeg dies
-        self.recordings[channel] = _Recording(channel, seg_dir, [source, sink], on_demand)
+        self.recordings[channel] = _Recording(channel, seg_dir, [source, sink], on_demand, log)
+
+    def _open_log(self, channel: str):
+        """stderr log of the channel's source+ffmpeg (append; rotated to .log.1 past LOG_MAX_BYTES)."""
+        path = self.buf_root / f"{channel}.log"
+        try:
+            if path.exists() and path.stat().st_size > LOG_MAX_BYTES:
+                os.replace(path, path.with_name(path.name + ".1"))
+            return open(path, "ab")
+        except OSError as exc:
+            print(f"[monitor] log do gravador de {channel} indisponivel: {exc}", flush=True)
+            return None
 
     def _stop(self, channel: str, remove_buffer: bool) -> None:
         rec = self.recordings.pop(channel)
-        for proc in rec.procs:  # streamlink first so ffmpeg sees EOF and closes the last segment
-            proc.terminate()
+        source, *rest = rec.procs
         for proc in rec.procs:
+            code = proc.poll()
+            if code is not None:
+                print(f"[monitor] gravador de {channel} tinha morrido (returncode={code})", flush=True)
+        # source first, wait for it, so ffmpeg sees EOF and closes the last segment
+        source.terminate()
+        try:
+            source.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            source.kill()
+            source.wait()  # reap: no zombie left behind
+        for proc in rest:
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()  # reap: no zombie left behind
+                proc.terminate()
+                try:
+                    proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+        if rec.log is not None:
+            try:
+                rec.log.close()
+            except OSError:
+                pass
         if remove_buffer:
             shutil.rmtree(rec.seg_dir, ignore_errors=True)
 
@@ -484,6 +528,15 @@ class RollingRecorderPool:
         if sum(1 for r in self.recordings.values() if r.on_demand) >= self.max_on_demand:
             return False
         return self._try_start(channel, on_demand=True)
+
+    def restart_on_demand(self, channel: str) -> bool:
+        """Restart the channel's recorder keeping its buffer and slot kind; True when it is recording again."""
+        rec = self.recordings.get(channel)
+        if rec is None:
+            return self.start_on_demand(channel)
+        on_demand = rec.on_demand
+        self._stop(channel, remove_buffer=False)
+        return self._try_start(channel, on_demand=on_demand)
 
     def release_on_demand(self, channel: str) -> None:
         rec = self.recordings.get(channel)
@@ -551,6 +604,16 @@ class RollingRecorderPool:
         chosen = [(s, p) for s, p in self.segments(channel) if s + SEGMENT_S > start_ts and s <= end_ts]
         if not chosen:
             raise ValueError(f"no buffered segments for {channel} in [{start_ts}, {end_ts}]")
+        # a gap would shift the concat (video_start + t stops being absolute time): keep the latest continuous run
+        first = 0
+        for i in range(len(chosen) - 1, 0, -1):
+            if chosen[i][0] - chosen[i - 1][0] > SEGMENT_S + SEGMENT_GAP_TOLERANCE_S:
+                first = i
+                break
+        if first:
+            print(f"[monitor] {channel}: buraco no buffer, descartando {first} segmento(s) anteriores a "
+                  f"{chosen[first][0]}", flush=True)
+            chosen = chosen[first:]
         return chosen
 
     def video_start_ts(self, channel: str, start_ts: float, end_ts: float) -> float:
@@ -1280,7 +1343,21 @@ def follow_live(
 
 # --- main loop and `python -m clipes monitor` entrypoint ------------------------------------------
 
-BUFFER_CAP_BYTES = 1_500_000_000  # global ceiling for queue/.buffer
+def buffer_cap_bytes() -> int:
+    """Global ceiling for queue/.buffer: CLIPES_BUFFER_CAP_GB (default 1.5; invalid -> default)."""
+    raw = os.environ.get("CLIPES_BUFFER_CAP_GB", "").strip()
+    if raw:
+        try:
+            gb = float(raw)
+            if gb > 0 and gb != float("inf"):
+                return int(gb * 1_000_000_000)
+        except ValueError:
+            pass
+        print(f"[monitor] CLIPES_BUFFER_CAP_GB invalido ({raw!r}); usando 1.5", flush=True)
+    return 1_500_000_000
+
+
+BUFFER_CAP_BYTES = buffer_cap_bytes()
 RANK_INTERVAL_S = 10.0
 WORKER_IDLE_S = 5.0
 WORKER_JOIN_S = 60.0  # espera maxima pela thread do worker no encerramento
@@ -1660,7 +1737,12 @@ async def run_monitor(
             )
 
     async def worker_loop() -> None:
-        while not stop.is_set() and not cancel.is_set():
+        while not stop.is_set():
+            if cancel.is_set():
+                # liberar em curso: nao processa mais jobs, mas a task NAO termina (terminar encerraria o
+                # run_monitor normalmente e engoliria o SystemExit(75) que o heartbeat esta prestes a levantar)
+                await sleep(WORKER_IDLE_S)
+                continue
             active_coord = coord_session.active if coord_session is not None else None
             on_err = coord_session.mark_offline if coord_session is not None else None
             if not await asyncio.to_thread(worker_step_sync, active_coord, on_err):
