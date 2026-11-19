@@ -809,3 +809,193 @@ def test_liberar_lento_ainda_sai_com_75_mesmo_com_o_worker_cancelado(tmp_path):
             coord=SlowLiberarCoord(), capacity_fn=lambda _: CAP, kill_children=lambda: None,
         ))
     assert exc.value.code == 75
+
+
+# ---- Re-revisao: fallback lost_lives, feito com erro de Mongo, stop tolerante, replay periodico ----
+
+
+def test_claim_aceito_depois_de_negado_libera_o_id_de_fallback_e_o_replay_sobe_o_job(tmp_path):
+    clock = Clock()
+    db = mongomock.MongoClient().db
+    flaky = FlakyCoord(Coord(db, "w-r3a", now=clock, lease_s=100_000), down=True)
+    other = Coord(db, "w-outro", now=clock, lease_s=100_000)
+    other.ensure_live("twitch:canal:123", channel="canal", platform="twitch")
+    assert other.claim_live("twitch:canal:123")
+    queue = monitor.DiskQueue(tmp_path / "q")
+    queue.enqueue(make_staged_job(tmp_path / "j1", channel="canal", peak=int(T0), z_score=9.0))  # fica rodando
+    j2 = make_staged_job(tmp_path / "j2", channel="canal", peak=int(T0) + 50, coord_synced=False,
+                         live_id="twitch:canal", window_end=int(T0) + 50)
+    job = json.loads((j2 / "job.json").read_text())
+    job["z_score"] = 1.0
+    (j2 / "job.json").write_text(json.dumps(job))
+    queue.enqueue(j2)
+    release = threading.Event()
+    target = f"twitch:canal:123:{int(T0) + 50}"
+
+    def pipeline(job_dir, out_root):
+        release.wait(30)
+        return {"clips": []}
+
+    async def irc(channels, on_message, stop):
+        i = 0
+        while not stop.is_set():
+            await clock.sleep(1)
+            if clock() >= T0 + 20:
+                i += 1
+                on_message("canal", clock(), f"u{i % 3}", "oi")
+
+    async def driver():
+        stop = asyncio.Event()
+        task = asyncio.create_task(monitor.run_monitor(
+            ["canal"], tmp_path / "out", monitor.ChannelPolicy(), queue_root=queue.root,
+            irc=irc, popen=FakePopen(), pipeline=pipeline, now=clock, sleep=clock.sleep, stop=stop,
+            coord=flaky, stream_ids={"canal": "123"}, capacity_fn=lambda _: CAP, max_lives_fn=lambda *_: 1,
+        ))
+        for _ in range(15000):
+            if clock() >= T0 + 70:
+                flaky.down = False  # volta e o claim e negado (outro PC e o dono)
+            if clock() >= T0 + 160:  # o outro PC solta a live: o proximo retry do claim vence
+                db.lives.update_one({"_id": "twitch:canal:123"}, {"$set": {"owner": None, "lease_until": None}})
+            if db.jobs.find_one({"_id": target}) or task.done():
+                break
+            await asyncio.sleep(0.002)
+        release.set()
+        stop.set()
+        await task
+
+    asyncio.run(driver())
+    doc = db.jobs.find_one({"_id": target})
+    assert doc is not None and doc["live_id"] == "twitch:canal:123"
+
+
+def test_liberar_com_erro_de_mongo_no_feito_ainda_sai_com_75(tmp_path):
+    clock = Clock()
+
+    class FeitoFalha:
+        worker_id = "w-r3b"
+
+        def ensure_indexes(self):
+            pass
+
+        def release_expired_own(self):
+            return 0
+
+        def beat(self, *args, **kwargs):
+            pass
+
+        def renew(self, live_id):
+            return True
+
+        def run_pending_command(self, liberar):
+            liberar()
+            raise ServerSelectionTimeoutError("caiu ao marcar feito")
+
+    async def irc(channels, on_message, stop):
+        while not stop.is_set():
+            await clock.sleep(1)
+
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(monitor.run_monitor(
+            ["canal"], tmp_path / "out", monitor.ChannelPolicy(), queue_root=tmp_path / "q",
+            irc=irc, popen=FakePopen(), pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+            coord=FeitoFalha(), capacity_fn=lambda _: CAP, kill_children=lambda: None,
+        ))
+    assert exc.value.code == 75
+
+
+def test_pool_stop_de_canal_ja_parado_nao_levanta(tmp_path):
+    pool = monitor.RollingRecorderPool(tmp_path / "buf", max_hot=1, popen=FakePopen())
+    pool._stop("inexistente", remove_buffer=True)  # antes: KeyError
+    pool.stop_channel("inexistente")
+
+
+def test_tick_loop_nao_religa_gravadores_durante_o_liberar(tmp_path):
+    clock = Clock()
+    db = mongomock.MongoClient().db
+    inner = Coord(db, "w-r3c", now=clock, lease_s=100_000)
+    popen = FakePopen()
+    seen: dict[str, int] = {}
+
+    class SlowLiberar(FlakyCoord):
+        def run_pending_command(self, liberar):
+            if not popen.pipelines():
+                return None
+            liberar()
+            seen["no_liberar"] = len(popen.pipelines())
+            time.sleep(0.4)  # o tick_loop roda varias vezes (relogio simulado) antes do SystemExit
+            seen["depois"] = len(popen.pipelines())
+            return "liberar"
+
+    coord = SlowLiberar(inner)
+
+    async def irc(channels, on_message, stop):
+        i = 0
+        while not stop.is_set():
+            await clock.sleep(1)
+            if clock() >= T0 + 20:
+                i += 1
+                on_message("canal", clock(), f"u{i % 3}", "oi")
+
+    with pytest.raises(SystemExit) as exc:
+        asyncio.run(monitor.run_monitor(
+            ["canal"], tmp_path / "out", monitor.ChannelPolicy(), queue_root=tmp_path / "q",
+            irc=irc, popen=popen, pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+            coord=coord, stream_ids={"canal": "5"}, capacity_fn=lambda _: CAP, kill_children=lambda: None,
+        ))
+    assert exc.value.code == 75
+    assert seen["no_liberar"] >= 1 and seen["depois"] == seen["no_liberar"]  # nada religado
+    assert all(p.returncode is not None for p in popen.procs)
+
+
+def test_cancel_antes_do_start_job_nao_gasta_attempt(tmp_path):
+    db = mongomock.MongoClient().db
+    inner = Coord(db, "w-r3e")
+    inner.ensure_live("twitch:canal:9", channel="canal", platform="twitch")
+    inner.add_job("twitch:canal:9:5", "twitch:canal:9", (0, 5), 1.0)
+    queue = monitor.DiskQueue(tmp_path / "q")
+    _synced_job(queue, tmp_path, "e", window_end=5, mongo_job_id="twitch:canal:9:5")
+    cancel = threading.Event()
+    cancel.set()
+    monitor.run_worker_step(queue, tmp_path / "out", monitor.ChannelPolicy(), lambda *_: {"clips": []},
+                            coord=inner, cancel=cancel)
+    assert db.jobs.find_one({"_id": "twitch:canal:9:5"})["attempts"] == 0
+    assert len(list((queue.root / "pending").iterdir())) == 1
+
+
+def test_heartbeat_reenvia_periodicamente_job_final_unsynced_com_mongo_online(tmp_path):
+    clock = Clock()
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-r3f", now=clock)
+    queue = monitor.DiskQueue(tmp_path / "q")
+    target = f"twitch:canal:9:{int(T0) + 10}"
+
+    async def irc(channels, on_message, stop):
+        while not stop.is_set():
+            await clock.sleep(1)
+
+    async def driver():
+        stop = asyncio.Event()
+        task = asyncio.create_task(monitor.run_monitor(
+            ["canal"], tmp_path / "out", monitor.ChannelPolicy(), queue_root=queue.root,
+            irc=irc, popen=FakePopen(), pipeline=lambda *_: {"clips": []}, now=clock, sleep=clock.sleep,
+            stop=stop, coord=coord, capacity_fn=lambda _: CAP, beat_s=1,
+        ))
+        await asyncio.sleep(0.05)
+        # job terminou localmente sem sincronizar, com o Mongo ja online (nenhuma reconexao vai acontecer)
+        make_staged_job(queue.root / "done", channel="canal", peak=int(T0), coord_synced=False,
+                        live_id="twitch:canal:9", window_end=int(T0) + 10, status="done", score=0.8, clips=1)
+        for _ in range(15000):
+            if db.jobs.find_one({"_id": target}) or task.done():
+                break
+            await asyncio.sleep(0.002)
+        stop.set()
+        await task
+
+    asyncio.run(driver())
+    assert db.jobs.find_one({"_id": target})["status"] == "done"
+
+
+def test_ajuda_do_policy_file_cita_clipes_policy_file(capsys):
+    with pytest.raises(SystemExit):
+        monitor.main(["--help"])
+    assert "CLIPES_POLICY_FILE" in capsys.readouterr().out

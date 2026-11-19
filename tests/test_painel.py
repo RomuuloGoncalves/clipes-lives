@@ -142,24 +142,29 @@ def env(monkeypatch):
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
 
 
-def test_status_livre_sem_auth(db, env):
-    code, _, corpo = chamar(status_fn, db, "GET")
+def test_status_exige_auth(db, env):
+    code_sem, hdr_sem, _ = chamar(status_fn, db, "GET", headers={"X-Real-IP": "198.51.100.5"})
+    assert code_sem == 401 and "Basic" in hdr_sem.get("WWW-Authenticate", "")
+    assert "198.51.100.5" in _nucleo._FALHAS_AUTH
+
+    code_err, _, _ = chamar(status_fn, db, "GET", basic("errada"), headers={"X-Real-IP": "198.51.100.5"})
+    assert code_err == 401
+
+    code, _, corpo = chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.5"})
     assert code == 200 and len(json.loads(corpo)["workers"]) == 2
     assert b"exemplo.invalid" not in corpo
-    # Mesmo com header Authorization invalido, status e livre e nao conta falha.
-    code2, _, _ = chamar(status_fn, db, "GET", basic("errada"), headers={"X-Real-IP": "198.51.100.5"})
-    assert code2 == 200 and not _nucleo._FALHAS_AUTH
+    assert "198.51.100.5" not in _nucleo._FALHAS_AUTH
 
 
-def test_status_500_sem_uri_e_200_sem_senha(db, monkeypatch):
+def test_status_e_comando_500_sem_uri_ou_sem_senha(db, monkeypatch):
     monkeypatch.delenv("PAINEL_SENHA", raising=False)
     monkeypatch.delenv("PAINEL_MONGO_URI", raising=False)
-    code, _, corpo = chamar(status_fn, db, "GET")
+    code, _, corpo = chamar(status_fn, db, "GET", basic("s3"))
     assert code == 500 and json.loads(corpo) == {"erro": "painel nao configurado"}
 
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
-    code_s, _, corpo_s = chamar(status_fn, db, "GET")
-    assert code_s == 200 and len(json.loads(corpo_s)["workers"]) == 2
+    code_s, _, corpo_s = chamar(status_fn, db, "GET", basic("s3"))
+    assert code_s == 500 and json.loads(corpo_s) == {"erro": "painel nao configurado"}
     code_c, _, corpo_c = chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})
     assert code_c == 500 and json.loads(corpo_c) == {"erro": "painel nao configurado"}
 
@@ -214,11 +219,12 @@ def test_limite_tentativas_senha_429(db, env, monkeypatch):
     code, hdr, _ = chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.10"})
     assert code == 429 and int(hdr["Retry-After"]) > 0
 
-    # GET /api/status continua livre mesmo para IP bloqueado e nao limpa o bloqueio.
-    assert chamar(status_fn, db, "GET", headers={"X-Real-IP": "198.51.100.10"})[0] == 200
+    # GET /api/status compartilha o mesmo rate limit (IP bloqueado recebe 429 e nao limpa o bloqueio).
+    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})[0] == 429
     assert chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.10"})[0] == 429
 
     # Outro IP continua normal.
+    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.11"})[0] == 200
     assert chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.11"})[0] == 202
 
     # Passada a janela de bloqueio, volta a aceitar.
@@ -322,9 +328,9 @@ def test_index_html_estrutura_e_fluxos():
     assert "n/d" in js
     for campo in ("alias", "online", "cpus", "cpu_pct", "ram_gb", "disco_livre_gb", "temp_c", "gpu", "job_atual", "max_lives"):
         assert campo in js
-    # atualizar() consulta /api/status sem pedir senha nem enviar Authorization
+    # atualizar() exige senha via pedirSenha e envia Authorization em /api/status
     atualizar_js = js.split("function atualizar()", 1)[1]
-    assert "Authorization" not in atualizar_js and "pedirSenha" not in atualizar_js
+    assert "Authorization" in atualizar_js and "pedirSenha" in atualizar_js and "basicHeader" in atualizar_js
 
 
 # ---- T21: configuracao da Vercel

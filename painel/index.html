@@ -34,6 +34,7 @@
       gap: 8px;
       margin-bottom: 16px;
     }
+    .header-dir { display: flex; align-items: center; gap: 8px; }
     h1 { font-size: 1.25rem; margin: 0; }
     h2 { font-size: 1rem; margin: 20px 0 8px; color: var(--muted); }
     .meta { font-size: 0.875rem; color: var(--muted); }
@@ -151,7 +152,10 @@
 <body>
   <header>
     <h1>Clipes Lives</h1>
-    <div id="atualizado" class="meta">Carregando...</div>
+    <div class="header-dir">
+      <div id="atualizado" class="meta">Carregando...</div>
+      <button type="button" id="auth-abrir" class="btn-sec" hidden>Entrar</button>
+    </div>
   </header>
 
   <div id="feedback" class="msg" role="status"></div>
@@ -206,10 +210,12 @@
       var authDescEl = document.getElementById("auth-desc");
       var authInput = document.getElementById("auth-senha");
       var authCancelarBtn = document.getElementById("auth-cancelar");
+      var authAbrirBtn = document.getElementById("auth-abrir");
       var drafts = Object.create(null);
       var carregando = false;
       var senhaCache = null;
       var pendingAuth = null;
+      var erroAuthAtivo = false;
 
       function basicHeader(senha) {
         var bytes = new TextEncoder().encode("painel:" + senha);
@@ -224,9 +230,16 @@
         authInput.value = "";
         authModal.hidden = true;
         pendingAuth = null;
+        if (!senhaCache) {
+          authAbrirBtn.hidden = false;
+          atualizadoEl.textContent = "Autenticacao necessaria";
+        }
       }
 
       authCancelarBtn.addEventListener("click", fecharModal);
+      authAbrirBtn.addEventListener("click", function () {
+        atualizar();
+      });
       document.addEventListener("keydown", function (e) {
         if (e.key === "Escape" && !authModal.hidden) fecharModal();
       });
@@ -247,7 +260,9 @@
           onDone(senhaCache);
           return;
         }
-        authDescEl.textContent = "Digite a senha para liberar recursos de " + nome + ".";
+        authDescEl.textContent = nome
+          ? ("Digite a senha para liberar recursos de " + nome + ".")
+          : "Digite a senha para consultar o painel.";
         authInput.value = "";
         pendingAuth = onDone;
         authModal.hidden = false;
@@ -325,7 +340,10 @@
                 mostrarMsg("Comando liberar recursos enviado para " + nome + ".", "ok");
                 atualizar();
               } else {
-                if (res.status === 401) senhaCache = null;
+                if (res.status === 401) {
+                  senhaCache = null;
+                  authAbrirBtn.hidden = false;
+                }
                 var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
                 mostrarMsg("Falha ao enviar comando: " + erro, "erro");
               }
@@ -433,33 +451,64 @@
 
       function atualizar() {
         if (carregando) return;
-        carregando = true;
-        fetch("/api/status")
-          .then(function (r) {
-            if (!r.ok) {
-              return r.json().catch(function () { return {}; }).then(function (b) {
-                throw new Error((b && b.erro) ? b.erro : ("HTTP " + r.status));
-              });
+        pedirSenha(null, function (senha) {
+          if (carregando) return;
+          carregando = true;
+          fetch("/api/status", {
+            credentials: "same-origin",
+            headers: {
+              "Authorization": basicHeader(senha)
             }
-            return r.json();
           })
-          .then(function (dados) {
-            renderWorkers(dados.workers || []);
-            renderLives(dados.lives || [], dados.workers || []);
-            renderJobs(dados.jobs_24h || {});
-            atualizadoEl.textContent = "Atualizado: " + new Date().toLocaleTimeString();
-          })
-          .catch(function (err) {
-            atualizadoEl.textContent = "Erro ao atualizar";
-            mostrarMsg("Falha ao consultar /api/status: " + (err && err.message ? err.message : "erro"), "erro");
-          })
-          .finally(function () {
-            carregando = false;
-          });
+            .then(function (r) {
+              if (r.status === 401) {
+                senhaCache = null;
+                return r.json().catch(function () { return {}; }).then(function (b) {
+                  var err = new Error((b && b.erro) ? b.erro : "nao autorizado");
+                  err.status = 401;
+                  throw err;
+                });
+              }
+              if (!r.ok) {
+                return r.json().catch(function () { return {}; }).then(function (b) {
+                  throw new Error((b && b.erro) ? b.erro : ("HTTP " + r.status));
+                });
+              }
+              return r.json();
+            })
+            .then(function (dados) {
+              authAbrirBtn.hidden = true;
+              renderWorkers(dados.workers || []);
+              renderLives(dados.lives || [], dados.workers || []);
+              renderJobs(dados.jobs_24h || {});
+              atualizadoEl.textContent = "Atualizado: " + new Date().toLocaleTimeString();
+              if (erroAuthAtivo) {
+                erroAuthAtivo = false;
+                mostrarMsg("", "");
+              }
+            })
+            .catch(function (err) {
+              atualizadoEl.textContent = "Erro ao atualizar";
+              mostrarMsg("Falha ao consultar /api/status: " + (err && err.message ? err.message : "erro"), "erro");
+              if (err && err.status === 401) {
+                erroAuthAtivo = true;
+                authAbrirBtn.hidden = false;
+                carregando = false;
+                pedirSenha(null, function () {
+                  atualizar();
+                });
+              }
+            })
+            .finally(function () {
+              carregando = false;
+            });
+        });
       }
 
       atualizar();
-      setInterval(atualizar, 10000);
+      setInterval(function () {
+        if (senhaCache) atualizar();
+      }, 10000);
     })();
   </script>
 </body>

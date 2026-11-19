@@ -4,7 +4,7 @@ Gerador gratuito e 100% CPU-only de clipes verticais (`1080x1920`, H.264/AAC) co
 
 ## Requisitos
 
-- Apenas **Docker** e **Docker Compose** (nada instalado no host, sem GPU, sem chaves de API ou login).
+- Apenas **Docker** e **Docker Compose** (nada instalado no host, sem GPU; chaves de API como `GEMINI_API_KEYS`, Discord, YouTube, TikTok e Twitch são opcionais).
 
 ## Início rápido (Docker)
 
@@ -12,7 +12,7 @@ Em cada PC (Linux; no Windows use uma distro WSL2, ver "Windows" abaixo):
 
 ```sh
 git clone https://github.com/RomuuloGoncalves/clipes-lives.git && cd clipes-lives
-git checkout onda-ab                 # até o merge no master
+git checkout master
 docker compose build                 # constrói a imagem (1x, ou após git pull)
 
 # credenciais fora do repositório (ver "Configuração fora do repositório")
@@ -60,7 +60,7 @@ Processar um VOD ou live ativa. Use o `./clipar` (cria a pasta de saída como se
 ./clipar "https://www.youtube.com/watch?v=cStJTQf9XUk" --live-minutes 4 --max-clips 2
 ```
 
-O `./clipar` limita o container a 3 CPUs (`CLIPES_CPUS`, `CLIPES_CPU_THREADS`), roda com prioridade baixa e liga o `./vigia-temp`: ele grava a temperatura em `<saída>/.temp.log` a cada 5 s, pausa o container a 85 °C (`CLIPES_TEMP_MAX`) e retoma a 75 °C (`CLIPES_TEMP_MIN`). Para uso contínuo, `./clipar monitor` mantém o ciclo detectar, gravar e processar um job por vez; se parar, retoma da fila.
+O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 8 GB), respeitando valores definidos no ambiente; roda com prioridade baixa e liga o `./vigia-temp`: ele grava a temperatura em `<saída>/.temp.log` a cada 5 s, pausa o container a 85 °C (`CLIPES_TEMP_MAX`) e retoma a 75 °C (`CLIPES_TEMP_MIN`). Para uso contínuo, `./clipar monitor` mantém o ciclo detectar, gravar e processar um job por vez; se parar, retoma da fila.
 
 Opções da CLI:
 

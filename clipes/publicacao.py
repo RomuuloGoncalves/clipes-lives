@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from . import config
 from .monitor import ChannelPolicy, load_policy
 from .registro import Registro, _atomic_write_json, _json_default, _locked_path, _read_json
 
@@ -208,7 +209,7 @@ def _resolve_quota_path(quota_path: Path | str | None, out_root: Path | str | No
     env_path = os.environ.get("CLIPES_QUOTA_PATH", "").strip()
     if env_path:
         return Path(env_path)
-    base = Path(out_root) if out_root is not None else Path(os.environ.get("OUT_DIR") or "out")
+    base = config.resolve_out_dir(out_root)
     return base / ".cotas_publicacao.json"
 
 
@@ -903,8 +904,9 @@ def _resolve_policy(policy: ChannelPolicy | None, policy_path: Path | str | None
         return policy
     if policy_path is not None:
         return load_policy(Path(policy_path))
-    if out_root is not None and (out_root / "policy.json").is_file():
-        return load_policy(out_root / "policy.json")
+    path = config.resolve_policy_path(out_root, legacy=Path("policy.json"))  # legado: cwd (como o acompanhar)
+    if path.is_file():
+        return load_policy(path)
     return ChannelPolicy()
 
 
@@ -1295,7 +1297,7 @@ def _download_from_discord(
             reg.marcar(clip_id, status="perdido")
         return None, "clipe_perdido", "clipe perdido: mensagem do Discord apagada"
 
-    base_out = root if root is not None else Path(os.environ.get("OUT_DIR") or "out")
+    base_out = config.resolve_out_dir(root)
     tmp_dl = base_out / ".tmp_publicar" / f"{clip_id}_{plat}_{uuid.uuid4().hex[:8]}.mp4"
     expected_size = int(found.get("tamanho") or discord_info.get("size") or att.get("size") or 0)
     max_bytes = (expected_size + 1024) if expected_size > 0 else 25 * 1024 * 1024

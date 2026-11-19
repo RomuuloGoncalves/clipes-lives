@@ -1,8 +1,13 @@
+name: clipes-lives
+
 services:
   clipes:
-    build: .
+    build:
+      context: .
+      # args:
+      #   WITH_LLM_4B: 1  # baixa e ativa Qwen3-4B (~2,5 GB extra, ~4,5 GB RAM)
     image: clipes-lives:latest
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
@@ -16,8 +21,12 @@ services:
       GEMINI_API_KEYS:
       CLIPES_GEMINI_MODELS:
       CLIPES_GEMINI_MIN_INTERVAL_S:
+      CLIPES_GEMINI_COTA_FILE: ${CLIPES_GEMINI_COTA_FILE:-}
+      CLIPES_CLOUD_TIMEOUT: ${CLIPES_CLOUD_TIMEOUT:-}
       CLIPES_LLM_BACKEND:
+      CLIPES_LLM_TIMEOUT: ${CLIPES_LLM_TIMEOUT:-}
       CLIPES_HOOK_TOP:
+      CLIPES_BLUR_BG: ${CLIPES_BLUR_BG:-}
       CLIPES_BAR:
       CLIPES_BRAND_NAME:
       CLIPES_BRAND_DISPLAY:
@@ -28,13 +37,18 @@ services:
       CLIPES_SPLIT_BAR_H:
       CLIPES_SPLIT_CAM_H:
       CLIPES_FACECAM_TTL_H:
+      CLIPES_FACECAM_CONFIG: ${CLIPES_FACECAM_CONFIG:-}
       CLIPES_MONGO_URI:
       CLIPES_ALIAS:
       CLIPES_LEASE_S:
       CLIPES_BEAT_S:
-      CLIPES_MIN_FREE_GB:
+      CLIPES_MIN_FREE_GB: ${CLIPES_MIN_FREE_GB:-}
+      CLIPES_BUFFER_CAP_GB: ${CLIPES_BUFFER_CAP_GB:-}
+      CLIPES_LIVE_CAPTURA_MORTA_S: ${CLIPES_LIVE_CAPTURA_MORTA_S:-}
       CLIPES_MAX_LIVES:
       CLIPES_POLICY_FILE:
+      TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID:-}
+      TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET:-}
       DISCORD_BOT_TOKEN:
       DISCORD_CHANNEL_ID:
       DISCORD_GUILD_ID:
@@ -51,10 +65,13 @@ services:
       TIKTOK_CLIENT_ID:
       TIKTOK_CLIENT_SECRET:
       CLIPES_TOKENS_PATH:
+      CLIPES_QUOTA_PATH: ${CLIPES_QUOTA_PATH:-}
       CLIPES_OAUTH_BIND:
       CLIPES_OAUTH_PORT:
       CLIPES_YT_MAX_DIA:
       CLIPES_TIKTOK_MAX_DIA:
+      CLIPES_PUB_LEASE_S: ${CLIPES_PUB_LEASE_S:-}
+      CLIPES_PUB_MAX_POR_CICLO: ${CLIPES_PUB_MAX_POR_CICLO:-}
       CLIPES_AGENDA_HORARIOS: ${CLIPES_AGENDA_HORARIOS-11:30,19:00}
       CLIPES_TZ: ${CLIPES_TZ:-America/Sao_Paulo}
     volumes:
@@ -64,7 +81,7 @@ services:
 
   bot:
     image: clipes-lives:latest
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     profiles: ["bot"]
     restart: on-failure:3
     mem_limit: ${CLIPES_MEM:-8g}
@@ -77,6 +94,7 @@ services:
       HF_HOME: /cache/huggingface
       CLIPES_MONGO_URI:
       CLIPES_ALIAS:
+      CLIPES_POLICY_FILE: ${CLIPES_POLICY_FILE:-}
       DISCORD_BOT_TOKEN:
       DISCORD_CHANNEL_ID:
       DISCORD_GUILD_ID:
@@ -93,8 +111,11 @@ services:
       TIKTOK_CLIENT_ID:
       TIKTOK_CLIENT_SECRET:
       CLIPES_TOKENS_PATH:
+      CLIPES_QUOTA_PATH: ${CLIPES_QUOTA_PATH:-}
       CLIPES_YT_MAX_DIA:
       CLIPES_TIKTOK_MAX_DIA:
+      CLIPES_PUB_LEASE_S: ${CLIPES_PUB_LEASE_S:-}
+      CLIPES_PUB_MAX_POR_CICLO: ${CLIPES_PUB_MAX_POR_CICLO:-}
       CLIPES_AGENDA_HORARIOS: ${CLIPES_AGENDA_HORARIOS-11:30,19:00}
       CLIPES_TZ: ${CLIPES_TZ:-America/Sao_Paulo}
     volumes:
@@ -106,7 +127,7 @@ services:
   # Testes: sem montar a pasta de saida (o Docker criaria ./out como root).
   test:
     image: clipes-lives:latest
-    user: "${UID:-1000}:${GID:-1000}"
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     mem_limit: ${CLIPES_MEM:-8g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256

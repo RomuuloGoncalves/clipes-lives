@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from . import config
 from .capacidade import cpu_threads
 from .ingest import probe_duration
 
@@ -17,7 +18,7 @@ MIN_BENCH_LIVE_S = 300.0
 
 
 def _default_out_dir() -> Path:
-    return Path(os.environ.get("OUT_DIR") or "out").expanduser().resolve()
+    return config.resolve_out_dir()
 
 
 def medir(
@@ -80,9 +81,9 @@ def medir(
 
 def max_lives(out_dir: Path | str, cpus: int | None = None) -> int:
     """CLIPES_MAX_LIVES (>=1) wins; else max(1, floor(0.6 / razao)) from .perfil.json; 1 if missing or cpus changed."""
-    raw = os.environ.get("CLIPES_MAX_LIVES", "").strip()
-    if raw.isdigit() and int(raw) >= 1:
-        return int(raw)
+    env_max = config.env_int("CLIPES_MAX_LIVES", 0)
+    if env_max >= 1:
+        return env_max
     perfil_path = Path(out_dir) / ".perfil.json"
     try:
         data = json.loads(perfil_path.read_text(encoding="utf-8"))

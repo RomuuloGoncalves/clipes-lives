@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import monitor
+from . import config, monitor
 from .executor_publicacao import PublishLoop
 from .ingest import sanitize_id
 from .janelas import filter_emitted, owns, window_end
@@ -165,14 +165,9 @@ def resolve_max_lives(
     *,
     max_lives_fn: Callable[[Path, int | None], int] | None = None,
 ) -> int:
-    raw = os.environ.get("CLIPES_MAX_LIVES", "").strip()
-    if raw:
-        try:
-            val = int(raw)
-        except ValueError:
-            val = 0
-        if val >= 1:
-            return val
+    val = config.env_int("CLIPES_MAX_LIVES", 0)
+    if val >= 1:
+        return val
     ml_fn = max_lives_fn or perfil_max_lives
     return int(ml_fn(out_root, cpus))
 
@@ -268,7 +263,7 @@ class LiveSession:
         self.max_dur = float(max_dur)
         self.min_dur = float(min_dur) if min_dur is not None else None
         self.pad = self.max_dur / 2
-        self.min_free = float(os.environ.get("CLIPES_MIN_FREE_GB", "5") if min_free_gb is None else min_free_gb)
+        self.min_free = config.env_float("CLIPES_MIN_FREE_GB", 5.0, min_value=0.0) if min_free_gb is None else float(min_free_gb)
         self.coord_getter = coord_getter or (lambda: None)
         self.on_mongo_error = on_mongo_error or (lambda _exc: None)
         self.live_id = live_id
@@ -1175,7 +1170,7 @@ class Supervisor:
                 if self.beat_s is not None:
                     beat_interval = max(0.01, float(self.beat_s))
                 else:
-                    beat_interval = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20")))
+                    beat_interval = config.env_float("CLIPES_BEAT_S", 20.0, min_value=1.0)
                 last_beat = float("-inf")
 
                 # A-02: solta lives proprias com lease vencida (sobras de crash) na inicializacao
@@ -1446,7 +1441,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("alvos", nargs="+", help="Canais/URLs Twitch ou URLs de live do YouTube")
     p.add_argument("--out-dir", default=None, help="Padrao: OUT_DIR ou ./out")
     p.add_argument("--queue-dir", type=Path, default=None, help="Padrao: <out-dir>/queue")
-    p.add_argument("--policy-file", type=Path, default=None, help="Padrao: policy.json ao lado de channels.txt")
+    p.add_argument("--policy-file", type=Path, default=None, help="Padrao: CLIPES_POLICY_FILE, senao <OUT_DIR>/policy.json (legado ao lado do channels.txt/cwd so se o padrao nao existir)")
     p.add_argument("--max-dur", type=float, default=60.0, help="Duracao maxima de cada clipe em segundos")
     p.add_argument("--min-dur", type=float, default=None, help="Duracao minima de cada clipe em segundos")
     args = p.parse_args(argv)
@@ -1466,9 +1461,9 @@ def main(argv: list[str] | None = None) -> int:
             print(f"[acompanhar] alvo invalido: {raw}", flush=True)
             return 2
 
-    out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
+    out_root = config.resolve_out_dir(args.out_dir)
     queue_root = args.queue_dir.expanduser().resolve() if args.queue_dir else None
-    policy = monitor.load_policy(args.policy_file) if args.policy_file else monitor.load_policy(Path("policy.json"))
+    policy = monitor.load_policy(args.policy_file) if args.policy_file else monitor.load_policy(config.resolve_policy_path(out_root, legacy=Path("policy.json")))
     try:
         with _exit_signals_to_kb():
             coord = monitor._connect_coord_for_follow(out_root) if os.environ.get("CLIPES_MONGO_URI", "").strip() else None

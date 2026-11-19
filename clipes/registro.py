@@ -178,6 +178,11 @@ def _is_duplicate_key(exc: Exception) -> bool:
     return type(exc).__name__ == "DuplicateKeyError"
 
 
+def _avisar_retencao(valor: Any) -> None:
+    # retencao invalida desliga a limpeza: nao pode ser silencioso (B-16)
+    print(f"[registro] CLIPES_RETENCAO_H={valor!r} invalido; retencao DESLIGADA (use horas >= 0)", flush=True)
+
+
 class Registro:
     """Persistent index of generated clips in `OUT_DIR/registro.json` with optional Mongo mirror."""
 
@@ -490,6 +495,7 @@ class Registro:
             try:
                 hours = float(raw)
             except ValueError:
+                _avisar_retencao(retencao_h)
                 return []
         elif isinstance(retencao_h, bool):
             return []
@@ -497,9 +503,11 @@ class Registro:
             try:
                 hours = float(retencao_h)
             except (TypeError, ValueError):
+                _avisar_retencao(retencao_h)
                 return []
 
         if math.isnan(hours) or math.isinf(hours) or hours < 0:
+            _avisar_retencao(retencao_h)
             return []
 
         now_ts = float(now() if callable(now) else (time.time() if now is None else now))

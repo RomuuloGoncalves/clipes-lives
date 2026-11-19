@@ -26,6 +26,7 @@ from typing import Any
 
 import numpy as np
 
+from . import config
 from .executor_publicacao import PublishLoop
 from .ingest import BOT_AUTHORS, _compact_chat_rows, js_runtime_args, probe_duration, probe_metadata, sanitize_id
 from .janelas import filter_emitted, owns, window_end
@@ -463,7 +464,9 @@ class RollingRecorderPool:
             return None
 
     def _stop(self, channel: str, remove_buffer: bool) -> None:
-        rec = self.recordings.pop(channel)
+        rec = self.recordings.pop(channel, None)
+        if rec is None:  # parado em paralelo (liberar na thread x tick_loop)
+            return
         source, *rest = rec.procs
         for proc in rec.procs:
             code = proc.poll()
@@ -1000,8 +1003,8 @@ def _rel_output_dir(output_dir: str | Path | None, out_root: Path) -> str | None
 
 def _effective_lease_s(beat_s: float | None = None) -> float:
     """CLIPES_LEASE_S garantindo lease >= 3 * beat (um beat perdido nao pode soltar a live)."""
-    beat = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20") if beat_s is None else beat_s))
-    lease_s = float(os.environ.get("CLIPES_LEASE_S", "90"))
+    beat = max(1.0, config.env_float("CLIPES_BEAT_S", 20.0, min_value=1.0) if beat_s is None else float(beat_s))
+    lease_s = config.env_float("CLIPES_LEASE_S", 90.0, min_value=1e-9)
     if lease_s < 3 * beat:
         print(f"[fila] CLIPES_LEASE_S={lease_s:g} < 3*beat ({beat:g}s); usando {3 * beat:g}s", flush=True)
         return 3 * beat
@@ -1135,6 +1138,9 @@ def run_worker_step(
     if job_dir is None:
         return False
     job = _read_job(job_dir)
+    if cancel is not None and cancel.is_set():  # nem gasta um attempt do start_job
+        queue.requeue(job_dir)
+        return True
     channel = job["channel"]
     mongo_job_id = job.get("mongo_job_id") or job["job_id"]
     live_id = job.get("live_id")
@@ -1380,6 +1386,7 @@ def buffer_cap_bytes() -> int:
 BUFFER_CAP_BYTES = buffer_cap_bytes()
 RANK_INTERVAL_S = 10.0
 WORKER_IDLE_S = 5.0
+REPLAY_EVERY_BEATS = 5  # a cada N beats, reenvia jobs com coord_synced=False
 WORKER_JOIN_S = 60.0  # espera maxima pela thread do worker no encerramento
 
 
@@ -1519,7 +1526,7 @@ async def run_monitor(
     cap_getter = capacity_fn
     max_lives_getter = max_lives_fn
     worker_alias = alias or os.environ.get("CLIPES_ALIAS", "").strip()
-    beat_interval = max(1.0, float(os.environ.get("CLIPES_BEAT_S", "20") if beat_s is None else beat_s))
+    beat_interval = max(1.0, config.env_float("CLIPES_BEAT_S", 20.0, min_value=1.0) if beat_s is None else float(beat_s))
     child_killer = kill_children or _terminate_child_processes
     current_job: list[str | None] = [None]
     if not dry_run:
@@ -1613,7 +1620,9 @@ async def run_monitor(
             if claimed:
                 owned_lives[channel] = live_id
                 lost_lives.discard(live_id)
-                was_unleased = channel in unleased
+                # claim aceito: o id de fallback deixa de ser pulado pelo replay (e passa a mapear para o id real)
+                was_unleased = channel in unleased or f"twitch:{channel}" in lost_lives
+                lost_lives.discard(f"twitch:{channel}")
                 unleased.discard(channel)
                 if was_unleased and queue is not None:  # jobs gravados sem lease passam a pertencer a esta live
                     try:
@@ -1694,6 +1703,9 @@ async def run_monitor(
     async def tick_loop() -> None:
         last_rank = float("-inf")
         while not stop.is_set():
+            if cancel.is_set():  # liberar em curso: nao religa gravadores nem abre capturas
+                await sleep(1.0)
+                continue
             t = now()
             if coord_session is not None and coord_session.configured and not coord_session.online and t >= coord_session.next_retry:
                 await asyncio.to_thread(coord_session.maybe_reconnect)
@@ -1811,6 +1823,7 @@ async def run_monitor(
 
     async def heartbeat_loop() -> None:
         last_beat = float("-inf")
+        beats_done = 0
         while not stop.is_set():
             t = now()
             active_coord = coord_session.active if coord_session is not None else None
@@ -1831,11 +1844,20 @@ async def run_monitor(
                             lost_lives.add(live_id)
                             if pool is not None:
                                 pool.stop_channel(ch)
+                    beats_done += 1
+                    if queue is not None and beats_done % REPLAY_EVERY_BEATS == 0:
+                        # job que terminou sem sincronizar com o Mongo online nao espera a proxima reconexao
+                        await asyncio.to_thread(
+                            replay_unsynced_jobs, queue, active_coord, skip_lives=_replay_skip(), out_root=out_root
+                        )
                     action = await asyncio.to_thread(active_coord.run_pending_command, liberar)
                 except Exception as exc:
                     if not _is_mongo_error(exc):
                         raise
                     coord_session.mark_offline(exc)
+                    if cancel.is_set():  # liberar ja cancelou tudo: nao vira processo zumbi so porque o "feito" falhou
+                        print("[comando] liberar recursos (Mongo caiu ao marcar feito)", flush=True)
+                        raise SystemExit(75)
                 else:
                     if action == "liberar":
                         print("[comando] liberar recursos", flush=True)
@@ -1899,7 +1921,7 @@ def main(argv: list[str] | None = None) -> int:
         description="Vigia chats da Twitch, grava picos em buffer rolante e enfileira jobs (sem publicar).",
     )
     p.add_argument("--channels-file", type=Path, default=Path("channels.txt"), help="1 canal por linha")
-    p.add_argument("--policy-file", type=Path, default=None, help="Padrão: policy.json ao lado de --channels-file")
+    p.add_argument("--policy-file", type=Path, default=None, help="Padrão: CLIPES_POLICY_FILE, senão <OUT_DIR>/policy.json (legado ao lado do channels.txt/cwd só se o padrão não existir)")
     p.add_argument("--game-id", default=None, help="Filtro de categoria do Helix (só com TWITCH_CLIENT_ID/SECRET no env)")
     p.add_argument("--max-recorders", type=int, default=3, help="Canais quentes gravando (máx. 3, + 1 sob demanda)")
     p.add_argument("--out-dir", default=None, help="Padrão: OUT_DIR ou ./out")
@@ -1908,8 +1930,8 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--follow", default=None, help="Acompanha um único canal em janelas contínuas até acabar")
     args = p.parse_args(argv)
 
-    out_root = Path(args.out_dir or os.environ.get("OUT_DIR") or "out").expanduser().resolve()
-    policy = load_policy(args.policy_file or args.channels_file.with_name("policy.json"))
+    out_root = config.resolve_out_dir(args.out_dir)
+    policy = load_policy(args.policy_file or config.resolve_policy_path(out_root, legacy=args.channels_file.with_name("policy.json")))
     queue_root = args.queue_dir.expanduser().resolve() if args.queue_dir else None
     if args.follow is not None:
         channel = _live_channel(args.follow)

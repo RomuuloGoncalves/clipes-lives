@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
+from . import config
 from .registro import Registro, _is_mongo_error, sha256_arquivo
 
 if TYPE_CHECKING:
@@ -89,8 +90,7 @@ def _master_mode() -> str:
 
 
 def _verificar_sha_enabled() -> bool:
-    raw = os.environ.get("CLIPES_REGISTRO_VERIFICAR", "1").strip().lower()
-    return raw not in ("0", "false", "no", "off")
+    return config.env_flag("CLIPES_REGISTRO_VERIFICAR", True)
 
 
 def _resolve_registro_root(out_path: Path | None, out_root: Path | str | None) -> Path | None:
@@ -98,9 +98,8 @@ def _resolve_registro_root(out_path: Path | None, out_root: Path | str | None) -
         return Path(out_root).expanduser().resolve()
     if out_path is None:
         return None
-    env_out = os.environ.get("OUT_DIR", "").strip()
-    if env_out:
-        cand = Path(env_out).expanduser().resolve()
+    if os.environ.get("OUT_DIR", "").strip():
+        cand = config.resolve_out_dir()
         try:
             out_path.resolve().relative_to(cand)
             return cand

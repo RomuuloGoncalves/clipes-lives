@@ -15,8 +15,23 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+live = [
+    "streamlink>=7.0",
+]
+coord = [
+    "pymongo>=4.8",
+]
+bot = [
+    "discord.py>=2.4,<3",
+]
+visao = [
+    "onnxruntime>=1.18",
+    "tokenizers>=0.19",
+    "opencv-python-headless>=4.9",
+]
 dev = [
     "pytest>=8.0.0",
+    "mongomock>=4.3",
 ]
 
 [tool.setuptools.packages.find]
