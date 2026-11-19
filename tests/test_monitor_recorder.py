@@ -436,3 +436,26 @@ def test_pool_uses_custom_source_cmd_for_twitch_and_youtube(tmp_path):
     assert sources[1][0] == "yt-dlp"
     assert sources[1][-2:] == ["-", "https://www.youtube.com/watch?v=abc123"]
     assert "--hls-use-mpegts" in sources[1]
+
+
+def test_pool_accepts_kick_keys_and_refuses_invalid_kick_keys(tmp_path):
+    popen = FakePopen()
+    pool = monitor.RollingRecorderPool(
+        tmp_path / "buf",
+        max_hot=0,
+        max_on_demand=4,
+        popen=popen,
+        source_cmd=lambda key: (
+            monitor.ytdlp_live_cmd(f"https://kick.com/{key.removeprefix('kick_')}")
+            if key.startswith("kick_")
+            else monitor.ytdlp_live_cmd("https://www.youtube.com/watch?v=abc123")
+            if key.startswith("yt_")
+            else monitor.streamlink_cmd(key)
+        ),
+    )
+    assert pool.start_on_demand("kick_foo-bar") is True
+    assert pool.start_on_demand("yt_abc123") is True
+    assert pool.start_on_demand("gaules") is True
+    assert pool.start_on_demand("kick_") is False
+    assert pool.start_on_demand("kick_a/b") is False
+    assert sorted(pool.recordings) == ["gaules", "kick_foo-bar", "yt_abc123"]

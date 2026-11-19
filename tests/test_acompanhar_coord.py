@@ -242,3 +242,163 @@ def test_supervisor_keepalive_renova_beat_e_lease_durante_pipeline_lento(tmp_pat
     assert res["status"] == "ended"
     assert beat_during_pipe
     assert "twitch:gaules:99" in renew_during_pipe
+
+
+def test_supervisor_coord_kick_abertura_platform_e_stream_id_override(tmp_path, monkeypatch):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
+    monkeypatch.setenv("CLIPES_BEAT_S", "20")
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-kick", now=clock.now, lease_s=90)
+    ensure_calls: list[tuple[str, str | None, str | None]] = []
+    orig_ensure = coord.ensure_live
+
+    def tracked_ensure(live_id, channel=None, platform=None, stream_id=None, **kw):
+        ensure_calls.append((live_id, platform, stream_id))
+        return orig_ensure(live_id, channel=channel, platform=platform, stream_id=stream_id, **kw)
+
+    coord.ensure_live = tracked_ensure
+
+    pool = FakeMultiPool(clock, {"kick_foo-bar": B + 320})
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("https://www.kick.com/Foo-Bar/")],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        is_live=lambda u: clock.t < B + 320,
+        probe=lambda u: {"is_live": True, "id": 123, "channel_id": "9"},
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    res = sup.run()
+
+    assert res["status"] == "ended"
+    assert ensure_calls == [("kick:foo-bar:123", "kick", "123")]
+    doc = db.lives.find_one({"_id": "kick:foo-bar:123"})
+    assert doc is not None and doc["platform"] == "kick" and doc["status"] == "ended"
+    assert db.jobs.find_one({"_id": f"kick:foo-bar:123:{B + 300}"}) is not None
+
+    # stream_id explicito prevalece sobre alvo.video_id
+    ensure_calls.clear()
+    clock2 = Clock(B + 10)
+    pool2 = FakeMultiPool(clock2, {"kick_foo-bar": B + 320})
+    sup2 = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("https://kick.com/foo-bar")],
+        tmp_path / "out2",
+        pool=pool2,
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        stream_id="override-99",
+        is_live=lambda u: clock2.t < B + 320,
+        probe=lambda u: {"is_live": True, "id": 123},
+        now=clock2.now,
+        sleep=clock2.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    assert sup2.run()["status"] == "ended"
+    assert ensure_calls == [("kick:foo-bar:override-99", "kick", "override-99")]
+
+
+def test_supervisor_coord_kick_sem_sid_recusa_como_aguardando(tmp_path, monkeypatch, capsys):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-kick-nosid", now=clock.now, lease_s=90)
+    avisos: list[str] = []
+    pool = FakeMultiPool(clock, {"kick_foo-bar": B + 320})
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("https://kick.com/foo-bar")],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        is_live=lambda u: True,
+        probe=lambda u: {"is_live": True},
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+        aviso_fn=avisos.append,
+    )
+    res = sup.run()
+
+    assert res["status"] == "not_claimed"
+    assert res["reason"] == "stream_id indisponivel"
+    assert pool.started_order == []
+    assert avisos == ["[acompanhar] recusada https://kick.com/foo-bar: stream_id indisponivel"]
+    assert "stream_id indisponivel" in capsys.readouterr().out
+
+
+def test_supervisor_coord_kick_backoff_e_reconexao(tmp_path, monkeypatch):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "1")
+    monkeypatch.setenv("CLIPES_BEAT_S", "20")
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-kick-backoff", now=clock.now, lease_s=500)
+    ensure_calls: list[tuple[str, str | None, str | None]] = []
+    orig_ensure = coord.ensure_live
+
+    def tracked_ensure(live_id, channel=None, platform=None, stream_id=None, **kw):
+        ensure_calls.append((live_id, platform, stream_id))
+        return orig_ensure(live_id, channel=channel, platform=platform, stream_id=stream_id, **kw)
+
+    coord.ensure_live = tracked_ensure
+
+    # Falha na inicializacao coloca Mongo em backoff antes de _try_start_alvo (cobre pending_live_id em backoff)
+    orig_rel = coord.release_expired_own
+    failed_once = [False]
+
+    def fail_first_release():
+        if not failed_once[0]:
+            failed_once[0] = True
+            raise pymongo.errors.AutoReconnect("mongo down at startup")
+        return orig_rel()
+
+    coord.release_expired_own = fail_first_release
+
+    pool = FakeMultiPool(clock, {"kick_foo-bar": B + 320})
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("https://kick.com/foo-bar")],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        is_live=lambda u: clock.t < B + 320,
+        probe=lambda u: {"is_live": True, "id": "777"},
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    res = sup.run()
+
+    assert res["status"] == "ended"
+    assert ensure_calls == [("kick:foo-bar:777", "kick", "777")]
+    doc = db.lives.find_one({"_id": "kick:foo-bar:777"})
+    assert doc is not None and doc["platform"] == "kick" and doc["status"] == "ended"
+
+    # Tambem verifica _try_claim_pending quando pending_live_id esta None na reconexao
+    ensure_calls.clear()
+    alvo_reconn = acompanhar.parse_alvo("https://kick.com/baz-qux")
+    alvo_reconn.video_id = "888"
+    sess_stub = SimpleNamespace(
+        alvo=alvo_reconn,
+        has_coord=True,
+        live_id=None,
+        pending_live_id=None,
+        pending_stream_id=None,
+    )
+    claimed = sup._try_claim_pending(coord, alvo_reconn.chave, sess_stub, pool, lambda _u: {})
+    assert claimed is True
+    assert sess_stub.live_id == "kick:baz-qux:888"
+    assert ensure_calls == [("kick:baz-qux:888", "kick", "888")]

@@ -32,7 +32,7 @@ os.chmod('/usr/local/bin/deno', 0o755)"
 WORKDIR /app
 
 RUN pip install --upgrade pip && pip install \
-    "yt-dlp[default]" \
+    "yt-dlp[default,curl-cffi]" \
     "faster-whisper>=1.1.0" \
     "numpy>=1.26.0" \
     "scipy>=1.12.0" \

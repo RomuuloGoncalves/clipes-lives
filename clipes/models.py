@@ -16,6 +16,7 @@ class Word:
     start: float
     end: float
     text: str
+    no_speech_prob: float = 0.0
 
     @property
     def clean(self) -> str:

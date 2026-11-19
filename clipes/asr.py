@@ -76,7 +76,15 @@ def transcribe_candidates(
                 and cached.get("beam_size", 5) == beam_size
                 and cached_wins == norm_windows
             ):
-                words = [Word(float(w["start"]), float(w["end"]), str(w["word"])) for w in cached.get("words", [])]
+                words = [
+                    Word(
+                        float(w["start"]),
+                        float(w["end"]),
+                        str(w["word"]),
+                        no_speech_prob=float(w.get("nsp", 0.0) or 0.0),
+                    )
+                    for w in cached.get("words", [])
+                ]
                 print(f"[asr] Reusing cached transcript ({len(words)} words)", flush=True)
                 return words, cached.get("language")
         except Exception:
@@ -120,11 +128,12 @@ def transcribe_candidates(
 
             win_words = 0
             for seg in segments:
+                seg_nsp = float(getattr(seg, "no_speech_prob", 0.0) or 0.0)
                 for w in (getattr(seg, "words", None) or []):
                     gs = round(w_start + float(w.start), 3)
                     ge = round(w_start + float(w.end), 3)
                     if ge > gs and str(w.word).strip():
-                        all_words.append(Word(start=gs, end=ge, text=str(w.word)))
+                        all_words.append(Word(start=gs, end=ge, text=str(w.word), no_speech_prob=seg_nsp))
                         win_words += 1
             print(
                 f"[asr] Window {idx}/{len(windows)} [{w_start:.1f}s-{w_end:.1f}s]: "
@@ -150,7 +159,10 @@ def transcribe_candidates(
         "language": detected_lang,
         "elapsed_s": round(time.perf_counter() - t0, 2),
         "windows": [[round(s, 2), round(e, 2)] for s, e in windows],
-        "words": [{"start": w.start, "end": w.end, "word": w.text} for w in deduped],
+        "words": [
+            {"start": w.start, "end": w.end, "word": w.text, "nsp": round(w.no_speech_prob, 4)}
+            for w in deduped
+        ],
     }
     words_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return deduped, detected_lang

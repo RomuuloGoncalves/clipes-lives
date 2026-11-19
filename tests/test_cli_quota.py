@@ -46,7 +46,7 @@ def _peaks(n: int, score: float = 0.9) -> list[CandidatePeak]:
 
 
 def _wire(monkeypatch, ing: IngestResult, peaks: list[CandidatePeak], quota):
-    seen: dict[str, list] = {"triage": [], "pass1": [], "quota": [], "pass2": []}
+    seen: dict[str, list] = {"triage": [], "pass1": [], "quota": [], "pass2": [], "pass2_candidates": []}
     monkeypatch.setattr(cli, "ingest", lambda **kwargs: ing)
     monkeypatch.setattr(cli, "compute_rms_db", lambda *a, **k: ing and np.zeros(4, np.float32))
     monkeypatch.setattr(cli, "compute_signals", lambda **k: _bundle(ing.duration))
@@ -66,6 +66,7 @@ def _wire(monkeypatch, ing: IngestResult, peaks: list[CandidatePeak], quota):
 
     def pass2(*a, **k):
         seen["pass2"].append(k.get("beam_size"))
+        seen["pass2_candidates"].append(list(k.get("candidates") or []))
         return [Word(12.0, 12.4, " Olha"), Word(12.5, 13.0, " isso!")], "pt"
 
     monkeypatch.setattr(cli, "triage_audio_blocks", triage)
@@ -99,15 +100,63 @@ def test_auto_triggers_quota_when_strong_peaks_miss_the_target(tmp_path, monkeyp
 
 def test_auto_stays_on_peaks_when_strong_peaks_fill_the_quota(tmp_path, monkeypatch):
     ing = _ing(tmp_path)
-    seen = _wire(monkeypatch, ing, _peaks(6), ([], False))
+    strong_peaks = _peaks(6, score=0.9)
+    weak_peaks = _peaks(2, score=0.1)
+    seen = _wire(monkeypatch, ing, strong_peaks + weak_peaks, ([], False))
     assert _run(tmp_path, []) == 0
     assert seen["triage"] == [] and seen["pass1"] == [] and seen["quota"] == []
     assert seen["pass2"] == [5]
+    assert len(seen["pass2_candidates"][0]) == 6
+    assert all(c.raw_score >= 0.25 for c in seen["pass2_candidates"][0])
     manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
     assert manifest["detection_mode"] == "auto"
     assert manifest["floor_mode"] is False
     assert manifest["quota_target"] == 6
     assert "note" not in manifest
+
+
+def test_auto_with_one_strong_and_five_weak_passes_only_strong(tmp_path, monkeypatch):
+    ing = _ing(tmp_path, duration=600.0)
+    strong = _peaks(1, score=0.8)
+    weak = _peaks(5, score=0.15)
+    seen = _wire(monkeypatch, ing, strong + weak, ([], False))
+    assert _run(tmp_path, []) == 0
+    assert seen["pass1"] == []
+    assert seen["pass2"] == [5]
+    assert len(seen["pass2_candidates"][0]) == 1
+    assert seen["pass2_candidates"][0][0].raw_score == 0.8
+
+
+def test_mode_peaks_keeps_strong_and_weak_candidates(tmp_path, monkeypatch):
+    ing = _ing(tmp_path, duration=600.0)
+    strong = _peaks(1, score=0.8)
+    weak = _peaks(5, score=0.15)
+    seen = _wire(monkeypatch, ing, strong + weak, ([], False))
+    assert _run(tmp_path, ["--mode", "peaks"]) == 0
+    assert seen["pass1"] == []
+    assert seen["pass2"] == [5]
+    assert len(seen["pass2_candidates"][0]) == 6
+
+
+def test_min_per_hour_zero_with_no_strong_peaks_emits_zero_clips(tmp_path, monkeypatch):
+    ing = _ing(tmp_path, duration=600.0)
+    weak = _peaks(5, score=0.15)
+    seen = _wire(monkeypatch, ing, weak, ([], False))
+    assert _run(tmp_path, ["--min-per-hour", "0"]) == 0
+    assert seen["triage"] == [] and seen["pass1"] == [] and seen["quota"] == []
+    assert seen["pass2"] == []
+    manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert manifest["quota_target"] == 0
+    assert manifest["clips"] == []
+
+
+def test_vod_defaults_keep_quota_target_at_least_one(tmp_path, monkeypatch):
+    ing = _ing(tmp_path, duration=300.0)
+    seen = _wire(monkeypatch, ing, [], ([_peaks(1)[0]], True))
+    assert _run(tmp_path, []) == 0
+    assert seen["pass1"] == [None]
+    manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert manifest["quota_target"] >= 1
 
 
 def test_mode_peaks_skips_pass1_and_mode_quota_always_runs_it(tmp_path, monkeypatch):

@@ -561,6 +561,17 @@ def select_clips(
         )
         if not parts:
             continue
+        if cand.topic_start is None and len(parts) > 1:
+            hit = next((p for p in parts if p.start <= cand.peak <= p.end), None)
+            if hit is None:
+                hit = min(
+                    parts,
+                    key=lambda p: min(abs(cand.peak - p.start), abs(cand.peak - p.end)),
+                )
+            hit.part_index = 1
+            hit.part_total = 1
+            hit.group_id = ""
+            parts = [hit]
         if len(chosen) > 0 and len(chosen) + len(parts) > max_clips + 1:
             continue
         if any(p.start < c.end + 1.0 and p.end > c.start - 1.0 for p in parts for c in chosen):

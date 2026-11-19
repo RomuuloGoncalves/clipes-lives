@@ -1,6 +1,6 @@
 """Unit tests for topic/part dataclass extensions in clipes.models."""
 
-from clipes.models import CandidatePeak, SnappedClip, TopicSegment
+from clipes.models import CandidatePeak, SnappedClip, TopicSegment, Word
 
 
 def test_topic_segment_duration_and_defaults():
@@ -51,3 +51,14 @@ def test_snapped_clip_hook_and_description_defaults():
     assert populated.hook_top == "Ele perdeu tudo?"
     assert populated.description_long == "Resumo do trecho."
     assert populated.description_source == "llm"
+
+
+def test_word_no_speech_prob_default_e_posicional():
+    w = Word(1.0, 2.0, "x")
+    assert w.start == 1.0
+    assert w.end == 2.0
+    assert w.text == "x"
+    assert w.no_speech_prob == 0.0
+
+    w_nsp = Word(1.0, 2.0, "x", no_speech_prob=0.85)
+    assert w_nsp.no_speech_prob == 0.85

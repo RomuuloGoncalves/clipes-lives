@@ -262,3 +262,39 @@ def test_snap_topic_part1_preroll_capped_to_part_max_dur():
         assert 25.0 <= p.duration <= 58.0
         assert not cuts_mid_word(p.start, words)
         assert not cuts_mid_word(p.end, words)
+
+
+def test_select_clips_peak_candidate_emits_only_part_containing_peak():
+    """Candidato de pico (topic_start=None) em topico de 3 partes emite so a parte do pico; quota mantem as 3."""
+    specs = [
+        (10.0 + i * 9.0, 10.0 + i * 9.0 + 8.5, f"Capítulo {i} da mesma história longa sobre o torneio.")
+        for i in range(22)
+    ]
+    words = _words_from_specs(specs)
+    duration = 220.0
+    rms = np.full(int(duration * FPS_RMS), -34.0, dtype=np.float32)
+    peak_t = 115.0
+    rms[int((peak_t - 1.0) * FPS_RMS) : int((peak_t + 2.0) * FPS_RMS)] = -12.0
+
+    # 1) Candidato de pico (topic_start=None): snap_topic_parts gera 3 partes, mas select_clips mantem so a do pico
+    peak_cand = CandidatePeak(
+        peak=peak_t, raw_score=0.95, start_win=5.0, end_win=210.0, active_signals=["loudness"],
+    )
+    raw_parts = snap_topic_parts(peak_cand, words, rms, duration, min_dur=25.0, single_max_dur=65.0, part_max_dur=58.0)
+    assert len(raw_parts) == 3
+
+    chosen_peak = select_clips([peak_cand], words, rms, duration, max_clips=5, min_dur=25.0, max_dur=65.0)
+    assert len(chosen_peak) == 1
+    assert chosen_peak[0].start <= peak_t <= chosen_peak[0].end
+    assert chosen_peak[0].part_index == 1
+    assert chosen_peak[0].part_total == 1
+
+    # 2) Mesmo topico com candidato de quota (topic_start preenchido): mantem a serie completa (3 partes)
+    quota_cand = CandidatePeak(
+        peak=peak_t, raw_score=0.95, start_win=5.0, end_win=210.0,
+        topic_start=raw_parts[0].start, topic_end=raw_parts[-1].end, active_signals=["loudness"],
+    )
+    chosen_quota = select_clips([quota_cand], words, rms, duration, max_clips=5, min_dur=25.0, max_dur=65.0)
+    assert len(chosen_quota) == 3
+    assert [c.part_index for c in chosen_quota] == [1, 2, 3]
+    assert all(c.part_total == 3 for c in chosen_quota)

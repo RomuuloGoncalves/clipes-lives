@@ -211,3 +211,11 @@ def test_cli_respects_render_clip_without_layout_key_and_skip_render(tmp_path: P
     assert saved_skip["clips"][0]["layout"] == "black_bars_16x9"
     assert saved_skip["clips"][0]["layout_fallback"] is False
     assert saved_skip["clips"][0]["facecam"] is None
+
+
+def test_cli_resolve_layout_key_strips_kick_prefixes_and_help_mentions_kick():
+    assert cli._resolve_layout_key("https://www.kick.com/foo-bar", "vid1") == "foo-bar"
+    assert cli._resolve_layout_key("kick.com/foo-bar", "vid1") == "foo-bar"
+    assert cli._resolve_layout_key("http://kick.com/foo-bar/", "vid1") == "foo-bar"
+    assert cli._resolve_layout_key("https://www.twitch.tv/gaules", "vid1") == "gaules"
+    assert "Kick" in cli.build_parser().format_help()

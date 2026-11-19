@@ -265,6 +265,14 @@ def test_format_channel_credit_and_ingest_channel(tmp_path: Path, monkeypatch):
     assert ingest_mod.format_channel_credit("podpah", "https://www.youtube.com/watch?v=abc", "youtube") == "@podpah"
     assert ingest_mod.format_channel_credit("", "https://www.youtube.com/@podpah/streams", "youtube") == "@podpah"
     assert ingest_mod.format_channel_credit("twitch.tv/gaules", "https://www.twitch.tv/videos/1", "") == "twitch.tv/gaules"
+    assert ingest_mod.format_channel_credit("x", "https://kick.com/x", "kick") == "kick.com/x"
+    assert ingest_mod.format_channel_credit("", "https://kick.com/x/videos/01a1f270-2818-7960-a98a-0ceb2ff97b57", "kick:vod") == "kick.com/x"
+    assert ingest_mod.format_channel_credit("", "https://kick.com/foo-bar", "") == "kick.com/foo-bar"
+    assert ingest_mod.format_channel_credit("kick.com/x", "", "kick") == "kick.com/x"
+    assert ingest_mod.format_channel_credit("www.kick.com/foo-bar", "", "") == "kick.com/foo-bar"
+    assert ingest_mod.format_channel_credit("", "https://kick.com/video/1234", "kick:vod") == ""
+    assert ingest_mod.format_channel_credit("", "https://kick.com/videos/1234", "kick:vod") == ""
+    assert ingest_mod.format_channel_credit("", "https://kick.com/clips/clip_1", "kick:clip") == ""
 
     # ingest_local populates .channel from meta.json
     local_dir = tmp_path / "local_job"

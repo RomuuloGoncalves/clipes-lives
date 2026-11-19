@@ -448,7 +448,7 @@ def download_chat(url: str, info: dict[str, Any], cache_dir: Path) -> list[list[
 
 
 def format_channel_credit(channel: str, url: str = "", extractor: str = "") -> str:
-    """Format channel credit as 'twitch.tv/<canal>' for Twitch or '@<canal>' for YouTube."""
+    """Format channel credit as 'twitch.tv/<canal>', 'kick.com/<canal>', or '@<canal>' for YouTube."""
     raw_ch = (channel or "").strip()
     low_ext = (extractor or "").lower()
     low_url = (url or "").lower()
@@ -456,10 +456,16 @@ def format_channel_credit(channel: str, url: str = "", extractor: str = "") -> s
     if raw_ch.lower().startswith(("twitch.tv/", "www.twitch.tv/")):
         name = raw_ch.split("/", 1)[1].strip("/ ").lstrip("@")
         return f"twitch.tv/{name}" if name else ""
+    if raw_ch.lower().startswith(("kick.com/", "www.kick.com/")):
+        name = raw_ch.split("/", 1)[1].strip("/ ").lstrip("@")
+        return f"kick.com/{name}" if name else ""
     if raw_ch.startswith("@"):
         if "twitch" in low_ext or "twitch.tv" in low_url:
             name = raw_ch.lstrip("@").strip("/")
             return f"twitch.tv/{name}" if name else ""
+        if "kick" in low_ext or "kick.com" in low_url:
+            name = raw_ch.lstrip("@").strip("/")
+            return f"kick.com/{name}" if name else ""
         return raw_ch
 
     if "twitch" in low_ext or "twitch.tv" in low_url:
@@ -468,6 +474,14 @@ def format_channel_credit(channel: str, url: str = "", extractor: str = "") -> s
         m = re.search(r"twitch\.tv/([A-Za-z0-9_]+)", url or "", re.IGNORECASE)
         if m and m.group(1).lower() not in ("videos", "video", "directory", "clip", "clips"):
             return f"twitch.tv/{m.group(1)}"
+        return ""
+
+    if "kick" in low_ext or "kick.com" in low_url:
+        if raw_ch:
+            return f"kick.com/{raw_ch.lstrip('@').strip('/')}"
+        m = re.search(r"kick\.com/([\w-]+)", url or "", re.IGNORECASE)
+        if m and m.group(1).lower() not in ("video", "videos", "clips"):
+            return f"kick.com/{m.group(1)}"
         return ""
 
     if "youtube" in low_ext or "youtu.be" in low_url or "youtube.com" in low_url:

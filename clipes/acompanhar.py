@@ -1,4 +1,4 @@
-"""Supervisor multi-live (`acompanhar`): acompanha N lives (Twitch/YouTube) com 1 fila e 1 worker."""
+"""Supervisor multi-live (`acompanhar`): acompanha N lives (Twitch/YouTube/Kick) com 1 fila e 1 worker."""
 
 from __future__ import annotations
 
@@ -28,6 +28,8 @@ from .perfil import max_lives as perfil_max_lives
 
 _YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,32}")
 _YT_HANDLE_RE = re.compile(r"@([A-Za-z0-9_.-]{1,64})")
+_KICK_SLUG_RE = re.compile(r"[a-z0-9_-]{1,25}")
+_KICK_RESERVED = frozenset({"video", "videos", "categories", "search", "auth", "clips"})
 
 RECORDER_RESTART_BASE_S = 5.0
 RECORDER_RESTART_MAX_S = 60.0
@@ -58,7 +60,7 @@ class Alvo:
 
 
 def parse_alvo(s: str) -> Alvo:
-    """Parse Twitch/YouTube live target into Alvo; raise ValueError on unsupported format."""
+    """Parse Twitch/YouTube/Kick live target into Alvo; raise ValueError on unsupported format."""
     raw = (s or "").strip()
     if not raw or any(ch.isspace() for ch in raw):
         raise ValueError(f"alvo invalido: {s!r}")
@@ -131,6 +133,20 @@ def parse_alvo(s: str) -> Alvo:
                 url=f"https://www.youtube.com/watch?v={path}",
                 canal=path.lower(),
                 video_id=path,
+                raw=raw,
+            )
+
+        if host in {"kick.com", "www.kick.com"}:
+            if not path or "/" in path:
+                raise ValueError(f"alvo invalido: {s!r}")
+            slug = path.lower()
+            if slug in _KICK_RESERVED or not _KICK_SLUG_RE.fullmatch(slug):
+                raise ValueError(f"alvo invalido: {s!r}")
+            return Alvo(
+                plataforma="kick",
+                chave=f"kick_{slug}",
+                url=f"https://kick.com/{slug}",
+                canal=slug,
                 raw=raw,
             )
 
@@ -759,6 +775,17 @@ class Supervisor:
     def _label(self, alvo: Alvo) -> str:
         return alvo.raw or alvo.chave
 
+    def _run_probe(self, alvo: Alvo, probe_fn: Callable[[str], dict[str, Any]]) -> dict[str, Any] | None:
+        try:
+            meta = probe_fn(alvo.url)
+        except Exception:
+            print(f"[acompanhar] {self._label(alvo)} offline; ignorado", flush=True)
+            return None
+        if not isinstance(meta, dict):
+            print(f"[acompanhar] {self._label(alvo)} offline; ignorado", flush=True)
+            return None
+        return meta
+
     def _probe_youtube(self, alvo: Alvo, probe_fn: Callable[[str], dict[str, Any]]) -> bool:
         """Populate YouTube video_id/channel_id/handle and return True if live."""
         need_probe = (
@@ -769,13 +796,8 @@ class Supervisor:
         )
         if not need_probe:
             return True
-        try:
-            meta = probe_fn(alvo.url)
-        except Exception:
-            print(f"[acompanhar] {self._label(alvo)} offline; ignorado", flush=True)
-            return False
-        if not isinstance(meta, dict):
-            print(f"[acompanhar] {self._label(alvo)} offline; ignorado", flush=True)
+        meta = self._run_probe(alvo, probe_fn)
+        if meta is None:
             return False
         if meta.get("id"):
             alvo.video_id = str(meta["id"])
@@ -793,6 +815,41 @@ class Supervisor:
             return False
         return True
 
+    def _probe_kick(self, alvo: Alvo, probe_fn: Callable[[str], dict[str, Any]]) -> bool:
+        """Populate Kick video_id/channel_id and return True only when is_live is True."""
+        meta = self._run_probe(alvo, probe_fn)
+        if meta is None:
+            return False
+        if meta.get("is_live") is not True:
+            print(f"[acompanhar] {self._label(alvo)} offline; ignorado", flush=True)
+            return False
+        if meta.get("id") not in (None, ""):
+            alvo.video_id = str(meta["id"])
+        if meta.get("channel_id") not in (None, ""):
+            alvo.channel_id = str(meta["channel_id"])
+        return True
+
+    def _resolve_live_id(
+        self,
+        alvo: Alvo,
+        probe_fn: Callable[[str], dict[str, Any]] | None = None,
+    ) -> tuple[str | None, str | None]:
+        """Resolve (live_id, stream_id) por plataforma; devolve (None, None) se indisponivel."""
+        if alvo.plataforma == "twitch":
+            sid = self.stream_id
+            if not sid and probe_fn is not None:
+                sid = monitor._resolve_stream_id(alvo.canal, probe=probe_fn)
+            if not sid:
+                return None, None
+            return f"twitch:{alvo.canal}:{sid}", sid
+        if alvo.plataforma == "kick":
+            sid = self.stream_id or alvo.video_id
+            if not sid:
+                return None, None
+            return f"kick:{alvo.canal}:{sid}", sid
+        sid = alvo.video_id or alvo.chave
+        return f"youtube:{alvo.channel_id or alvo.canal}:{sid}", sid
+
     def _try_start_alvo(
         self,
         alvo: Alvo,
@@ -805,8 +862,13 @@ class Supervisor:
         *,
         already_probed: bool = False,
     ) -> str:
-        if alvo.plataforma == "youtube" and not already_probed:
-            if not self._probe_youtube(alvo, probe_fn):
+        if alvo.plataforma in ("youtube", "kick") and not already_probed:
+            probed = (
+                self._probe_youtube(alvo, probe_fn)
+                if alvo.plataforma == "youtube"
+                else self._probe_kick(alvo, probe_fn)
+            )
+            if not probed:
                 return "skip"
             if alvo.chave in self._all_sessions or any(a.chave == alvo.chave for a, _ in self._aguardando):
                 return "skip"
@@ -837,16 +899,11 @@ class Supervisor:
         c_active = self._coord_active()
         if c_active is not None:
             cap = self._cap()
-            if alvo.plataforma == "twitch":
-                sid = self.stream_id or monitor._resolve_stream_id(alvo.canal, probe=probe_fn)
-                if not sid:
-                    self._saw_not_claimed = True
-                    self._recusar(alvo, "stream_id indisponivel")
-                    return "aguardando"
-                live_id = f"twitch:{alvo.canal}:{sid}"
-            else:
-                sid = alvo.video_id or alvo.chave
-                live_id = f"youtube:{alvo.channel_id or alvo.canal}:{sid}"
+            live_id, sid = self._resolve_live_id(alvo, probe_fn=probe_fn)
+            if not live_id:
+                self._saw_not_claimed = True
+                self._recusar(alvo, "stream_id indisponivel")
+                return "aguardando"
 
             try:
                 count_fn = getattr(c_active, "count_owned_live", None)
@@ -875,12 +932,7 @@ class Supervisor:
                     return "aguardando"
         elif self.coord is not None:
             # Mongo em backoff na abertura: guarda live_id pretendido para tentar claim ao reconectar (M-01)
-            if alvo.plataforma == "youtube":
-                pending_stream_id = alvo.video_id or alvo.chave
-                pending_live_id = f"youtube:{alvo.channel_id or alvo.canal}:{pending_stream_id}"
-            elif self.stream_id:
-                pending_stream_id = self.stream_id
-                pending_live_id = f"twitch:{alvo.canal}:{self.stream_id}"
+            pending_live_id, pending_stream_id = self._resolve_live_id(alvo)
 
         sess = LiveSession(
             alvo,
@@ -1004,14 +1056,9 @@ class Supervisor:
         lid = sess.pending_live_id
         sid = sess.pending_stream_id
         if lid is None:
-            if sess.alvo.plataforma == "twitch":
-                sid = self.stream_id or monitor._resolve_stream_id(sess.alvo.canal, probe=probe_fn)
-                if not sid:
-                    return None
-                lid = f"twitch:{sess.alvo.canal}:{sid}"
-            else:
-                sid = sess.alvo.video_id or sess.alvo.chave
-                lid = f"youtube:{sess.alvo.channel_id or sess.alvo.canal}:{sid}"
+            lid, sid = self._resolve_live_id(sess.alvo, probe_fn=probe_fn)
+            if not lid:
+                return None
             sess.pending_live_id = lid
             sess.pending_stream_id = sid
 
@@ -1044,7 +1091,7 @@ class Supervisor:
                 break
             status = self._try_start_alvo(
                 alvo, limite, queue, pool, pipeline_fn, is_live_fn, probe_fn,
-                already_probed=(alvo.plataforma == "youtube"),
+                already_probed=(alvo.plataforma in ("youtube", "kick")),
             )
             if status == "aguardando":
                 still_waiting.append((alvo, self._last_refusal_reason or motivo))
@@ -1150,7 +1197,7 @@ class Supervisor:
 
                     def _source_cmd(key: str) -> list[str]:
                         alvo = self._alvo_by_key.get(key)
-                        if alvo is not None and alvo.plataforma == "youtube":
+                        if alvo is not None and alvo.plataforma in ("youtube", "kick"):
                             return monitor.ytdlp_live_cmd(alvo.url)
                         return monitor.streamlink_cmd(key)
 
@@ -1436,9 +1483,9 @@ class Supervisor:
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         prog="clipes acompanhar",
-        description="Acompanha uma ou mais lives (Twitch/YouTube) em uma fila unica.",
+        description="Acompanha uma ou mais lives (Twitch/YouTube/Kick) em uma fila unica.",
     )
-    p.add_argument("alvos", nargs="+", help="Canais/URLs Twitch ou URLs de live do YouTube")
+    p.add_argument("alvos", nargs="+", help="Canais/URLs Twitch ou URLs de live do YouTube/Kick")
     p.add_argument("--out-dir", default=None, help="Padrao: OUT_DIR ou ./out")
     p.add_argument("--queue-dir", type=Path, default=None, help="Padrao: <out-dir>/queue")
     p.add_argument("--policy-file", type=Path, default=None, help="Padrao: CLIPES_POLICY_FILE, senao <OUT_DIR>/policy.json (legado ao lado do channels.txt/cwd so se o padrao nao existir)")

@@ -18,7 +18,7 @@ import numpy as np
 from . import cloud_llm, config
 from .asr import transcribe_candidates, transcribe_fast_blocks
 from .candidates import pick_candidate_peaks, pick_quota_candidates
-from .eval import evaluate_clips
+from .eval import count_speech_words, evaluate_clips, speech_gate
 from .ingest import format_channel_credit, ingest, probe_metadata, sanitize_id
 from .llm import (
     enrich_clips_with_llm,
@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="python -m clipes",
         description="Gera clipes verticais (1080x1920) com legendas de lives e VODs em CPU.",
     )
-    p.add_argument("url", help="URL do vídeo/VOD/live (YouTube ou Twitch)")
+    p.add_argument("url", help="URL do vídeo/VOD/live (YouTube, Twitch ou Kick)")
     p.add_argument("--max-clips", type=int, default=8, help="Máximo de clipes a gerar (padrão: 8)")
     p.add_argument("--min-dur", type=float, default=25.0, help="Duração mínima do clipe em s (padrão: 25)")
     p.add_argument("--max-dur", type=float, default=65.0, help="Duração máxima do clipe em s (padrão: 65)")
@@ -177,7 +177,7 @@ def _timing_total(timings: dict[str, float]) -> float:
 def _resolve_layout_key(channel: str, video_id: str) -> str:
     """Derive a filesystem-safe facecam cache/override key from channel or video_id."""
     raw = (channel or "").strip()
-    for prefix in ("https://", "http://", "www.twitch.tv/", "twitch.tv/"):
+    for prefix in ("https://", "http://", "www.twitch.tv/", "twitch.tv/", "www.kick.com/", "kick.com/"):
         if raw.lower().startswith(prefix):
             raw = raw[len(prefix):]
     raw = raw.lstrip("@").strip("/ ")
@@ -223,13 +223,17 @@ def _select_candidates(
     The fourth value is True when the quota pass (Passada 1) ran.
     """
     mode = args.mode
-    quota_target = max(1, min(args.max_clips, math.ceil(args.min_per_hour * bundle.duration / 3600.0)))
+    min_target = 0 if args.min_per_hour == 0 else 1
+    quota_target = max(min_target, min(args.max_clips, math.ceil(args.min_per_hour * bundle.duration / 3600.0)))
     peaks = pick_candidate_peaks(bundle, max_clips=args.max_clips, min_separation=90)
     p90 = float(np.percentile(bundle.smoothed, 90.0)) if len(bundle.smoothed) else 0.0
     strong = [c for c in peaks if c.raw_score >= max(p90, 0.25)]  # absolute floor: a flat curve has no strong peaks
-    if mode == "peaks" or (mode == "auto" and len(strong) >= quota_target):
+    if mode == "peaks":
         timings["asr_pass1_s"] = 0.0
         return peaks, False, quota_target, False
+    if mode == "auto" and len(strong) >= quota_target:
+        timings["asr_pass1_s"] = 0.0
+        return strong, False, quota_target, False
 
     blocks = triage_audio_blocks(bundle, budget_ratio=args.asr_budget_ratio)
     t_pass1 = time.perf_counter()
@@ -247,6 +251,67 @@ def _select_candidates(
         min_per_hour=args.min_per_hour,
     )
     return chosen, floor_mode, quota_target, True
+
+
+def _resolve_portao_mode() -> str:
+    raw = os.environ.get("CLIPES_PORTAO", "").strip().lower()
+    if not raw:
+        return "log"
+    if raw in ("off", "log", "on"):
+        return raw
+    print(f"[portao] CLIPES_PORTAO={raw!r} invalido; usando 'log'", flush=True)
+    return "log"
+
+
+def _apply_speech_gate(clips: list[Any], words: list[Word]) -> list[Any]:
+    """Aplica o portao de fala pos-ASR (CLIPES_PORTAO=off|log|on, padrao log)."""
+    if not clips:
+        return clips
+    mode = _resolve_portao_mode()
+    min_wps = config.env_float("CLIPES_MIN_WPS", 0.4, min_value=0.0)
+    min_words = config.env_int("CLIPES_MIN_PALAVRAS", 15, min_value=0)
+
+    if not words:
+        for clip in clips:
+            setattr(clip, "wps", 0.0)
+            setattr(clip, "palavras", 0)
+        if mode != "off":
+            print("[portao] sem ASR: portao ignorado", flush=True)
+        return clips
+
+    total = len(clips)
+    discarded = 0
+    kept: list[Any] = []
+    for clip in clips:
+        n_words = count_speech_words(words, clip.start, clip.end)
+        ok, wps = speech_gate(n_words, clip.duration, min_wps=min_wps, min_words=min_words)
+        setattr(clip, "wps", round(wps, 3))
+        setattr(clip, "palavras", n_words)
+        if not ok and mode in ("log", "on"):
+            discarded += 1
+            print(
+                f"[portao] descartado: pouca fala (wps={wps:.2f}, palavras={n_words}, inicio={clip.start:.1f}s)",
+                flush=True,
+            )
+            if mode == "on":
+                continue
+        kept.append(clip)
+
+    if discarded > 0 and mode in ("log", "on"):
+        print(f"[portao] {discarded} descartados de {total}", flush=True)
+
+    if mode == "on" and discarded > 0:
+        groups: dict[str, list[Any]] = {}
+        for c in kept:
+            gid = getattr(c, "group_id", "") or ""
+            if gid:
+                groups.setdefault(gid, []).append(c)
+        for members in groups.values():
+            new_total = len(members)
+            for new_idx, c in enumerate(members, 1):
+                c.part_index = new_idx
+                c.part_total = new_total
+    return kept
 
 
 def run_pipeline(args: argparse.Namespace) -> int:
@@ -386,6 +451,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
     timings["snap_s"] = round(time.perf_counter() - t4, 2)
     timings["topics_s"] = timings["snap_s"]
     print(f"[snap] Final valid clips: {len(clips)}/{len(candidates)}", flush=True)
+
+    clips = _apply_speech_gate(clips, words)
 
     if not clips:
         note = "Nenhum candidato formou clipe válido dentro das restrições de borda/duração."
@@ -548,6 +615,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "group_id": clip.group_id,
             "topic_duration": group_totals.get(clip.group_id, clip.duration),
             "transcript": clip.text,
+            "wps": float(getattr(clip, "wps", 0.0)),
+            "palavras": int(getattr(clip, "palavras", 0)),
             "cabe_discord": bool(getattr(clip, "cabe_discord", True)),
         }
         clips_payload.append(clip_entry)

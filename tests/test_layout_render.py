@@ -681,6 +681,13 @@ def test_baixa3_ass_escape_collapses_newlines_and_layout_key_sanitizes(tmp_path:
     assert k1.endswith("x") and k3 == "default"
 
 
+def test_render_resolve_layout_key_strips_kick_prefix(tmp_path: Path):
+    out_dir = tmp_path / "vod"
+    assert render_mod._resolve_layout_key("", "kick.com/foo-bar", out_dir) == "foo-bar"
+    assert render_mod._resolve_layout_key("", "twitch.tv/gaules", out_dir) == "gaules"
+    assert render_mod._resolve_layout_key("", "@podpah", out_dir) == "podpah"
+
+
 def test_real_ffmpeg_media1_18W_hook_and_baixa1_partbadge_no_overlap(tmp_path: Path, monkeypatch):
     """MEDIA-1 + BAIXA-1 + BAIXA-2 real 3s ffmpeg check: 18 'W's hook fits inside cam <=3 lines; PartBadge clears Cap."""
     _clear_layout_and_bar_env(monkeypatch)

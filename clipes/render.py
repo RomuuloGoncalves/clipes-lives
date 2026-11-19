@@ -949,7 +949,7 @@ def _resolve_layout_key(layout_key: str, channel_credit: str, out_dir: Path) -> 
     else:
         cred = channel_credit.strip()
         if cred:
-            raw = cred.removeprefix("twitch.tv/").lstrip("@").strip("/")
+            raw = cred.removeprefix("twitch.tv/").removeprefix("kick.com/").lstrip("@").strip("/")
         else:
             raw = out_dir.name or "default"
     return _sanitize_layout_key(raw)

@@ -496,3 +496,41 @@ def test_irc_loop_survives_callback_error_and_reconnects_on_overlong_line():
 def test_irc_loop_never_joins_invalid_channel_names():
     writer, _, _, _ = run_irc_loop(["ok_1", "bad\r\nPRIVMSG #x :spam", "UPPER", "a" * 26], [])
     assert [l.strip() for l in writer.lines if l.startswith("JOIN")] == ["JOIN #ok_1"]
+
+
+def test_run_local_pipeline_usa_min_per_hour_zero_e_mantem_duracoes(tmp_path, monkeypatch):
+    from pathlib import Path
+    from types import SimpleNamespace
+    from clipes import cli
+
+    seen_args = []
+
+    def fake_run_pipeline(args):
+        seen_args.append(args)
+        ing = cli.ingest(args.url, Path(args.out_dir), args.live_minutes, args.chat)
+        (ing.out_dir / "clips.json").write_text(json.dumps({"video_id": ing.video_id, "clips": []}), encoding="utf-8")
+        return 0
+
+    def fake_ingest_local(job_dir: Path, out_root: Path, enable_chat: bool):
+        od = out_root / job_dir.name
+        od.mkdir(parents=True, exist_ok=True)
+        return SimpleNamespace(video_id=job_dir.name, out_dir=od)
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr("clipes.ingest.ingest_local", fake_ingest_local)
+
+    out_root = tmp_path / "out"
+    j1 = tmp_path / "live_1"
+    j1.mkdir()
+    (j1 / "job.json").write_text(json.dumps({"job_id": "live_1", "max_dur": 50.0, "min_dur": 20.0}), encoding="utf-8")
+    monitor.run_local_pipeline(j1, out_root)
+    assert seen_args[-1].min_per_hour == 0.0
+    assert seen_args[-1].max_dur == 50.0
+    assert seen_args[-1].min_dur == 20.0
+
+    j2 = tmp_path / "spike_2"
+    j2.mkdir()
+    monitor.run_local_pipeline(j2, out_root)
+    assert seen_args[-1].min_per_hour == 0.0
+    assert seen_args[-1].max_dur == 65.0
+    assert seen_args[-1].min_dur == 25.0

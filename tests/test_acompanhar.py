@@ -139,6 +139,47 @@ def test_parse_alvo_aceita_cinco_formatos_rejeita_invalido_e_deduplica():
             acompanhar.parse_alvo(bad)
 
 
+def test_parse_alvo_kick_aceita_canal_normalizado_e_rejeita_invalidos():
+    a = acompanhar.parse_alvo("https://www.kick.com/Foo-Bar/")
+    assert a == acompanhar.Alvo(
+        plataforma="kick",
+        chave="kick_foo-bar",
+        url="https://kick.com/foo-bar",
+        canal="foo-bar",
+        raw="https://www.kick.com/Foo-Bar/",
+    )
+
+    b = acompanhar.parse_alvo("http://kick.com/foo-bar")
+    assert b.plataforma == "kick" and b.chave == "kick_foo-bar" and b.url == "https://kick.com/foo-bar"
+    assert len(acompanhar.dedup_alvos([a, b])) == 1
+
+    # Mesmo slug em Twitch e Kick nao colide no dedup; palavra solta continua Twitch
+    tw = acompanhar.parse_alvo("gaules")
+    kk = acompanhar.parse_alvo("https://kick.com/gaules")
+    assert tw.plataforma == "twitch" and tw.chave == "gaules"
+    assert kk.plataforma == "kick" and kk.chave == "kick_gaules"
+    assert len(acompanhar.dedup_alvos([tw, kk])) == 2
+
+    invalidos = [
+        "https://kick.com/a/videos/01a1f270-2818-7960-a98a-0ceb2ff97b57",
+        "https://kick.com/a/b",
+        "https://kick.com/video/01a1f270-2818-7960-a98a-0ceb2ff97b57",
+        "https://kick.com/search",
+        "https://kick.com/clips",
+        "https://kick.com/videos",
+        "https://kick.com/categories",
+        "https://kick.com/auth",
+        "https://kick.com/video",
+        "https://kick.com/",
+        "https://kick.com/" + "a" * 26,
+        "https://kick.com/foo.bar",
+    ]
+    for bad in invalidos:
+        with pytest.raises(ValueError) as exc_info:
+            acompanhar.parse_alvo(bad)
+        assert bad in str(exc_info.value)
+
+
 # ---- T5 + T6: Supervisor multi-live + 1 worker + Twitch & YouTube --------------------------------
 
 
@@ -594,3 +635,128 @@ def test_sigterm_sighup_para_gravadores_e_enforce_cap_no_ciclo(tmp_path, monkeyp
         rc = acompanhar.main(["c1", "--out-dir", str(tmp_path / "out_hup")])
         assert rc == 0
         assert signal.getsignal(signal.SIGHUP) is prev_hup
+
+
+@pytest.mark.parametrize(
+    "probe_behavior",
+    [
+        lambda _u: (_ for _ in ()).throw(RuntimeError("UserNotLive")),
+        lambda _u: None,
+        lambda _u: "nao-dict",
+        lambda _u: {"is_live": False, "id": 123},
+        lambda _u: {"is_live": None, "id": 123},
+        lambda _u: {"is_live": 1, "id": 123},
+        lambda _u: {"id": 123},
+    ],
+)
+def test_supervisor_kick_probe_offline_nao_grava(tmp_path, monkeypatch, capsys, probe_behavior):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
+
+    pool = FakeMultiPool(clock, {"kick_foo-bar": B + 320})
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("https://kick.com/foo-bar")],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        probe=probe_behavior,
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+    )
+    res = sup.run()
+    out = capsys.readouterr().out
+
+    assert res["status"] == "ended"
+    assert pool.started_order == []
+    assert "offline; ignorado" in out
+
+
+def test_supervisor_kick_probe_popula_ids_e_promocao_nao_reprobra(tmp_path, monkeypatch):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "1")
+
+    kick_alvo = acompanhar.parse_alvo("https://www.kick.com/Foo-Bar/")
+    kick_probe_calls: list[str] = []
+
+    def fake_probe(url: str):
+        kick_probe_calls.append(url)
+        return {"is_live": True, "id": 123, "channel_id": "9"}
+
+    stops = {"c1": B + 320, "kick_foo-bar": B + 620}
+    pool = FakeMultiPool(clock, stops)
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("c1"), kick_alvo],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        is_live=lambda u: clock.t < (B + 320 if "twitch" in u else B + 620),
+        probe=fake_probe,
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+    )
+    res = sup.run()
+
+    assert res["status"] == "ended"
+    assert kick_alvo.video_id == "123" and isinstance(kick_alvo.video_id, str)
+    assert kick_alvo.channel_id == "9"
+    assert kick_alvo.url == "https://kick.com/foo-bar"
+    assert kick_alvo.chave == "kick_foo-bar"
+    assert pool.started_order == ["c1", "kick_foo-bar"]
+    assert kick_probe_calls == ["https://kick.com/foo-bar"]
+
+
+def test_supervisor_kick_grava_via_ytdlp_e_twitch_segue_em_streamlink(tmp_path, monkeypatch):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "2")
+
+    spawned: list[FakeProc] = []
+
+    def fake_popen(cmd, **kwargs):
+        proc = FakeProc(cmd, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    orig_pool_cls = monitor.RollingRecorderPool
+    monkeypatch.setattr(
+        monitor,
+        "RollingRecorderPool",
+        lambda *a, **kw: orig_pool_cls(*a, popen=fake_popen, **kw),
+    )
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-kick-cmd", now=clock.now, lease_s=90)
+
+    def fake_probe(url: str):
+        if "kick.com" in url:
+            return {"is_live": True, "id": "123"}
+        return {"is_live": True, "id": "tw9"}
+
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("https://kick.com/foo-bar"), acompanhar.parse_alvo("gaules")],
+        tmp_path / "out",
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        is_live=lambda _u: clock.t < B + 100,
+        probe=fake_probe,
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    res = sup.run()
+
+    assert res["status"] == "ended"
+    sources = [p.cmd for p in spawned if p.cmd[0] != "ffmpeg"]
+    kick_cmds = [c for c in sources if "https://kick.com/foo-bar" in c]
+    twitch_cmds = [c for c in sources if "twitch.tv/gaules" in c]
+    assert len(kick_cmds) == 1
+    assert kick_cmds[0][0] == "yt-dlp" and "--hls-use-mpegts" in kick_cmds[0]
+    assert len(twitch_cmds) == 1
+    assert twitch_cmds[0][0] == "streamlink"
+    assert db.lives.find_one({"_id": "kick:foo-bar:123"})["status"] == "ended"
+    assert db.lives.find_one({"_id": "twitch:gaules:tw9"})["status"] == "ended"

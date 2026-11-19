@@ -54,7 +54,7 @@ POST_ROLL_MAX_S = 120
 MIN_CLIP_SOURCE_S = 25.0  # a source shorter than min_dur cannot yield a clip
 STREAMLINK_QUALITY = "720p60,720p,480p,best"
 CHANNEL_RE = re.compile(r"[a-z0-9_]{1,25}")
-_YT_KEY_RE = re.compile(r"yt_[A-Za-z0-9_-]{1,64}")
+_YT_KEY_RE = re.compile(r"(?:yt|kick)_[A-Za-z0-9_-]{1,64}")
 
 # (game_id, limit) -> (monotonic timestamp of last Helix attempt, logins it returned); enforces >= 60s polling.
 _helix_cache: dict[tuple[str | None, int], tuple[float, list[str]]] = {}
@@ -418,7 +418,8 @@ class RollingRecorderPool:
         self.frozen = False  # liberar: nenhum gravador novo depois do stop_all
 
     def _start(self, channel: str, on_demand: bool) -> None:
-        if not (CHANNEL_RE.fullmatch(channel) or _YT_KEY_RE.fullmatch(channel)):
+        key_re = _YT_KEY_RE if channel.startswith(("yt_", "kick_")) else CHANNEL_RE
+        if not key_re.fullmatch(channel):
             raise ValueError(f"invalid channel name: {channel!r}")
         seg_dir = self.buf_root / channel
         seg_dir.mkdir(parents=True, exist_ok=True)
@@ -882,7 +883,7 @@ def run_local_pipeline(job_dir: Path, out_root: Path) -> dict[str, Any]:
         ingested["result"] = ingest_local(job_dir, out_root, enable_chat)
         return ingested["result"]
 
-    cli_args = [job_dir.name, "--out-dir", str(out_root)]
+    cli_args = [job_dir.name, "--out-dir", str(out_root), "--min-per-hour", "0"]
     job_path = job_dir / "job.json"
     if job_path.is_file():
         try:
