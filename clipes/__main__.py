@@ -116,6 +116,10 @@ def main(argv: list[str]) -> int:
         return bot_main(argv[1:])
     if argv[:1] == ["auth"]:
         return _auth(argv[1:])
+    if argv[:1] == ["metricas"]:
+        from .metricas import main as metricas_main
+
+        return metricas_main(argv[1:])
     from .cli import main as cli_main
 
     return cli_main(argv)
