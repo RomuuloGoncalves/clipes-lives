@@ -29,6 +29,7 @@ def _clear_layout_and_bar_env(monkeypatch) -> None:
         "CLIPES_BLUR_BG",
         "CLIPES_MASTER_MODE",
         "CLIPES_DISCORD_MAX_MB",
+        "CLIPES_STARCUTS_OVERLAY",
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -39,6 +40,7 @@ def _rect(x: int, y: int, w: int, h: int) -> SimpleNamespace:
 
 def _make_layout(variante: str, src_w: int = 1920, src_h: int = 1080, fc_corner: str = "tl") -> SimpleNamespace:
     heights = {
+        "split-starcuts": (0, 600, 1320),
         "split-cheio": (0, 768, 1152),
         "split-barra": (340, 520, 1060),
         "split-fina": (170, 700, 1050),
@@ -104,7 +106,7 @@ def test_build_video_filter_split_variants_logo_hook_and_full_parity(tmp_path: P
     assert fc_full_plain == (
         "[0:v]scale=1080:1920:force_original_aspect_ratio=decrease:force_divisible_by=2,"
         "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1[v_base];"
-        "[v_base]tpad=stop_mode=clone:stop_duration=1.2[v_pad];"
+        "[v_base]tpad=stop_mode=clone:stop_duration=0.5[v_pad];"
         f"[v_pad]subtitles='{render_mod._escape_ffmpeg_filter_path(ass_path)}'[v_out]"
     )
 
@@ -198,14 +200,14 @@ def test_build_ass_split_positions_variants_and_full_parity(tmp_path: Path, monk
     assert r"\an7\pos(205,48)}CortesLR" in txt_a
     assert r"\an7\pos(205,104)}@cortes_lr1" in txt_a
     assert r"\an7\pos(120,838)}Parte 1/2" in txt_a
-    assert r"\an5\pos(540,1860)" in txt_a
+    assert r"\an5\pos(540,1305)" in txt_a
     assert "Style: Credit,DejaVu Sans,34," in txt_a
     assert r"\pos(540,1344)\fad(250,0)}Parte 2 →" in txt_a
     cap_lines_a = [l for l in txt_a.splitlines() if ",Cap," in l]
     assert len(cap_lines_a) == 2
-    assert all(r"{\an5\pos(540,768)}" in l and r"{\c&H0000FFFF&}" in l for l in cap_lines_a)
+    assert all(r"{\an5\pos(540,1380)}" in l and r"{\c&H0000FFFF&}" in l for l in cap_lines_a)
 
-    # Variant B (split-barra): fixed title in bar for entire file (0..11.20), NO TopHook, Cap at (540,860)
+    # Variant B (split-barra): fixed title in bar for entire file (0..11.20), NO TopHook, Cap at (540,1380)
     ass_b = tmp_path / "b.ass"
     lay_b = _make_layout("split-barra")
     render_mod.build_ass(
@@ -219,7 +221,7 @@ def test_build_ass_split_positions_variants_and_full_parity(tmp_path: Path, monk
     assert "Gancho fixo na barra" in txt_b
     assert "Style: BarName,DejaVu Sans,54,&H00101010&" in txt_b
     assert r"\an7\pos(235,52)}CortesLR" in txt_b
-    assert r"\an5\pos(540,860)}" in txt_b
+    assert r"\an5\pos(540,1380)}" in txt_b
     assert r"\pos(540,1390)\fad(250,0)}Live completa: twitch.tv/alanzoka" in txt_b
 
     # Variant B with empty hook_top falls back to clip.title and still works when bar=None (CLIPES_BAR=0)
@@ -233,7 +235,7 @@ def test_build_ass_split_positions_variants_and_full_parity(tmp_path: Path, monk
     assert ",BarHandle," not in txt_b_nb
     assert ",BarTitle," in txt_b_nb and "Titulo fallback" in txt_b_nb
 
-    # Variant C (split-fina): TopHook at cam center (170 + 700//2 = 520), Cap at (540,870), name at (190,36)
+    # Variant C (split-fina): TopHook at cam center (170 + 700//2 = 520), Cap at (540,1380), name at (190,36)
     ass_c = tmp_path / "c.ass"
     lay_c = _make_layout("split-fina")
     render_mod.build_ass(
@@ -245,15 +247,42 @@ def test_build_ass_split_positions_variants_and_full_parity(tmp_path: Path, monk
     assert r"\an5\pos(540,520)" in txt_c
     assert "Style: BarName,DejaVu Sans,50,&H00FFFFFF&" in txt_c
     assert r"\an7\pos(190,36)}CortesLR" in txt_c
-    assert r"\an5\pos(540,870)}" in txt_c
+    assert r"\an5\pos(540,1380)}" in txt_c
+
+    # Variant D (split-starcuts): BarTitle 44px #101010 at (540,696), PartBadge at (120,785), Cap at (540,1380), Credit at (540,1305)
+    ass_s = tmp_path / "starcuts.ass"
+    lay_s = SimpleNamespace(
+        cam=_rect(16, 12, 440, 244),
+        game=_rect(450, 0, 884, 1080),
+        bar_h=0,
+        cam_h=600,
+        game_h=1320,
+        emenda_y=600,
+        variante="split-starcuts",
+    )
+    render_mod.build_ass(
+        words, 0.0, 10.0, ass_s,
+        channel_credit="twitch.tv/alanzoka", part_index=1, part_total=2,
+        hook_top="Que isso mandy??", title="Titulo", bar=bar, split=lay_s, variante="split-starcuts",
+    )
+    txt_s = ass_s.read_text(encoding="utf-8")
+    assert "Style: BarTitle,DejaVu Sans,44,&H00101010&" in txt_s
+    assert r"\an5\pos(540,696)}Que isso mandy??" in txt_s
+    assert ",BarName," not in txt_s
+    assert ",BarHandle," not in txt_s
+    assert "TopHook" not in txt_s
+    assert r"\an7\pos(120,785)}Parte 1/2" in txt_s
+    assert r"\an5\pos(540,1305)" in txt_s
+    assert r"\an5\pos(540,1380)}" in txt_s
+    assert ",120,180,0,1\n" in next(l for l in txt_s.splitlines() if l.startswith("Style: Cap,")) + "\n"
 
 
 def test_render_clip_layout_resolution_fallbacks_and_master_retry(tmp_path: Path, monkeypatch, capsys):
     _clear_layout_and_bar_env(monkeypatch)
     monkeypatch.setenv("CLIPES_MASTER_MODE", "livre")
-    assert render_mod.resolve_layout_mode() == "split-barra"
+    assert render_mod.resolve_layout_mode() == "split-starcuts"
     monkeypatch.setenv("CLIPES_LAYOUT", "invalido")
-    assert render_mod.resolve_layout_mode() == "split-barra"
+    assert render_mod.resolve_layout_mode() == "split-starcuts"
     assert "CLIPES_LAYOUT invalido" in capsys.readouterr().out
     monkeypatch.delenv("CLIPES_LAYOUT")
 
@@ -306,7 +335,7 @@ def test_render_clip_layout_resolution_fallbacks_and_master_retry(tmp_path: Path
     cmds.clear()
     clip2b = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Cam cheia sem reframe")
     render_mod.render_clip(clip2b, 2, [], "", out_dir, cache_dir, live_video_path=src, reframe=False)
-    assert clip2b.layout == "black_bars_16x9"
+    assert clip2b.layout == "blurred_16x9"
 
     # 3) nenhuma -> full without error and without calling detect_speaker_crop
     reframe_called: list[bool] = []
@@ -318,7 +347,7 @@ def test_render_clip_layout_resolution_fallbacks_and_master_retry(tmp_path: Path
     cmds.clear()
     clip3 = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Sem cam")
     render_mod.render_clip(clip3, 3, [], "", out_dir, cache_dir, live_video_path=src, reframe=True)
-    assert clip3.layout == "black_bars_16x9"
+    assert clip3.layout == "blurred_16x9"
     assert reframe_called == []
 
     # 4) facecam.obter raises -> logs [facecam] deteccao falhou and falls back to full
@@ -330,7 +359,7 @@ def test_render_clip_layout_resolution_fallbacks_and_master_retry(tmp_path: Path
     clip4 = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Erro deteccao")
     render_mod.render_clip(clip4, 4, [], "", out_dir, cache_dir, live_video_path=src)
     assert "[facecam] deteccao falhou: yunet missing" in capsys.readouterr().out
-    assert clip4.layout == "black_bars_16x9"
+    assert clip4.layout == "blurred_16x9"
 
     # 5) CLIPES_LAYOUT=full -> does NOT call facecam.obter
     monkeypatch.setenv("CLIPES_LAYOUT", "full")
@@ -344,7 +373,7 @@ def test_render_clip_layout_resolution_fallbacks_and_master_retry(tmp_path: Path
     clip5 = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Full explicito")
     render_mod.render_clip(clip5, 5, [], "", out_dir, cache_dir, live_video_path=src)
     assert obter_calls == []
-    assert clip5.layout == "black_bars_16x9"
+    assert clip5.layout == "blurred_16x9"
     assert "vstack" not in cmds[0][cmds[0].index("-filter_complex") + 1]
 
     # 6) ffmpeg split fails -> falls back to full, sets layout_fallback=True, regenerates ASS
@@ -369,11 +398,11 @@ def test_render_clip_layout_resolution_fallbacks_and_master_retry(tmp_path: Path
     assert "vstack" in fallback_cmds[0][fallback_cmds[0].index("-filter_complex") + 1]
     assert "vstack" not in fallback_cmds[1][fallback_cmds[1].index("-filter_complex") + 1]
     assert clip6.layout_fallback is True
-    assert clip6.layout == "black_bars_16x9"
-    # Regenerated ASS uses full credit position (120,600) instead of split (540,1860)
+    assert clip6.layout == "blurred_16x9"
+    # Regenerated ASS uses full credit position (120,600) instead of split (540,1305)
     ass6 = (cache_dir / "clip_06_fallback-ffmpeg.ass").read_text(encoding="utf-8")
     assert r"\pos(120,600)" in ass6
-    assert r"\pos(540,1860)" not in ass6
+    assert r"\pos(540,1305)" not in ass6
 
     # 7) F4 master retry uses the SAME split layout on the 2nd encode
     monkeypatch.setenv("CLIPES_MASTER_MODE", "discord")
@@ -413,7 +442,7 @@ def test_render_clip_layout_resolution_fallbacks_and_master_retry(tmp_path: Path
     )
     clip8 = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Vertical")
     render_mod.render_clip(clip8, 8, [], "", out_dir, cache_dir, live_video_path=src)
-    assert clip8.layout == "black_bars_16x9"
+    assert clip8.layout == "blurred_16x9"
     assert "vstack" not in vert_cmds[0][vert_cmds[0].index("-filter_complex") + 1]
 
 
@@ -539,8 +568,8 @@ def test_render_clip_real_ffmpeg_split_three_variants_and_corners(tmp_path: Path
             # Blue logo center at (40+60, 25+60) = (100, 85)
             assert frame[85, 100, 2] > 180 and frame[85, 100, 0] < 60
 
-    # Render 1280x720 source with top-right webcam in default split-barra (CLIPES_LAYOUT unset)
-    monkeypatch.delenv("CLIPES_LAYOUT", raising=False)
+    # Render 1280x720 source with top-right webcam in split-barra
+    monkeypatch.setenv("CLIPES_LAYOUT", "split-barra")
     fake_layout_tr = SimpleNamespace(
         split_layout=lambda w, h, fc, variante="split-barra": _make_layout(variante, w, h, fc_corner="tr")
     )
@@ -604,7 +633,7 @@ def test_media2_baixa4_invalid_layout_falls_back_without_double_render(tmp_path:
         clip = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title=f"Bad {idx}")
         render_mod.render_clip(clip, idx, [], "", out_dir, cache_dir, live_video_path=src)
         assert clip.layout_fallback is True
-        assert clip.layout == "black_bars_16x9"
+        assert clip.layout == "blurred_16x9"
         assert len(cmds) == 1
         assert "vstack" not in cmds[0][cmds[0].index("-filter_complex") + 1]
 
@@ -733,18 +762,18 @@ def test_real_ffmpeg_media1_18W_hook_and_baixa1_partbadge_no_overlap(tmp_path: P
             assert 1 <= bands <= 3
 
         frame = _rgb_frame(mp4, 1.5)
-        # BAIXA-1: Cap around emenda_y=870 and PartBadge at emenda_y+70=940 have a clean gap
-        seam_region = frame[820:1030, :]
+        # BAIXA-1: PartBadge at emenda_y+70=940 and Cap at y=1380 have a clean gap
+        seam_region = frame[900:1450, :]
         text_rows = (seam_region.max(axis=2) > 100).any(axis=1)
         v_bands: list[tuple[int, int]] = []
         st = None
         for r_i, active in enumerate(text_rows):
             if active and st is None:
-                st = 820 + r_i
+                st = 900 + r_i
             elif not active and st is not None:
-                v_bands.append((st, 820 + r_i - 1))
+                v_bands.append((st, 900 + r_i - 1))
                 st = None
-        assert len(v_bands) == 2  # Cap band + PartBadge band separated by empty background rows
+        assert len(v_bands) == 2  # PartBadge band + Cap band separated by empty background rows
         assert v_bands[0][1] < v_bands[1][0] - 10
 
     # BAIXA-2 real 3s ffmpeg render: split-barra with CLIPES_SPLIT_BAR_H=200 uses barless style (white text + hook on cam)
@@ -774,3 +803,79 @@ def test_real_ffmpeg_media1_18W_hook_and_baixa1_partbadge_no_overlap(tmp_path: P
     # Bar at y=10 is black (not white), and TopHook renders bright white pixels in cam [200..720]
     assert (frame_b2[10, 540] < 30).all()
     assert (frame_b2[350:550, 300:780].max(axis=2) > 150).any()
+
+
+def test_render_clip_real_ffmpeg_split_starcuts_and_antiflop(tmp_path: Path, monkeypatch):
+    """Real 3s synthetic render in default split-starcuts: pixels, 48kHz audio, and no source/Lavf tags."""
+    _clear_layout_and_bar_env(monkeypatch)
+    monkeypatch.setattr(render_mod, "_WARNED_MISSING_LOGOS", set())
+    assert render_mod.OUTRO_DURATION == 0.5
+    assert render_mod.is_blur_bg_enabled() is True
+    assert render_mod._master_mode() == "livre"
+
+    src = tmp_path / "src_starcuts.mkv"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i",
+            "color=c=#1E9020:s=1920x1080:r=30:d=3.2,"
+            "drawbox=x=16:y=12:w=440:h=310:color=#FF1010:t=fill",
+            "-f", "lavfi", "-i", "sine=frequency=440:duration=3.2",
+            "-metadata", "title=SourceTagShouldBeStripped",
+            "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac", "-shortest", str(src),
+        ],
+        check=True,
+    )
+
+    out_dir = tmp_path / "out" / "starcuts"
+    cache_dir = tmp_path / "cache"
+    out_dir.mkdir(parents=True)
+    cache_dir.mkdir()
+    _install_fake_layout_and_facecam(
+        monkeypatch,
+        SimpleNamespace(tipo="overlay", rect=(0.01, 0.01, 0.22, 0.28), metodo="override"),
+    )
+
+    # Restore real split_layout for split-starcuts (0+600+1320)
+    from clipes import layout as real_layout
+    monkeypatch.setitem(sys.modules, "clipes.layout", real_layout)
+    monkeypatch.setattr(clipes_pkg, "layout", real_layout, raising=False)
+
+    words = [Word(0.5, 1.0, " Olha"), Word(1.1, 1.8, " isso!")]
+    clip = SnappedClip(
+        peak=1.5, start=0.0, end=3.0, score=0.95,
+        title="Que isso mandy??", hook_top="Que isso mandy??",
+    )
+    mp4 = render_mod.render_clip(
+        clip, 1, words, "", out_dir, cache_dir,
+        live_video_path=src, channel_credit="twitch.tv/alanzoka",
+    )
+    assert clip.layout == "split_webcam"
+
+    probe = json.loads(
+        subprocess.run(
+            ["ffprobe", "-v", "error", "-show_format", "-show_streams", "-of", "json", str(mp4)],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    )
+    v_stream = next(s for s in probe["streams"] if s["codec_type"] == "video")
+    a_stream = next(s for s in probe["streams"] if s["codec_type"] == "audio")
+    assert (v_stream["width"], v_stream["height"]) == (1080, 1920)
+    assert a_stream["sample_rate"] == "48000"
+    fmt_tags = probe.get("format", {}).get("tags", {})
+    assert "SourceTagShouldBeStripped" not in json.dumps(probe)
+    assert "Lavf" not in str(fmt_tags.get("encoder", ""))
+
+    frame = _rgb_frame(mp4, 1.5)
+    # Red webcam in top band (y=300, x=540)
+    cam_px = frame[300, 540]
+    assert cam_px[0] > 180 and cam_px[1] < 60 and cam_px[2] < 60
+    # Purple/blue divider bar at y=595, x=100 (strong blue component, B > G)
+    div_px = frame[595, 100]
+    assert int(div_px[2]) > 140 and int(div_px[2]) > int(div_px[1])
+    # White title box at y=660, x=350
+    box_px = frame[660, 350]
+    assert (box_px > 235).all()
+    # Green gameplay below y=770 (y=820, x=540)
+    game_px = frame[820, 540]
+    assert game_px[1] > 100 and game_px[1] > game_px[0] + 40 and game_px[1] > game_px[2] + 40

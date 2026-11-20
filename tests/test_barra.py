@@ -395,7 +395,7 @@ def test_render_clip_real_ffmpeg_brand_bar_with_and_without_logo(tmp_path: Path,
     )
     assert (info["streams"][0]["width"], info["streams"][0]["height"]) == (1080, 1920)
 
-    for sample_t in (1.0, 3.8):  # active clip + outro
+    for sample_t in (1.0, 3.25):  # active clip + outro (0.5s)
         frame = _rgb_frame(mp4_logo, sample_t)
         # White background bar at (x=540, y=10)
         assert (frame[10, 540] > 240).all()
