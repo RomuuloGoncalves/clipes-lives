@@ -881,6 +881,16 @@ def test_index_html_ram_livre_limite_e_selo_diverge():
     assert "pedido do painel diferente do limite do contêiner" in raw
 
 
+def test_index_html_coluna_ram_larga_sem_quebra_de_linha():
+    # a coluna RAM nao pode quebrar "6.79 GB livre / 7.5 GB limite" em varias linhas
+    from pathlib import Path
+
+    raw = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
+    assert ".col-ram { min-width: 15rem; white-space: nowrap; }" in raw
+    assert '<th class="col-ram">RAM</th>' in raw
+    assert 'tdLabel("RAM", "mono col-ram", fmtRam(cap))' in raw
+
+
 # ---- CAPA-04/05: comportamento do JS (funcoes puras extraidas do index.html) ----------------------
 # Com `node` executa as funcoes de verdade. Sem node (o contêiner nao tem) o teste estatico abaixo
 # so confere as expressoes de decisao: limitacao documentada, nao roda o JS.

@@ -410,6 +410,7 @@
 
     .cap-alerta { color: var(--off-fg); font-weight: 700; }
     .selo-diverge { color: var(--warn-fg); font-weight: 700; margin-left: 6px; }
+    .col-ram { min-width: 15rem; white-space: nowrap; }
 
     .slot-list {
       display: flex;
@@ -937,7 +938,7 @@
             <th>PC</th>
             <th>Status</th>
             <th>CPU</th>
-            <th>RAM</th>
+            <th class="col-ram">RAM</th>
             <th>Disco</th>
             <th>Temp</th>
             <th>GPU</th>
@@ -1394,7 +1395,7 @@
           tr.appendChild(tdOn);
 
           tr.appendChild(tdLabel("CPU", "mono", fmtCpu(cap)));
-          var tdRam = tdLabel("RAM", "mono", fmtRam(cap));
+          var tdRam = tdLabel("RAM", "mono col-ram", fmtRam(cap));
           if (temSeloDiverge(cap)) {
             var seloDiverge = el("span", "selo-diverge", "diverge");
             seloDiverge.title = "pedido do painel diferente do limite do contêiner";
