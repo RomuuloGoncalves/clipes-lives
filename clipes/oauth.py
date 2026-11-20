@@ -474,3 +474,65 @@ def auth_flow(
     saved = _update_platform_tokens(tokens_path, plat, entry, replace=True)
     printer("token salvo")
     return saved
+
+
+def _expira_em(entry: dict[str, Any]) -> float | None:
+    raw = entry.get("expires_at")
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        raise ValueError("expires_at")
+    return float(raw)
+
+
+def status_tokens(
+    renovar: bool = False, *, tokens_path: Path | None = None, agora: float | None = None
+) -> list[dict[str, str]]:
+    """Estado por plataforma: ok | ausente | expirado-renovavel | invalido (nunca devolve tokens/segredos).
+
+    `expires_at` (epoch s) e opcional em tokens.json; sem ele a expiracao e "desconhecida" e o estado e ok.
+    Com `renovar`, tenta refresh_google/refresh_tiktok e limpa `expires_at` se der certo.
+    """
+    import time
+
+    now = time.time() if agora is None else agora
+    target = resolve_tokens_path(tokens_path)
+    try:
+        tokens = load_tokens(target)
+        lido = True
+    except OAuthError:
+        tokens, lido = {}, False
+    refreshers = {"youtube": refresh_google, "tiktok": refresh_tiktok}
+    out: list[dict[str, str]] = []
+    for plat in ("youtube", "tiktok"):
+        row = {"plataforma": plat, "estado": "ok", "caminho": str(target), "expira": "desconhecida", "erro": ""}
+        entry = tokens.get(plat)
+        try:
+            if not lido:
+                row["estado"] = "invalido"
+            elif entry is None:
+                row["estado"] = "ausente"
+            elif not isinstance(entry, dict) or not isinstance(entry.get("refresh_token"), str):
+                row["estado"] = "invalido"
+            elif not entry["refresh_token"].strip():
+                row["estado"] = "ausente"
+            else:
+                exp = _expira_em(entry)
+                if exp is not None:
+                    row["expira"] = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp))
+                    if exp <= now:
+                        row["estado"] = "expirado-renovavel"
+        except ValueError:
+            row["estado"] = "invalido"
+        if renovar and row["estado"] in ("ok", "expirado-renovavel"):
+            try:
+                refreshers[plat](tokens_path=target)
+                if "expires_at" in entry:
+                    atual = load_tokens(target)
+                    atual[plat].pop("expires_at", None)
+                    save_tokens(atual, target)
+                row["estado"], row["expira"] = "ok", "renovado agora"
+            except OAuthError as exc:
+                row["estado"], row["erro"] = "invalido", str(exc)
+        out.append(row)
+    return out

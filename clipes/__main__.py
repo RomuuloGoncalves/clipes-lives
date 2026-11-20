@@ -16,7 +16,8 @@ def _auth(argv: list[str]) -> int:
         prog="clipes auth",
         description="Autoriza o YouTube ou TikTok via OAuth local e salva o token em /config/tokens.json.",
     )
-    p.add_argument("plataforma", help="Plataforma OAuth (youtube ou tiktok)")
+    p.add_argument("plataforma", help="Plataforma OAuth (youtube ou tiktok) ou 'status'")
+    p.add_argument("--renovar", action="store_true", help="Com 'status': tenta renovar os tokens")
     p.add_argument(
         "--bind",
         default=None,
@@ -25,6 +26,12 @@ def _auth(argv: list[str]) -> int:
     args = p.parse_args(argv)
 
     plat = args.plataforma.strip().lower()
+    if plat == "status":
+        rows = oauth.status_tokens(args.renovar)
+        for r in rows:
+            erro = f" erro={r['erro']}" if r["erro"] else ""
+            print(f"[auth] {r['plataforma']}: {r['estado']} caminho={r['caminho']} expira={r['expira']}{erro}", flush=True)
+        return 0 if all(r["estado"] == "ok" for r in rows) else 1
     if plat not in ("youtube", "tiktok"):
         print(
             f"[auth] erro: plataforma invalida {args.plataforma!r} (use youtube ou tiktok)",

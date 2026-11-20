@@ -308,3 +308,96 @@ def test_auth_flow_default_bind_127_and_explicit_bind_0_0_0_0_keeps_localhost_re
     assert observed_binds[-1] == "0.0.0.0"
     assert seen_redirects[-1].startswith("http://127.0.0.1:")
 
+
+
+# --- auth status (TOK-01..03) ---
+
+def _status_env(monkeypatch, tmp_path, tokens):
+    f = tmp_path / "tokens.json"
+    if tokens is not None:
+        save_tokens(tokens, f)
+    monkeypatch.setenv("CLIPES_TOKENS_PATH", str(f))
+    for k, v in {
+        "YOUTUBE_CLIENT_ID": "CID-SECRETO", "YOUTUBE_CLIENT_SECRET": "CSEC-YT",
+        "TIKTOK_CLIENT_KEY": "CKEY-SECRETO", "TIKTOK_CLIENT_SECRET": "CSEC-TT",
+    }.items():
+        monkeypatch.setenv(k, v)
+    return f
+
+
+def _rodar(args, capsys):
+    from clipes.__main__ import main
+
+    code = main(["auth", "status", *args])
+    return code, capsys.readouterr().out
+
+
+def test_status_ausente_exit_1(monkeypatch, tmp_path, capsys):
+    f = _status_env(monkeypatch, tmp_path, None)
+    code, out = _rodar([], capsys)
+    assert code == 1
+    assert out.count(": ausente ") == 2 and str(f) in out
+
+
+def test_status_ok_ambas_exit_0_sem_vazar(monkeypatch, tmp_path, capsys):
+    import time
+
+    fut = time.time() + 86400
+    _status_env(monkeypatch, tmp_path, {
+        "youtube": {"refresh_token": "RT-YT-SEGREDO", "expires_at": fut},
+        "tiktok": {"refresh_token": "RT-TT-SEGREDO", "open_id": "OPEN-ID-X"},
+    })
+    code, out = _rodar([], capsys)
+    assert code == 0
+    assert out.count(": ok") == 2
+    for s in ("RT-YT-SEGREDO", "RT-TT-SEGREDO", "OPEN-ID-X", "CID-SECRETO", "CSEC-YT", "CKEY-SECRETO", "CSEC-TT"):
+        assert s not in out
+
+
+def test_status_expirado_e_invalido(monkeypatch, tmp_path, capsys):
+    _status_env(monkeypatch, tmp_path, {
+        "youtube": {"refresh_token": "RT-YT", "expires_at": 1000},
+        "tiktok": "lixo",
+    })
+    code, out = _rodar([], capsys)
+    assert code == 1
+    assert "youtube: expirado-renovavel" in out and "tiktok: invalido" in out
+    assert "1970" in out
+
+
+def test_status_renovar_ok_grava_e_sai_0(monkeypatch, tmp_path, capsys):
+    f = _status_env(monkeypatch, tmp_path, {
+        "youtube": {"refresh_token": "RT-YT", "expires_at": 1000},
+        "tiktok": {"refresh_token": "RT-TT"},
+    })
+    chamadas = []
+
+    def fake_post(url, params, urlopen, timeout, secrets_to_scrub):
+        chamadas.append(url)
+        if "tiktok" in url:
+            return {"access_token": "AT-TT", "refresh_token": "RT-TT-NOVO", "open_id": "o"}
+        return {"access_token": "AT-YT"}
+
+    monkeypatch.setattr("clipes.oauth._post_form", fake_post)
+    code, out = _rodar(["--renovar"], capsys)
+    assert code == 0 and len(chamadas) == 2
+    assert out.count(": ok") == 2
+    for s in ("AT-YT", "AT-TT", "RT-TT-NOVO"):
+        assert s not in out
+    saved = load_tokens(f)
+    assert saved["tiktok"]["refresh_token"] == "RT-TT-NOVO"
+    assert "expires_at" not in saved["youtube"]
+
+
+def test_status_renovar_erro_sanitizado_exit_1(monkeypatch, tmp_path, capsys):
+    _status_env(monkeypatch, tmp_path, {
+        "youtube": {"refresh_token": "RT-YT"}, "tiktok": {"refresh_token": "RT-TT"},
+    })
+
+    def fake_post(url, params, urlopen, timeout, secrets_to_scrub):
+        raise OAuthError("OAuth HTTP 400: invalid_grant ***")
+
+    monkeypatch.setattr("clipes.oauth._post_form", fake_post)
+    code, out = _rodar(["--renovar"], capsys)
+    assert code == 1 and "invalid_grant" in out
+    assert "RT-YT" not in out and "CSEC-YT" not in out
