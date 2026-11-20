@@ -18,13 +18,15 @@ from .models import SnappedClip, Word
 SAFE_MARGIN_L = 120
 SAFE_MARGIN_R = 200
 SAFE_MARGIN_V = 560
-OUTRO_DURATION = 1.2
+OUTRO_DURATION = 0.5
 DEFAULT_BAR_H = 420
 MIN_BAR_H = 300
 MAX_BAR_H = 600
 DEFAULT_BRAND_LOGO = "/app/assets/logo.jpg"
-DEFAULT_LAYOUT = "split-barra"
-VALID_LAYOUTS = ("full", "split-cheio", "split-barra", "split-fina")
+DEFAULT_STARCUTS_OVERLAY = "/app/assets/starcuts_overlay.png"
+DEFAULT_STARCUTS_BARRA_LOGO = "/app/assets/starcuts_barra_logo.png"
+DEFAULT_LAYOUT = "split-starcuts"
+VALID_LAYOUTS = ("full", "split-starcuts", "split-cheio", "split-barra", "split-fina")
 
 _BAR_STYLES: dict[str, tuple[str, str, str]] = {
     "claro": ("#FFFFFF", "#000000", "#606060"),
@@ -59,6 +61,25 @@ class _SplitStyle:
 # Diverge de layout.VARIANTES (name_y, etc.) de proposito: layout.py e a tabela do recorte split_layout (cam/jogo);
 # unificar mudaria o visual dos clipes, por isso as duas tabelas ficam separadas (adiado).
 _SPLIT_STYLES: dict[str, _SplitStyle] = {
+    "split-starcuts": _SplitStyle(
+        bar_bg="",
+        fg="#101010",
+        handle_fg="#707070",
+        text_outline=0,
+        text_shadow=0,
+        logo_size=0,
+        logo_x=0,
+        logo_y=0,
+        text_x_with_logo=0,
+        text_x_no_logo=0,
+        name_y=0,
+        handle_y=0,
+        handle_only_y=0,
+        name_fs=0,
+        handle_fs=0,
+        title_in_bar=True,
+        hook_on_cam=False,
+    ),
     "split-cheio": _SplitStyle(
         bar_bg="",
         fg="#FFFFFF",
@@ -120,7 +141,7 @@ _SPLIT_STYLES: dict[str, _SplitStyle] = {
 
 
 def resolve_layout_mode() -> str:
-    """Resolve CLIPES_LAYOUT env var; empty defaults to split-barra."""
+    """Resolve CLIPES_LAYOUT env var; empty defaults to split-starcuts."""
     raw = os.environ.get("CLIPES_LAYOUT", "").strip().lower()
     if not raw:
         return DEFAULT_LAYOUT
@@ -136,7 +157,7 @@ def _resolve_split_variante(split: Any, variante: str | None = None) -> str:
     if cand == "split-barra" and bar_h < MIN_BAR_H:
         return "split-cheio"
     if cand in _SPLIT_STYLES:
-        if bar_h <= 0 and cand != "split-cheio":
+        if bar_h <= 0 and cand not in ("split-cheio", "split-starcuts"):
             return "split-cheio"
         return cand
     if bar_h <= 0:
@@ -412,16 +433,22 @@ def build_ass(
         if w.end > clip_start and w.start < clip_end and w.clean
     ]
 
-    split_style = (
-        _SPLIT_STYLES[_resolve_split_variante(split, variante)]
+    resolved_split_var = (
+        _resolve_split_variante(split, variante)
         if split is not None
+        else None
+    )
+    split_style = (
+        _SPLIT_STYLES[resolved_split_var]
+        if resolved_split_var is not None
         else None
     )
 
     if split is not None and split_style is not None:
+        is_starcuts = resolved_split_var == "split-starcuts"
         wrapped_hook = (
             wrap_top_hook(hook_top, max_chars=14, max_lines=3)
-            if (split_style.hook_on_cam and hook_top.strip() and content_dur > 0 and is_hook_top_enabled())
+            if (not is_starcuts and split_style.hook_on_cam and hook_top.strip() and content_dur > 0 and is_hook_top_enabled())
             else ""
         )
         hook_dur = min(5.4, content_dur)
@@ -430,18 +457,18 @@ def build_ass(
         hook_margin_l = 60
         hook_margin_r = 60
         hook_pop = r"\fscx75\fscy75\t(0,200,\fscx106\fscy106)\t(200,300,\fscx100\fscy100)"
-        part_y = split.emenda_y + 70
+        part_y = (split.emenda_y + 185) if is_starcuts else (split.emenda_y + 70)
         part_align = 7
         part_pos = f"{{\\an7\\pos(120,{part_y})}}"
         credit_fs = 34
         credit_align = 5
-        credit_pos = f"\\an5\\pos({width // 2},1860)"
+        credit_pos = f"\\an5\\pos({width // 2},1305)"
         card_y = split.emenda_y + split.game_h // 2
         cap_style_line = (
             "Style: Cap,DejaVu Sans,72,&H00FFFFFF,&H0000FFFF,&H00000000,&H80000000,"
-            "-1,0,0,0,100,100,0,0,1,5,2,5,60,60,0,1\n"
+            "-1,0,0,0,100,100,0,0,1,5,2,5,120,180,0,1\n"
         )
-        cap_prefix = f"{{\\an5\\pos({width // 2},{split.emenda_y})}}"
+        cap_prefix = f"{{\\an5\\pos({width // 2},1380)}}"
     else:
         wrapped_hook = (
             wrap_top_hook(hook_top)
@@ -484,19 +511,25 @@ def build_ass(
     if split is not None and split_style is not None:
         fg_ass = _ass_color(split_style.fg)
         handle_ass = _ass_color(split_style.handle_fg)
-        if bar is not None:
-            ol, sh = split_style.text_outline, split_style.text_shadow
+        if resolved_split_var == "split-starcuts":
             bar_styles += (
-                f"Style: BarName,DejaVu Sans,{split_style.name_fs},{fg_ass},{fg_ass},&H00000000&,&H80000000&,"
-                f"-1,0,0,0,100,100,0,0,1,{ol},{sh},7,60,60,0,1\n"
-                f"Style: BarHandle,DejaVu Sans,{split_style.handle_fs},{handle_ass},{handle_ass},&H00000000&,&H80000000&,"
-                f"0,0,0,0,100,100,0,0,1,{ol},{sh},7,60,60,0,1\n"
-            )
-        if split_style.title_in_bar and split.bar_h >= MIN_BAR_H:
-            bar_styles += (
-                f"Style: BarTitle,DejaVu Sans,58,{fg_ass},{fg_ass},&H00000000&,&H00000000&,"
+                "Style: BarTitle,DejaVu Sans,44,&H00101010&,&H00101010&,&H00000000&,&H00000000&,"
                 "-1,0,0,0,100,100,0,0,1,0,0,5,60,60,0,1\n"
             )
+        else:
+            if bar is not None:
+                ol, sh = split_style.text_outline, split_style.text_shadow
+                bar_styles += (
+                    f"Style: BarName,DejaVu Sans,{split_style.name_fs},{fg_ass},{fg_ass},&H00000000&,&H80000000&,"
+                    f"-1,0,0,0,100,100,0,0,1,{ol},{sh},7,60,60,0,1\n"
+                    f"Style: BarHandle,DejaVu Sans,{split_style.handle_fs},{handle_ass},{handle_ass},&H00000000&,&H80000000&,"
+                    f"0,0,0,0,100,100,0,0,1,{ol},{sh},7,60,60,0,1\n"
+                )
+            if split_style.title_in_bar and split.bar_h >= MIN_BAR_H:
+                bar_styles += (
+                    f"Style: BarTitle,DejaVu Sans,58,{fg_ass},{fg_ass},&H00000000&,&H00000000&,"
+                    "-1,0,0,0,100,100,0,0,1,0,0,5,60,60,0,1\n"
+                )
     elif bar is not None:
         fg_ass = _ass_color(bar.fg)
         handle_ass = _ass_color(bar.handle_fg)
@@ -535,22 +568,7 @@ def build_ass(
     if total_dur > 0:
         bar_end = _ass_time(total_dur)
         if split is not None and split_style is not None:
-            if bar is not None:
-                text_x = split_style.text_x_with_logo if bar.logo is not None else split_style.text_x_no_logo
-                safe_display = _ass_escape(bar.display.strip())
-                safe_handle = _ass_escape(bar.handle.strip())
-                if safe_display:
-                    events.append(
-                        f"Dialogue: 3,0:00:00.00,{bar_end},BarName,,0,0,0,,"
-                        f"{{\\an7\\pos({text_x},{split_style.name_y})}}{safe_display}"
-                    )
-                if safe_handle:
-                    handle_y = split_style.handle_y if safe_display else split_style.handle_only_y
-                    events.append(
-                        f"Dialogue: 3,0:00:00.00,{bar_end},BarHandle,,0,0,0,,"
-                        f"{{\\an7\\pos({text_x},{handle_y})}}{safe_handle}"
-                    )
-            if split_style.title_in_bar and split.bar_h >= MIN_BAR_H:
+            if resolved_split_var == "split-starcuts":
                 bar_title_src = hook_top.strip() or title.strip()
                 wrapped_title = (
                     wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
@@ -558,11 +576,39 @@ def build_ass(
                     else ""
                 )
                 if wrapped_title:
-                    title_y = (195 + max(220, split.bar_h - 15)) // 2
                     events.append(
                         f"Dialogue: 3,0:00:00.00,{bar_end},BarTitle,,0,0,0,,"
-                        f"{{\\an5\\pos({width // 2},{title_y})}}{wrapped_title}"
+                        f"{{\\an5\\pos({width // 2},{split.emenda_y + 96})}}{wrapped_title}"
                     )
+            else:
+                if bar is not None:
+                    text_x = split_style.text_x_with_logo if bar.logo is not None else split_style.text_x_no_logo
+                    safe_display = _ass_escape(bar.display.strip())
+                    safe_handle = _ass_escape(bar.handle.strip())
+                    if safe_display:
+                        events.append(
+                            f"Dialogue: 3,0:00:00.00,{bar_end},BarName,,0,0,0,,"
+                            f"{{\\an7\\pos({text_x},{split_style.name_y})}}{safe_display}"
+                        )
+                    if safe_handle:
+                        handle_y = split_style.handle_y if safe_display else split_style.handle_only_y
+                        events.append(
+                            f"Dialogue: 3,0:00:00.00,{bar_end},BarHandle,,0,0,0,,"
+                            f"{{\\an7\\pos({text_x},{handle_y})}}{safe_handle}"
+                        )
+                if split_style.title_in_bar and split.bar_h >= MIN_BAR_H:
+                    bar_title_src = hook_top.strip() or title.strip()
+                    wrapped_title = (
+                        wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
+                        if bar_title_src
+                        else ""
+                    )
+                    if wrapped_title:
+                        title_y = (195 + max(220, split.bar_h - 15)) // 2
+                        events.append(
+                            f"Dialogue: 3,0:00:00.00,{bar_end},BarTitle,,0,0,0,,"
+                            f"{{\\an5\\pos({width // 2},{title_y})}}{wrapped_title}"
+                        )
         elif bar is not None:
             text_x = 240 if bar.logo is not None else 60
             safe_display = _ass_escape(bar.display.strip())
@@ -748,8 +794,8 @@ def _escape_ffmpeg_filter_path(path: Path) -> str:
 
 
 def is_blur_bg_enabled() -> bool:
-    """Blurred background only when CLIPES_BLUR_BG is explicitly enabled ('1', 'true', 'yes', 'on'). Default: black bars."""
-    return config.env_flag("CLIPES_BLUR_BG", False)
+    """Blurred background enabled by default; disable with CLIPES_BLUR_BG=0/false/no/off."""
+    return config.env_flag("CLIPES_BLUR_BG", True)
 
 
 def _circular_logo_filter(size: int = 150) -> str:
@@ -765,6 +811,7 @@ def _build_split_video_parts(
     bar: BarConfig | None,
     variante: str,
     has_hook: bool,
+    starcuts_overlay: bool = True,
 ) -> tuple[list[str], str]:
     style = _SPLIT_STYLES[variante]
     cam = split.cam
@@ -783,7 +830,11 @@ def _build_split_video_parts(
         f"[cam][game]vstack=inputs=2{pad_bar}[v_base]",
     ]
     cur = "[v_base]"
-    if bar is not None and bar.logo is not None:
+    if variante == "split-starcuts":
+        if starcuts_overlay:
+            vf_parts.append(f"{cur}[1:v]overlay=0:{split.emenda_y - 79}[v_logo]")
+            cur = "[v_logo]"
+    elif bar is not None and bar.logo is not None:
         vf_parts.append(_circular_logo_filter(style.logo_size))
         vf_parts.append(f"{cur}[logo]overlay={style.logo_x}:{style.logo_y}[v_logo]")
         cur = "[v_logo]"
@@ -801,6 +852,7 @@ def build_video_filter(
     split: Any | None = None,
     variante: str | None = None,
     has_hook: bool = False,
+    starcuts_overlay: bool = True,
 ) -> tuple[str, str]:
     """Build ffmpeg -filter_complex string and mapped video pad label."""
     if blur_bg is None:
@@ -808,7 +860,9 @@ def build_video_filter(
 
     if split is not None:
         resolved_var = _resolve_split_variante(split, variante)
-        vf_parts, cur = _build_split_video_parts(split, bar, resolved_var, has_hook)
+        vf_parts, cur = _build_split_video_parts(
+            split, bar, resolved_var, has_hook, starcuts_overlay=starcuts_overlay,
+        )
     elif bar is None:
         if crop is not None:
             cx, cy, cw, ch = crop
@@ -887,7 +941,28 @@ def build_audio_filter(
 
 def _master_mode() -> str:
     raw = os.environ.get("CLIPES_MASTER_MODE", "").strip().lower()
-    return "livre" if raw == "livre" else "discord"
+    return "discord" if raw == "discord" else "livre"
+
+
+def _resolve_starcuts_overlay(has_title_text: bool) -> Path | None:
+    """Resolve Star Cuts PNG overlay path for split-starcuts, or None if disabled/missing."""
+    if os.environ.get("CLIPES_BAR", "").strip().lower() in ("0", "false", "no", "off"):
+        return None
+    if has_title_text:
+        raw = os.environ.get("CLIPES_STARCUTS_OVERLAY", "").strip() or DEFAULT_STARCUTS_OVERLAY
+    else:
+        raw = DEFAULT_STARCUTS_BARRA_LOGO
+    overlay_path = Path(raw)
+    try:
+        exists = overlay_path.is_file() and os.access(overlay_path, os.R_OK) and overlay_path.stat().st_size > 0
+    except OSError:
+        exists = False
+    if exists:
+        return overlay_path
+    if raw not in _WARNED_MISSING_LOGOS:
+        _WARNED_MISSING_LOGOS.add(raw)
+        print(f"[render] overlay starcuts nao encontrado: {raw}", flush=True)
+    return None
 
 
 def _build_render_cmd(
@@ -918,7 +993,14 @@ def _build_render_cmd(
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "21",
         *rate_args,
         "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "160k", "-af", af_chain,
+        "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-af", af_chain,
+        "-map_metadata", "-1",
+        "-map_metadata:s:v", "-1",
+        "-map_metadata:s:a", "-1",
+        "-map_chapters", "-1",
+        "-fflags", "+bitexact",
+        "-flags:v", "+bitexact",
+        "-flags:a", "+bitexact",
         "-t", f"{total_dur:.3f}",
         "-movflags", "+faststart",
         str(tmp_out),
@@ -1094,9 +1176,16 @@ def render_clip(
         clip.layout = "split_webcam" if split_obj is not None else full_layout_name  # type: ignore[attr-defined]
 
         has_hook = bool(clip.hook_top.strip() and clip.duration > 0 and is_hook_top_enabled())
+        has_title_text = bool(clip.hook_top.strip() or clip.title.strip())
         af_chain = build_audio_filter(clip.duration, outro_duration=OUTRO_DURATION)
         total_dur = clip.duration + OUTRO_DURATION
-        logo_args = ["-i", str(bar.logo)] if (bar is not None and bar.logo is not None) else []
+        starcuts_overlay_path = (
+            _resolve_starcuts_overlay(has_title_text)
+            if (split_obj is not None and split_variante == "split-starcuts")
+            else None
+        )
+        has_starcuts_overlay = starcuts_overlay_path is not None
+        bar_logo_args = ["-i", str(bar.logo)] if (bar is not None and bar.logo is not None) else []
 
         mode = _master_mode()
         rate_kbps: int | None = None
@@ -1141,6 +1230,12 @@ def render_clip(
             n_subs: int,
         ) -> None:
             downscale = maxrate is not None and maxrate < 1500
+            active_is_starcuts = active_split is not None and active_var == "split-starcuts"
+            active_logo_args = (
+                (["-i", str(starcuts_overlay_path)] if starcuts_overlay_path is not None else [])
+                if active_is_starcuts
+                else bar_logo_args
+            )
             filter_complex, v_map = build_video_filter(
                 ass_path=ass_path,
                 n_subs=n_subs,
@@ -1152,11 +1247,12 @@ def render_clip(
                 split=active_split,
                 variante=active_var,
                 has_hook=active_hook,
+                starcuts_overlay=has_starcuts_overlay,
             )
             cmd = _build_render_cmd(
                 pre_args=pre_args,
                 src_path=src_path,
-                logo_args=logo_args,
+                logo_args=active_logo_args,
                 filter_complex=filter_complex,
                 v_map=v_map,
                 af_chain=af_chain,
