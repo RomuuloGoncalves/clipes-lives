@@ -1469,3 +1469,155 @@ def test_run_pending_falha_ao_editar_estado_nao_vira_erro(tmp_path: Path, monkey
 
 
 
+
+
+# --- antiflop-v2 T14: gate, dedup e visibilidade global ---
+
+
+def _patch_clip(clips_json: Path, **campos: Any) -> None:
+    m = json.loads(clips_json.read_text(encoding="utf-8"))
+    m["clips"][0].update(campos)
+    clips_json.write_text(json.dumps(m), encoding="utf-8")
+
+
+def _setup_pub(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **clip_extra: Any) -> tuple[Path, Path]:
+    clips_json = _make_clip_fixture(tmp_path, owner="w-pc1")
+    _patch_clip(clips_json, **clip_extra)
+    monkeypatch.setenv("DISCORD_ALLOWED_USER_IDS", ALLOWED_USER)
+    for k in ("CLIPES_GATE", "CLIPES_DEDUP_PHASH", "CLIPES_VISIBILIDADE"):
+        monkeypatch.delenv(k, raising=False)
+    tokens_path = tmp_path / "tokens.json"
+    _write_tokens(tokens_path, {
+        "youtube": {"refresh_token": SECRET_REFRESH, "access_token": SECRET_ACCESS},
+        "tiktok": {"refresh_token": SECRET_REFRESH, "access_token": SECRET_ACCESS},
+    })
+    return clips_json, tokens_path
+
+
+_GATE_RUIM = {"ok": False, "motivos": ["hook_ausente", "resolucao"], "versao": 1}
+
+
+def test_gate_bloquear_recusa_com_motivos_sem_cota_nem_agenda(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _, tokens_path = _setup_pub(tmp_path, monkeypatch, gate=_GATE_RUIM)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    res = request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path,
+                  quota_path=tmp_path / "quota.json")
+    assert "hook_ausente" in res and "resolucao" in res
+    assert store.get_request("live1_c01", "youtube") is None
+    assert store.find_pending() == []
+    assert not (tmp_path / "quota.json").exists()
+
+
+def test_gate_avisar_publica_e_anexa_motivos(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _, tokens_path = _setup_pub(tmp_path, monkeypatch, gate=_GATE_RUIM)
+    monkeypatch.setenv("CLIPES_GATE", "avisar")
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    res = request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    assert "publicacao enfileirada" in res
+    assert "hook_ausente" in res and "resolucao" in res
+    assert store.get_request("live1_c01", "youtube") is not None
+
+
+def test_gate_off_ignora_gate_reprovado(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _, tokens_path = _setup_pub(tmp_path, monkeypatch, gate=_GATE_RUIM)
+    monkeypatch.setenv("CLIPES_GATE", "off")
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    res = request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    assert "publicacao enfileirada" in res and "hook_ausente" not in res
+
+
+def test_config_global_do_mongo_vence_env_do_gate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _, tokens_path = _setup_pub(tmp_path, monkeypatch, gate=_GATE_RUIM)
+    monkeypatch.setenv("CLIPES_GATE", "off")
+    _, db = _mongo_with_worker()
+    db.config_global.insert_one({"_id": "global", "config": {"CLIPES_GATE": "bloquear"}})
+    res = request(MongoStore(db), "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    assert "hook_ausente" in res
+    assert db.publish_requests.count_documents({}) == 0
+
+
+def _registro_com_publicado(tmp_path: Path, **campos: Any) -> None:
+    rec = {"canal": "gaules", "publicacoes": {"youtube": {"id": "x", "url": "", "em": 1}}, **campos}
+    (tmp_path / "registro.json").write_text(
+        json.dumps({"version": 1, "clips": {"outro_c09": rec}}), encoding="utf-8"
+    )
+
+
+@pytest.mark.parametrize(
+    "registro, clip",
+    [
+        ({"texto_hash": "abc123"}, {"texto_hash": "abc123"}),
+        ({"phash": 0b1111}, {"phash": 0b1100}),  # distancia 2 <= 6
+        ({"inicio_abs": 100.0, "fim_abs": 140.0}, {"inicio_abs": 110.0, "fim_abs": 150.0}),  # 30/40 sobrepoe
+    ],
+    ids=["texto", "phash", "trecho"],
+)
+def test_duplicado_e_recusado(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registro, clip):
+    _, tokens_path = _setup_pub(tmp_path, monkeypatch, **clip)
+    _registro_com_publicado(tmp_path, **registro)
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    res = request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    assert res == "duplicado de outro_c09"
+    assert store.find_pending() == []
+
+
+def test_phash_distante_ou_desligado_nao_e_duplicado(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    _, tokens_path = _setup_pub(tmp_path, monkeypatch, phash=0b1100)
+    _registro_com_publicado(tmp_path, phash=0b1111)
+    monkeypatch.setenv("CLIPES_DEDUP_PHASH", "0")
+    store = LocalStore(tmp_path / ".publicacoes.json")
+    res = request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path)
+    assert "publicacao enfileirada" in res
+
+
+def _run_visibilidade(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_doc: dict | None, plat: str):
+    _, tokens_path = _setup_pub(tmp_path, monkeypatch)
+    _, db = _mongo_with_worker()
+    if config_doc is not None:
+        db.config_global.insert_one({"_id": "global", "config": config_doc})
+    store = MongoStore(db)
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path,
+            platforms=(plat,), agendar=False)
+    seen: list[dict] = []
+
+    def fake_pub(mp4, *a, **kw):
+        seen.append(kw)
+        return {"video_id": "vid1", "publish_id": "vid1"}
+
+    run_pending(store, "w-pc1", out_root=tmp_path, now=T0, tokens_path=tokens_path, publishers={plat: fake_pub})
+    return seen, store.get_request("live1_c01", plat)
+
+
+@pytest.mark.parametrize("plat, esperado", [("youtube", "public"), ("tiktok", "PUBLIC_TO_EVERYONE")])
+def test_visibilidade_public_vira_privacy_e_e_gravada(tmp_path, monkeypatch, plat, esperado):
+    seen, req = _run_visibilidade(tmp_path, monkeypatch, {"CLIPES_VISIBILIDADE": "public"}, plat)
+    assert seen == [{"privacy": esperado}]
+    assert req["resultado"]["privacidade"] == esperado
+
+
+@pytest.mark.parametrize("config_doc", [None, {"CLIPES_VISIBILIDADE": "padrao"}])
+def test_visibilidade_padrao_ou_sem_config_nao_passa_privacy(tmp_path, monkeypatch, config_doc):
+    seen, req = _run_visibilidade(tmp_path, monkeypatch, config_doc, "youtube")
+    assert seen == [{}]
+    assert req["resultado"]["privacidade"] == "private"
+
+
+def test_privacidade_gravada_no_registro(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import hashlib
+    from clipes.registro import Registro
+
+    mp4 = tmp_path / "2026-11-17 - Live [live1]" / "clip_01_jogada_epica.mp4"
+    _, tokens_path = _setup_pub(tmp_path, monkeypatch)
+    Registro(tmp_path).upsert({
+        "clip_id": "live1_c01", "canal": "gaules", "arquivo": str(mp4.relative_to(tmp_path)),
+        "tamanho": mp4.stat().st_size, "sha256": hashlib.sha256(mp4.read_bytes()).hexdigest(),
+    })
+    _, db = _mongo_with_worker()
+    db.config_global.insert_one({"_id": "global", "config": {"CLIPES_VISIBILIDADE": "public"}})
+    store = MongoStore(db)
+    request(store, "live1_c01", ALLOWED_USER, T0, out_root=tmp_path, tokens_path=tokens_path,
+            platforms=("youtube",), agendar=False)
+    run_pending(store, "w-pc1", out_root=tmp_path, now=T0, tokens_path=tokens_path,
+                publishers={"youtube": lambda *a, **kw: {"video_id": "vid1"}})
+    pub = Registro(tmp_path).get("live1_c01")["publicacoes"]["youtube"]
+    assert pub["id"] == "vid1" and pub["privacidade"] == "public"

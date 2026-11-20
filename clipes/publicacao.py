@@ -1070,6 +1070,10 @@ def request(
         ready_str = _dt(ready_at).strftime("%Y-%m-%d %H:%M UTC")
         return f"aguardar ate {ready_str}"
 
+    recusa, aviso_gate = _gate_e_dup(found, clip_id, root, getattr(adapted, "db", None))
+    if recusa:
+        return recusa
+
     tok_map = _load_tokens(tokens, tokens_path)
     owner = worker_id or found.get("owner") or (_local_worker_id(root) if root is not None else None) or "local"
     eff_thread_id = thread_id or found.get("thread_id")
@@ -1146,6 +1150,8 @@ def request(
         else:
             messages.append(f"{plat}: publicacao enfileirada{sched_suffix}")
 
+    if messages and aviso_gate:
+        messages.append(aviso_gate)
     return "\n".join(messages) if messages else "nenhuma plataforma configurada"
 
 
@@ -1175,18 +1181,19 @@ def _default_publish(
     clip: dict[str, Any],
     access_token: str,
     refresh: Callable[[], str] | None = None,
+    privacy: str | None = None,
 ) -> dict[str, Any]:
     if plataforma == "youtube":
         from . import publicar_youtube  # lazy: module from T5
 
         title = str(clip.get("title") or clip.get("clip_id") or mp4_path.stem)
         desc = str(clip.get("description_long") or clip.get("caption") or title)
-        return publicar_youtube.publish(mp4_path, title, desc, access_token, refresh=refresh)
+        return publicar_youtube.publish(mp4_path, title, desc, access_token, refresh=refresh, privacy=privacy)
     if plataforma == "tiktok":
         from . import publicar_tiktok  # lazy: module from T6
 
         caption = str(clip.get("caption") or clip.get("title") or mp4_path.stem)
-        return publicar_tiktok.publish(mp4_path, caption, access_token, refresh=refresh)
+        return publicar_tiktok.publish(mp4_path, caption, access_token, refresh=refresh, privacy=privacy)
     raise ValueError(f"unknown platform: {plataforma}")
 
 
@@ -1196,13 +1203,63 @@ def _call_publisher(
     mp4_path: Path,
     clip: dict[str, Any],
     access_token: str,
+    privacy: str | None = None,
 ) -> dict[str, Any]:
+    extra = {"privacy": privacy} if privacy is not None else {}
     if plataforma == "youtube":
         title = str(clip.get("title") or clip.get("clip_id") or mp4_path.stem)
         desc = str(clip.get("description_long") or clip.get("caption") or title)
-        return fn(mp4_path, title, desc, access_token)
+        return fn(mp4_path, title, desc, access_token, **extra)
     caption = str(clip.get("caption") or clip.get("title") or mp4_path.stem)
-    return fn(mp4_path, caption, access_token)
+    return fn(mp4_path, caption, access_token, **extra)
+
+
+_VISIBILIDADE: dict[str, dict[str, str]] = {
+    "public": {"youtube": "public", "tiktok": "PUBLIC_TO_EVERYONE"},
+    "private": {"youtube": "private", "tiktok": "SELF_ONLY"},
+}
+
+
+def _cfg_val(g: dict[str, str], key: str, default: str) -> str:
+    """Config global do Mongo vence o env; sem nenhum dos dois, `default`."""
+    return (g.get(key) or os.environ.get(key) or default).strip()
+
+
+def _privacy_for(visibilidade: str, plat: str) -> str | None:
+    """`padrao` (ou desconhecido) -> None: o publisher mantem o comportamento atual."""
+    return _VISIBILIDADE.get(visibilidade, {}).get(plat)
+
+
+def _gate_e_dup(found: dict[str, Any], clip_id: str, root: Path | None, db: Any) -> tuple[str | None, str]:
+    """(recusa, aviso) para o `request`: gate `bloquear`, duplicado ou gate `avisar`."""
+    g = config.config_global(db)
+    clip = found.get("clip") or {}
+    rec = found.get("registro") or {}
+    modo = _cfg_val(g, "CLIPES_GATE", "bloquear")
+    gate = clip.get("gate") or rec.get("gate") or {}
+    aviso = ""
+    if modo != "off" and gate.get("ok") is False:
+        motivos = ", ".join(gate.get("motivos") or ["?"])
+        if modo == "bloquear":
+            return f"bloqueado pelo gate: {motivos}", ""
+        aviso = f"aviso do gate: {motivos}"
+    if root is not None and (root / "registro.json").is_file():
+        def pick(k: str) -> Any:
+            return clip.get(k) if clip.get(k) is not None else rec.get(k)
+
+        try:
+            ini, fim = float(pick("inicio_abs") or 0), float(pick("fim_abs") or 0)
+            phash_max = int(_cfg_val(g, "CLIPES_DEDUP_PHASH", "6"))
+        except (TypeError, ValueError):
+            ini = fim = 0.0
+            phash_max = 6
+        dups = Registro(root).similares(
+            found.get("channel") or "", ini, fim, str(pick("texto_hash") or ""), pick("phash"),
+            phash_max, excluir=clip_id,
+        )
+        if dups:
+            return f"duplicado de {dups[0][0]}", ""
+    return None, aviso
 
 
 def _is_401_error(exc: BaseException) -> bool:
@@ -1472,6 +1529,8 @@ def run_pending(
     mongo_db = getattr(adapted, "db", None)
     reg = Registro(root, mongo=mongo_db) if root is not None else None
     outcomes: list[dict[str, Any]] = []
+    # config global lida a cada ciclo; sem Mongo vale o env/padrao
+    visibilidade = _cfg_val(config.config_global(mongo_db), "CLIPES_VISIBILIDADE", "padrao")
 
     now_fn_ts = _now_ts(now)
     max_n = limit if limit is not None and limit > 0 else _pub_max_por_ciclo()
@@ -1704,11 +1763,12 @@ def run_pending(
 
                 pub_fn = (publishers or {}).get(plat)
                 clip_entry = found["clip"]
+                privacy = _privacy_for(visibilidade, plat)
 
                 def invoke(tok: str) -> dict[str, Any]:
                     if pub_fn is not None:
-                        return _call_publisher(pub_fn, plat, mp4_path, clip_entry, tok)
-                    return _default_publish(plat, mp4_path, clip_entry, tok, refresh=do_refresh)
+                        return _call_publisher(pub_fn, plat, mp4_path, clip_entry, tok, privacy)
+                    return _default_publish(plat, mp4_path, clip_entry, tok, refresh=do_refresh, privacy=privacy)
 
                 try:
                     res = invoke(str(access_token))
@@ -1811,13 +1871,13 @@ def run_pending(
                     print(f"[publicacao] falha ao registrar cota de {clip_id} ({aviso_cota})", flush=True)
                 pub_id = str(res.get("video_id") or res.get("publish_id") or res.get("id") or "")
                 if plat == "youtube":
-                    priv = "private"
+                    priv = privacy or "private"
                     url = str(res.get("url") or (f"https://youtube.com/shorts/{pub_id}" if pub_id else ""))
                     resultado: dict[str, Any] = {"video_id": pub_id, "privacidade": priv}
                     if url:
                         resultado["url"] = url
                 else:
-                    priv = "SELF_ONLY"
+                    priv = privacy or "SELF_ONLY"
                     url = str(res.get("url") or "")
                     resultado = {"publish_id": pub_id, "privacidade": priv}
                     if url:
@@ -1850,6 +1910,11 @@ def run_pending(
                             plat,
                             {"id": pub_id, "url": url, "em": now_ts},
                         )
+                        # registrar_publicacao nao guarda a privacidade: acrescenta em publicacoes.<plat>
+                        rec_pub = reg.get(clip_id) or {}
+                        pubs = dict(rec_pub.get("publicacoes") or {})
+                        pubs[plat] = {**dict(pubs.get(plat) or {}), "privacidade": priv}
+                        reg.marcar(clip_id, publicacoes=pubs)
                     except Exception as exc:
                         safe_err = _sanitize_text(f"{type(exc).__name__}: {exc}", secrets)
                         print(f"[publicacao] falha ao registrar publicacao de {clip_id} ({safe_err})", flush=True)
