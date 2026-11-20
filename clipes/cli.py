@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from . import cloud_llm, config, traducao
+from . import cloud_llm, config, gate, traducao
 from .asr import transcribe_candidates, transcribe_fast_blocks
 from .candidates import pick_candidate_peaks, pick_quota_candidates
 from .eval import count_speech_words, evaluate_clips, speech_gate
@@ -23,6 +23,7 @@ from .ingest import format_channel_credit, ingest, probe_metadata, sanitize_id
 from .llm import (
     enrich_clips_with_llm,
     format_long_description,
+    FORBIDDEN_HASHTAGS,
     format_three_line_caption,
     long_paragraph_fallback,
     pick_hook_top,
@@ -31,9 +32,9 @@ from .llm import (
 from .models import CandidatePeak, SignalBundle, TopicSegment, Word
 from .monitor import follow_live
 from .notificar import _write_json_atomic, notify_discord
-from .render import OUTRO_DURATION, clip_stem, generate_title, is_blur_bg_enabled, render_clip
+from .render import OUTRO_DURATION, clip_stem, generate_title, render_clip
 from .signals import compute_rms_db, compute_signals, triage_audio_blocks
-from .snap import select_clips
+from .snap import cortar_silencio_inicial, select_clips
 from .topics import score_topic_segments
 
 
@@ -44,8 +45,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("url", help="URL do vídeo/VOD/live (YouTube, Twitch ou Kick)")
     p.add_argument("--max-clips", type=int, default=8, help="Máximo de clipes a gerar (padrão: 8)")
-    p.add_argument("--min-dur", type=float, default=25.0, help="Duração mínima do clipe em s (padrão: 25)")
-    p.add_argument("--max-dur", type=float, default=65.0, help="Duração máxima do clipe em s (padrão: 65)")
+    p.add_argument("--min-dur", type=float, default=config.env_float("CLIPES_DUR_MIN", 15.0),
+                   help="Duração mínima do clipe em s (padrão: CLIPES_DUR_MIN, 15)")
+    p.add_argument("--max-dur", type=float, default=config.env_float("CLIPES_DUR_MAX", 45.0),
+                   help="Duração máxima do clipe em s (padrão: CLIPES_DUR_MAX, 45)")
     p.add_argument("--live-minutes", type=float, default=20.0,
                    help="Minutos a gravar se a URL for uma live ativa (padrão: 20)")
     p.add_argument("--ate-acabar", action="store_true", help=argparse.SUPPRESS)
@@ -340,6 +343,15 @@ def _apply_speech_gate(clips: list[Any], words: list[Word]) -> list[Any]:
     return kept
 
 
+def _dimensoes_ou_padrao(mp4: Path) -> tuple[int, int]:
+    """ffprobe falhou = sem evidencia de resolucao errada: nao reprova o clipe por isso."""
+    try:
+        return gate.dimensoes(mp4)
+    except Exception as exc:
+        print(f"[gate] ffprobe indisponivel ({exc}); resolucao nao verificada", flush=True)
+        return 1080, 1920
+
+
 def run_pipeline(args: argparse.Namespace) -> int:
     if getattr(args, "ate_acabar", False):
         print("removido: use ./clipar servico (e /live adicionar no Discord)", file=sys.stderr, flush=True)
@@ -460,6 +472,8 @@ def run_pipeline(args: argparse.Namespace) -> int:
     print(f"[snap] Final valid clips: {len(clips)}/{len(candidates)}", flush=True)
 
     clips = _apply_speech_gate(clips, words)
+    hook_max_atraso = config.env_float("CLIPES_HOOK_MAX_ATRASO", 1.0)
+    clips = [cortar_silencio_inicial(c, words, hook_max_atraso, args.min_dur) for c in clips]
 
     if not clips:
         note = "Nenhum candidato formou clipe válido dentro das restrições de borda/duração."
@@ -503,7 +517,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     timings["llm_s"] = round(time.perf_counter() - t_llm, 2)
 
     t5 = time.perf_counter()
-    default_layout = "blurred_16x9" if is_blur_bg_enabled() else "black_bars_16x9"
+    default_layout = "blurred_16x9"
     safe_video_id = sanitize_id(ing.video_id)
     effective_channel = channel_credit or getattr(ing, "channel", "") or ing.title
     layout_key = _resolve_layout_key(
@@ -595,7 +609,35 @@ def run_pipeline(args: argparse.Namespace) -> int:
             desc_path = ing.out_dir / Path(clip.output_file).with_suffix(".descricao.txt")
             desc_path.write_text(clip.description_long, encoding="utf-8")
 
+        gate_extra: dict[str, Any] = {}
+        if os.environ.get("CLIPES_GATE", "").strip().lower() != "off":
+            mp4 = None if args.skip_render else ing.out_dir / clip.output_file
+            c_words = [w for w in words if clip.start <= w.start < clip.end]
+            gate_extra["hook_cabe"] = bool(getattr(clip, "hook_cabe", True))
+            gate_extra["texto_hash"] = gate.texto_hash(c_words)
+            if mp4 is not None:
+                try:
+                    gate_extra["phash"] = gate.dhash(mp4, 1.0)
+                except Exception as exc:
+                    print(f"[gate] phash indisponivel ({exc})", flush=True)
+            gate_extra["gate"] = gate.avaliar(
+                {
+                    "hook_top": getattr(clip, "hook_top", ""), "hook_cabe": gate_extra["hook_cabe"],
+                    "start": clip.start, "end": clip.end, "layout": clip_layout,
+                    "caption": clip.caption, "hashtags": list(clip.hashtags), "idioma": lang or "pt",
+                },
+                c_words, mp4,
+                {
+                    "hook_max_atraso": hook_max_atraso,
+                    "dur_min": args.min_dur, "dur_max": args.max_dur,
+                    "hashtags_max": config.env_int("CLIPES_HASHTAGS", 3),
+                    "hashtags_banidas": FORBIDDEN_HASHTAGS,
+                },
+                dimensoes_fn=_dimensoes_ou_padrao,
+            )
+
         clip_entry: dict[str, Any] = {
+            **gate_extra,
             "index": idx,
             "clip_id": f"{safe_video_id}_c{idx:02d}",
             "file": clip.output_file,

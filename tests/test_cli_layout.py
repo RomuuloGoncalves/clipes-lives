@@ -219,3 +219,53 @@ def test_cli_resolve_layout_key_strips_kick_prefixes_and_help_mentions_kick():
     assert cli._resolve_layout_key("http://kick.com/foo-bar/", "vid1") == "foo-bar"
     assert cli._resolve_layout_key("https://www.twitch.tv/gaules", "vid1") == "gaules"
     assert "Kick" in cli.build_parser().format_help()
+
+
+def _run_gate_pipeline(tmp_path, monkeypatch, words_first=10.0):
+    from clipes import gate
+    ing = _make_ing(tmp_path, video_id="gate1", channel="twitch.tv/x")
+    _wire_fake_pipeline(monkeypatch, ing)
+    monkeypatch.setattr(cli, "transcribe_candidates", lambda **k: (
+        [Word(words_first, words_first + 1, "Jogada"), Word(words_first + 1.1, words_first + 2, "absurda")], "pt"))
+    monkeypatch.setattr(gate, "dimensoes", lambda mp4, run=None: (1080, 1920))
+    monkeypatch.setattr(gate, "dhash", lambda mp4, t=0.0, run=None: 12345)
+
+    def fake_render(clip, idx, words, url, out_dir, cache_dir, live_video_path=None, **kw):
+        out = out_dir / f"clip_{idx:02d}.mp4"
+        out.write_bytes(b"mp4")
+        return out
+
+    monkeypatch.setattr(cli, "render_clip", fake_render)
+    args = cli.build_parser().parse_args([ing.url, "--out-dir", str(tmp_path / "out"), "--no-llm", "--no-discord"])
+    assert cli.run_pipeline(args) == 0
+    return json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))["clips"][0]
+
+
+def test_clips_json_traz_gate_phash_texto_hash(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_GATE", raising=False)
+    e = _run_gate_pipeline(tmp_path, monkeypatch)
+    assert isinstance(e["gate"]["ok"], bool) and "motivos" in e["gate"]
+    assert e["phash"] == 12345
+    assert len(e["texto_hash"]) == 12
+    assert e["layout"] != "black_bars_16x9"
+    assert "hook_cabe" in e
+
+
+def test_gate_off_nao_grava_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLIPES_GATE", "off")
+    assert "gate" not in _run_gate_pipeline(tmp_path, monkeypatch)
+
+
+def test_start_ajustado_quando_primeira_palavra_em_mais_3s(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_GATE", raising=False)
+    e = _run_gate_pipeline(tmp_path, monkeypatch, words_first=13.0)
+    assert 12.5 <= e["start"] < 13.0
+
+
+def test_duracao_padrao_15_45(monkeypatch):
+    monkeypatch.delenv("CLIPES_DUR_MIN", raising=False)
+    monkeypatch.delenv("CLIPES_DUR_MAX", raising=False)
+    a = cli.build_parser().parse_args(["http://x"])
+    assert (a.min_dur, a.max_dur) == (15.0, 45.0)
+    monkeypatch.setenv("CLIPES_DUR_MIN", "20")
+    assert cli.build_parser().parse_args(["http://x"]).min_dur == 20.0
