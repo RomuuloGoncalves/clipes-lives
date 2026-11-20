@@ -1,18 +1,15 @@
-"""Nucleo do painel: autorizacao, status, comando e alvos. Sem I/O de rede alem do `db` recebido.
+"""Nucleo do painel: status, comando e alvos. Sem I/O de rede alem do `db` recebido.
 
 Sem imports de `clipes` (a Vercel so instala pymongo): o parser de alvos espelha
 `acompanhar.parse_alvo` + `bot._parse_live_alvo`, e `tests/test_painel.py` confere a paridade.
 """
 from __future__ import annotations
 
-import base64
 import json
 import math
 import os
 import re
-import secrets
 import threading
-import time
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, Protocol, TypedDict
@@ -90,25 +87,9 @@ def _parse_beat_s(valor: Any, padrao: float = 20.0) -> float:
 
 BEAT_S: float = _parse_beat_s(os.environ.get("CLIPES_BEAT_S"), 20.0)
 SEM_CONFIG: tuple[int, dict[str, str]] = (500, {"erro": "painel nao configurado"})
-MAX_TENTATIVAS_SENHA: int = 5
-JANELA_BLOQUEIO_S: float = 60.0
-_FALHAS_AUTH: dict[str, list[float]] = {}
-_AUTH_LOCK = threading.Lock()
 _CLIENT: Any = None
 _CLIENT_URI: str | None = None
 _CLIENT_LOCK = threading.Lock()
-
-
-def autorizado(header: str | None, senha: str | None) -> bool:
-    """Basic Auth: so a senha conta (usuario ignorado), comparada em bytes UTF-8."""
-    if not header or not senha or not header.startswith("Basic "):
-        return False
-    try:
-        bruto = base64.b64decode(header[6:], validate=True).decode("utf-8")
-    except ValueError:
-        return False
-    _, sep, dada = bruto.partition(":")
-    return bool(sep) and secrets.compare_digest(dada.encode(), senha.encode())
 
 
 def _iso(d: Any) -> str | None:
@@ -319,39 +300,6 @@ def gerir_alvo(db: Any, corpo: Mapping[str, Any], now: datetime) -> tuple[int, d
     return 400, {"erro": "acao invalida"}
 
 
-def _chave_cliente(h: _HttpHandler) -> str:
-    for hdr in ("X-Real-IP", "X-Forwarded-For"):
-        val = (h.headers.get(hdr) or "").split(",")[0].strip()
-        if val:
-            return val
-    addr = getattr(h, "client_address", None)
-    return str(addr[0]) if addr else "global"
-
-
-def _auth_bloqueada(chave: str, agora_mono: float) -> bool:
-    corte = agora_mono - JANELA_BLOQUEIO_S
-    with _AUTH_LOCK:
-        recentes = [t for t in _FALHAS_AUTH.get(chave, ()) if t > corte]
-        if recentes:
-            _FALHAS_AUTH[chave] = recentes
-        else:
-            _FALHAS_AUTH.pop(chave, None)
-        return len(recentes) >= MAX_TENTATIVAS_SENHA
-
-
-def _registrar_falha_auth(chave: str, agora_mono: float) -> None:
-    corte = agora_mono - JANELA_BLOQUEIO_S
-    with _AUTH_LOCK:
-        recentes = [t for t in _FALHAS_AUTH.get(chave, ()) if t > corte]
-        recentes.append(agora_mono)
-        _FALHAS_AUTH[chave] = recentes
-
-
-def _limpar_falhas_auth(chave: str) -> None:
-    with _AUTH_LOCK:
-        _FALHAS_AUTH.pop(chave, None)
-
-
 def _origem_valida(h: _HttpHandler) -> bool:
     origin = (h.headers.get("Origin") or "").strip()
     alvo = origin or (h.headers.get("Referer") or "").strip()
@@ -382,22 +330,6 @@ def tratar(h: _HttpHandler, metodo: MetodoPainel, now: datetime | None = None) -
     uri = os.environ.get("PAINEL_MONGO_URI")
     if not uri:
         return _enviar(h, *SEM_CONFIG)
-    senha = os.environ.get("PAINEL_SENHA")
-    if not senha:
-        return _enviar(h, *SEM_CONFIG)
-    chave = _chave_cliente(h)
-    agora_mono = time.monotonic()
-    if _auth_bloqueada(chave, agora_mono):
-        return _enviar(
-            h,
-            429,
-            {"erro": "muitas tentativas"},
-            {"Retry-After": str(int(JANELA_BLOQUEIO_S))},
-        )
-    if not autorizado(h.headers.get("Authorization"), senha):
-        _registrar_falha_auth(chave, agora_mono)
-        return _enviar(h, 401, {"erro": "nao autorizado"}, {"WWW-Authenticate": 'Basic realm="painel"'})
-    _limpar_falhas_auth(chave)
     if metodo in ("comando", "alvos"):
         if not _origem_valida(h):
             return _enviar(h, 403, {"erro": "origem nao permitida"})

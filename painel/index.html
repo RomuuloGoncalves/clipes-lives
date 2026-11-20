@@ -114,39 +114,6 @@
       padding: 8px 12px;
       font-size: 0.875rem;
     }
-    .modal[hidden] { display: none; }
-    .modal {
-      position: fixed;
-      inset: 0;
-      background: rgba(15, 23, 42, 0.78);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      padding: 16px;
-    }
-    .modal-card {
-      width: 100%;
-      max-width: 340px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      padding: 16px;
-      display: flex;
-      flex-direction: column;
-      gap: 10px;
-    }
-    .modal-card h3 { margin: 0; font-size: 1rem; }
-    .modal-card input[type="password"] {
-      width: 100%;
-      padding: 8px 10px;
-      border-radius: 4px;
-      border: 1px solid var(--border);
-      background: var(--bg);
-      color: var(--text);
-      font-size: 0.9rem;
-    }
-    .modal-acoes { display: flex; justify-content: flex-end; gap: 8px; }
-    .btn-sec { background: var(--border); }
     .alvo-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
     input[type="text"].alvo-entrada { width: 260px; }
   </style>
@@ -156,7 +123,6 @@
     <h1>Clipes Lives</h1>
     <div class="header-dir">
       <div id="atualizado" class="meta">Carregando...</div>
-      <button type="button" id="auth-abrir" class="btn-sec" hidden>Entrar</button>
     </div>
   </header>
 
@@ -212,18 +178,6 @@
   <h2>Jobs (24 h)</h2>
   <div id="jobs" class="cards"></div>
 
-  <div id="auth-modal" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="auth-titulo">
-    <form id="auth-form" class="modal-card">
-      <h3 id="auth-titulo">Senha do painel</h3>
-      <div id="auth-desc" class="meta"></div>
-      <input id="auth-senha" type="password" autocomplete="current-password" placeholder="Senha" required>
-      <div class="modal-acoes">
-        <button type="button" id="auth-cancelar" class="btn-sec">Cancelar</button>
-        <button type="submit">Confirmar</button>
-      </div>
-    </form>
-  </div>
-
   <script>
     (function () {
       var pcsEl = document.getElementById("pcs");
@@ -236,67 +190,8 @@
       var jobsEl = document.getElementById("jobs");
       var atualizadoEl = document.getElementById("atualizado");
       var feedbackEl = document.getElementById("feedback");
-      var authModal = document.getElementById("auth-modal");
-      var authForm = document.getElementById("auth-form");
-      var authDescEl = document.getElementById("auth-desc");
-      var authInput = document.getElementById("auth-senha");
-      var authCancelarBtn = document.getElementById("auth-cancelar");
-      var authAbrirBtn = document.getElementById("auth-abrir");
       var drafts = Object.create(null);
       var carregando = false;
-      var senhaCache = null;
-      var pendingAuth = null;
-      var erroAuthAtivo = false;
-
-      function basicHeader(senha) {
-        var bytes = new TextEncoder().encode("painel:" + senha);
-        var bin = "";
-        for (var i = 0; i < bytes.length; i++) {
-          bin += String.fromCharCode(bytes[i]);
-        }
-        return "Basic " + btoa(bin);
-      }
-
-      function fecharModal() {
-        authInput.value = "";
-        authModal.hidden = true;
-        pendingAuth = null;
-        if (!senhaCache) {
-          authAbrirBtn.hidden = false;
-          atualizadoEl.textContent = "Autenticacao necessaria";
-        }
-      }
-
-      authCancelarBtn.addEventListener("click", fecharModal);
-      authAbrirBtn.addEventListener("click", function () {
-        atualizar();
-      });
-      document.addEventListener("keydown", function (e) {
-        if (e.key === "Escape" && !authModal.hidden) fecharModal();
-      });
-      authForm.addEventListener("submit", function (e) {
-        e.preventDefault();
-        var s = authInput.value;
-        authInput.value = "";
-        if (!s) return;
-        authModal.hidden = true;
-        var fn = pendingAuth;
-        pendingAuth = null;
-        senhaCache = s;
-        if (fn) fn(s);
-      });
-
-      function pedirSenha(descricao, onDone) {
-        if (senhaCache) {
-          onDone(senhaCache);
-          return;
-        }
-        authDescEl.textContent = descricao || "Digite a senha para consultar o painel.";
-        authInput.value = "";
-        pendingAuth = onDone;
-        authModal.hidden = false;
-        authInput.focus();
-      }
 
       function el(tag, cls, txt) {
         var n = document.createElement(tag);
@@ -346,84 +241,70 @@
         if (!confirm("Liberar recursos de " + nome + "? O container sera encerrado e reiniciado.")) {
           return;
         }
-        pedirSenha("Digite a senha para liberar recursos de " + nome + ".", function (senha) {
-          btn.disabled = true;
-          fetch("/api/comando", {
-            method: "POST",
-            credentials: "same-origin",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": basicHeader(senha)
-            },
-            body: JSON.stringify({ worker_id: worker.id, confirmar: val })
-          })
-            .then(function (r) {
-              return r.json().catch(function () { return {}; }).then(function (body) {
-                return { status: r.status, body: body };
-              });
-            })
-            .then(function (res) {
-              if (res.status === 202) {
-                drafts[worker.id] = "";
-                input.value = "";
-                mostrarMsg("Comando liberar recursos enviado para " + nome + ".", "ok");
-                atualizar();
-              } else {
-                if (res.status === 401) {
-                  senhaCache = null;
-                  authAbrirBtn.hidden = false;
-                }
-                var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
-                mostrarMsg("Falha ao enviar comando: " + erro, "erro");
-              }
-            })
-            .catch(function () {
-              mostrarMsg("Erro de rede ao enviar comando.", "erro");
-            })
-            .finally(function () {
-              btn.disabled = false;
+        btn.disabled = true;
+        fetch("/api/comando", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ worker_id: worker.id, confirmar: val })
+        })
+          .then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (body) {
+              return { status: r.status, body: body };
             });
-        });
+          })
+          .then(function (res) {
+            if (res.status === 202) {
+              drafts[worker.id] = "";
+              input.value = "";
+              mostrarMsg("Comando liberar recursos enviado para " + nome + ".", "ok");
+              atualizar();
+            } else {
+              var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
+              mostrarMsg("Falha ao enviar comando: " + erro, "erro");
+            }
+          })
+          .catch(function () {
+            mostrarMsg("Erro de rede ao enviar comando.", "erro");
+          })
+          .finally(function () {
+            btn.disabled = false;
+          });
       }
 
       function enviarAlvo(corpo, btn, okMsg, aoOk) {
-        pedirSenha("Digite a senha para alterar os alvos.", function (senha) {
-          btn.disabled = true;
-          fetch("/api/alvos", {
-            method: "POST",
-            credentials: "same-origin",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": basicHeader(senha)
-            },
-            body: JSON.stringify(corpo)
-          })
-            .then(function (r) {
-              return r.json().catch(function () { return {}; }).then(function (body) {
-                return { status: r.status, body: body };
-              });
-            })
-            .then(function (res) {
-              if (res.status >= 200 && res.status < 300) {
-                mostrarMsg(okMsg, "ok");
-                if (aoOk) aoOk();
-                atualizar();
-              } else {
-                if (res.status === 401) {
-                  senhaCache = null;
-                  authAbrirBtn.hidden = false;
-                }
-                var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
-                mostrarMsg("Falha ao alterar alvos: " + erro, "erro");
-              }
-            })
-            .catch(function () {
-              mostrarMsg("Erro de rede ao alterar alvos.", "erro");
-            })
-            .finally(function () {
-              btn.disabled = false;
+        btn.disabled = true;
+        fetch("/api/alvos", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(corpo)
+        })
+          .then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (body) {
+              return { status: r.status, body: body };
             });
-        });
+          })
+          .then(function (res) {
+            if (res.status >= 200 && res.status < 300) {
+              mostrarMsg(okMsg, "ok");
+              if (aoOk) aoOk();
+              atualizar();
+            } else {
+              var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
+              mostrarMsg("Falha ao alterar alvos: " + erro, "erro");
+            }
+          })
+          .catch(function () {
+            mostrarMsg("Erro de rede ao alterar alvos.", "erro");
+          })
+          .finally(function () {
+            btn.disabled = false;
+          });
       }
 
       alvoForm.addEventListener("submit", function (e) {
@@ -584,65 +465,36 @@
 
       function atualizar() {
         if (carregando) return;
-        pedirSenha(null, function (senha) {
-          if (carregando) return;
-          carregando = true;
-          fetch("/api/status", {
-            credentials: "same-origin",
-            headers: {
-              "Authorization": basicHeader(senha)
+        carregando = true;
+        fetch("/api/status", {
+          credentials: "same-origin"
+        })
+          .then(function (r) {
+            if (!r.ok) {
+              return r.json().catch(function () { return {}; }).then(function (b) {
+                throw new Error((b && b.erro) ? b.erro : ("HTTP " + r.status));
+              });
             }
+            return r.json();
           })
-            .then(function (r) {
-              if (r.status === 401) {
-                senhaCache = null;
-                return r.json().catch(function () { return {}; }).then(function (b) {
-                  var err = new Error((b && b.erro) ? b.erro : "nao autorizado");
-                  err.status = 401;
-                  throw err;
-                });
-              }
-              if (!r.ok) {
-                return r.json().catch(function () { return {}; }).then(function (b) {
-                  throw new Error((b && b.erro) ? b.erro : ("HTTP " + r.status));
-                });
-              }
-              return r.json();
-            })
-            .then(function (dados) {
-              authAbrirBtn.hidden = true;
-              renderWorkers(dados.workers || []);
-              renderLives(dados.lives || [], dados.workers || []);
-              renderAlvos(dados.alvos || [], dados.workers || []);
-              renderJobs(dados.jobs_24h || {});
-              atualizadoEl.textContent = "Atualizado: " + new Date().toLocaleTimeString();
-              if (erroAuthAtivo) {
-                erroAuthAtivo = false;
-                mostrarMsg("", "");
-              }
-            })
-            .catch(function (err) {
-              atualizadoEl.textContent = "Erro ao atualizar";
-              mostrarMsg("Falha ao consultar /api/status: " + (err && err.message ? err.message : "erro"), "erro");
-              if (err && err.status === 401) {
-                erroAuthAtivo = true;
-                authAbrirBtn.hidden = false;
-                carregando = false;
-                pedirSenha(null, function () {
-                  atualizar();
-                });
-              }
-            })
-            .finally(function () {
-              carregando = false;
-            });
-        });
+          .then(function (dados) {
+            renderWorkers(dados.workers || []);
+            renderLives(dados.lives || [], dados.workers || []);
+            renderAlvos(dados.alvos || [], dados.workers || []);
+            renderJobs(dados.jobs_24h || {});
+            atualizadoEl.textContent = "Atualizado: " + new Date().toLocaleTimeString();
+          })
+          .catch(function (err) {
+            atualizadoEl.textContent = "Erro ao atualizar";
+            mostrarMsg("Falha ao consultar /api/status: " + (err && err.message ? err.message : "erro"), "erro");
+          })
+          .finally(function () {
+            carregando = false;
+          });
       }
 
       atualizar();
-      setInterval(function () {
-        if (senhaCache) atualizar();
-      }, 10000);
+      setInterval(atualizar, 10000);
     })();
   </script>
 </body>

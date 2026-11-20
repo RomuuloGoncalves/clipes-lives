@@ -90,25 +90,9 @@ def test_comando_409_atomico_em_corrida_e_duplicate_key(db, monkeypatch):
     assert _nucleo.criar_comando(db, "w-2", "LIBERAR", NOW) == (409, {"erro": "comando ja pendente"})
 
 
-def test_autorizado():
-    assert _nucleo.autorizado(basic("s3"), "s3")
-    assert not _nucleo.autorizado(basic("errada"), "s3")
-    assert not _nucleo.autorizado(None, "s3")
-    assert not _nucleo.autorizado("Basic !!!", "s3")
-    assert not _nucleo.autorizado(basic("s3"), "")
-    assert _nucleo.autorizado(basic("sénha"), "sénha")
-
-
 def test_status_sem_uri_nem_host(db):
     txt = json.dumps(_nucleo.status(db, NOW))
     assert "mongodb" not in txt and "://" not in txt
-
-
-@pytest.fixture(autouse=True)
-def _limpar_falhas_auth():
-    _nucleo._FALHAS_AUTH.clear()
-    yield
-    _nucleo._FALHAS_AUTH.clear()
 
 
 # ---- T18/T19: handlers
@@ -138,99 +122,60 @@ def chamar(mod, db, metodo, path_auth=None, corpo=None, headers=None, raw_body=N
 
 @pytest.fixture
 def env(monkeypatch):
-    monkeypatch.setenv("PAINEL_SENHA", "s3")
+    monkeypatch.delenv("PAINEL_SENHA", raising=False)
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
 
 
-def test_status_exige_auth(db, env):
-    code_sem, hdr_sem, _ = chamar(status_fn, db, "GET", headers={"X-Real-IP": "198.51.100.5"})
-    assert code_sem == 401 and "Basic" in hdr_sem.get("WWW-Authenticate", "")
-    assert "198.51.100.5" in _nucleo._FALHAS_AUTH
-
-    code_err, _, _ = chamar(status_fn, db, "GET", basic("errada"), headers={"X-Real-IP": "198.51.100.5"})
-    assert code_err == 401
-
-    code, _, corpo = chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.5"})
+def test_status_acesso_livre_sem_auth(db, env):
+    code, _, corpo = chamar(status_fn, db, "GET")
     assert code == 200 and len(json.loads(corpo)["workers"]) == 2
     assert b"exemplo.invalid" not in corpo
-    assert "198.51.100.5" not in _nucleo._FALHAS_AUTH
 
 
-def test_status_e_comando_500_sem_uri_ou_sem_senha(db, monkeypatch):
+def test_status_e_comando_500_sem_uri(db, monkeypatch):
     monkeypatch.delenv("PAINEL_SENHA", raising=False)
     monkeypatch.delenv("PAINEL_MONGO_URI", raising=False)
-    code, _, corpo = chamar(status_fn, db, "GET", basic("s3"))
+    code, _, corpo = chamar(status_fn, db, "GET")
     assert code == 500 and json.loads(corpo) == {"erro": "painel nao configurado"}
 
-    monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
-    code_s, _, corpo_s = chamar(status_fn, db, "GET", basic("s3"))
-    assert code_s == 500 and json.loads(corpo_s) == {"erro": "painel nao configurado"}
-    code_c, _, corpo_c = chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})
+    code_c, _, corpo_c = chamar(comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"})
     assert code_c == 500 and json.loads(corpo_c) == {"erro": "painel nao configurado"}
 
 
-def test_comando_405_401_202_409(db, env):
-    assert chamar(comando, db, "GET", basic("s3"))[0] == 405
-    assert chamar(comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 401
-    assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1"})[0] == 400
-    assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 202
-    assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 409
+def test_comando_405_400_202_409(db, env):
+    assert chamar(comando, db, "GET")[0] == 405
+    assert chamar(comando, db, "POST", None, {"worker_id": "w-1"})[0] == 400
+    assert chamar(comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 202
+    assert chamar(comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"})[0] == 409
     assert db.commands.count_documents({}) == 1
 
 
 def test_comando_exige_content_type_json_e_confere_origin(db, env):
     # Content-Type ausente ou form -> 415
-    assert chamar(comando, db, "POST", basic("s3"), raw_body=b"worker_id=w-1")[0] == 415
+    assert chamar(comando, db, "POST", raw_body=b"worker_id=w-1")[0] == 415
     assert chamar(
-        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"},
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )[0] == 415
     # charset junto de application/json é aceito
     assert chamar(
-        comando, db, "POST", basic("s3"), {"worker_id": "w-2", "confirmar": "LIBERAR"},
+        comando, db, "POST", None, {"worker_id": "w-2", "confirmar": "LIBERAR"},
         headers={"Content-Type": "application/json; charset=utf-8"},
     )[0] == 202
     # Origin cruzado ou null -> 403
     assert chamar(
-        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"},
         headers={"Origin": "https://atacante.invalid"},
     )[0] == 403
     assert chamar(
-        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"},
         headers={"Origin": "null"},
     )[0] == 403
     # Origin compatível com Host -> 202
     assert chamar(
-        comando, db, "POST", basic("s3"), {"worker_id": "w-1", "confirmar": "LIBERAR"},
+        comando, db, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"},
         headers={"Host": "painel.local", "Origin": "https://painel.local"},
     )[0] == 202
-
-
-def test_limite_tentativas_senha_429(db, env, monkeypatch):
-    t = [1000.0]
-    monkeypatch.setattr(_nucleo.time, "monotonic", lambda: t[0])
-    payload = {"worker_id": "w-1", "confirmar": "LIBERAR"}
-
-    for _ in range(_nucleo.MAX_TENTATIVAS_SENHA):
-        code, _, _ = chamar(comando, db, "POST", basic("errada"), payload, headers={"X-Real-IP": "198.51.100.10"})
-        assert code == 401
-
-    # Mesmo com a senha certa, o cliente bloqueado recebe 429 ate expirar a janela.
-    code, hdr, _ = chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.10"})
-    assert code == 429 and int(hdr["Retry-After"]) > 0
-
-    # GET /api/status compartilha o mesmo rate limit (IP bloqueado recebe 429 e nao limpa o bloqueio).
-    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.10"})[0] == 429
-    assert chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.10"})[0] == 429
-
-    # Outro IP continua normal.
-    assert chamar(status_fn, db, "GET", basic("s3"), headers={"X-Real-IP": "198.51.100.11"})[0] == 200
-    assert chamar(comando, db, "POST", basic("s3"), payload, headers={"X-Real-IP": "198.51.100.11"})[0] == 202
-
-    # Passada a janela de bloqueio, volta a aceitar.
-    t[0] += _nucleo.JANELA_BLOQUEIO_S + 1
-    assert chamar(comando, db, "POST", basic("s3"), {"worker_id": "w-2", "confirmar": "LIBERAR"},
-                  headers={"X-Real-IP": "198.51.100.10"})[0] == 202
 
 
 def test_abrir_reutiliza_client_lazy_com_max_pool_size_1(monkeypatch):
@@ -314,13 +259,13 @@ def test_index_html_estrutura_e_fluxos():
     p.feed(txt)
     p.close()
     assert "table" in p.tags
-    assert "password" in txt
+    assert "auth-modal" not in txt
+    assert "pedirSenha" not in txt
     js = "\n".join(p.scripts)
     assert "/api/status" in js
     assert "/api/comando" in js
-    assert "Basic " in js
-    assert "Authorization" in js
-    assert "pedirSenha" in js
+    assert "Basic " not in js
+    assert "Authorization" not in js
     assert "10000" in js
     assert "confirm(" in js
     assert "LIBERAR" in js
@@ -328,9 +273,9 @@ def test_index_html_estrutura_e_fluxos():
     assert "n/d" in js
     for campo in ("alias", "online", "cpus", "cpu_pct", "ram_gb", "disco_livre_gb", "temp_c", "gpu", "job_atual", "max_lives"):
         assert campo in js
-    # atualizar() exige senha via pedirSenha e envia Authorization em /api/status
+    # atualizar() chama /api/status diretamente sem Authorization/pedirSenha
     atualizar_js = js.split("function atualizar()", 1)[1]
-    assert "Authorization" in atualizar_js and "pedirSenha" in atualizar_js and "basicHeader" in atualizar_js
+    assert "Authorization" not in atualizar_js and "pedirSenha" not in atualizar_js and "basicHeader" not in atualizar_js
 
 
 # ---- T21: configuracao da Vercel
@@ -447,19 +392,18 @@ def test_criar_alvo_limite_30_ativos_e_remover(db):
     assert _nucleo.gerir_alvo(db, {"acao": "xyz"}, NOW) == (400, {"erro": "acao invalida"})
 
 
-def test_alvos_handler_auth_origem_json_e_codigos(db, env):
+def test_alvos_handler_origem_json_e_codigos(db, env):
     from painel.api import alvos as alvos_fn
 
     body = {"acao": "adicionar", "alvo": "fulano", "pc": ""}
-    assert chamar(alvos_fn, db, "GET", basic("s3"))[0] == 405
-    assert chamar(alvos_fn, db, "POST", None, body)[0] == 401
-    assert chamar(alvos_fn, db, "POST", basic("s3"), raw_body=b"alvo=fulano")[0] == 415
-    assert chamar(alvos_fn, db, "POST", basic("s3"), body, headers={"Origin": "https://atacante.invalid"})[0] == 403
-    code, _, corpo = chamar(alvos_fn, db, "POST", basic("s3"), body)
+    assert chamar(alvos_fn, db, "GET")[0] == 405
+    assert chamar(alvos_fn, db, "POST", raw_body=b"alvo=fulano")[0] == 415
+    assert chamar(alvos_fn, db, "POST", None, body, headers={"Origin": "https://atacante.invalid"})[0] == 403
+    code, _, corpo = chamar(alvos_fn, db, "POST", None, body)
     assert code == 201 and json.loads(corpo) == {"ok": True, "_id": "fulano"}
-    assert chamar(alvos_fn, db, "POST", basic("s3"), body)[0] == 409
-    assert chamar(alvos_fn, db, "POST", basic("s3"), {"acao": "remover", "id": "fulano"})[0] == 200
-    assert chamar(alvos_fn, db, "POST", basic("s3"), {"acao": "xyz"})[0] == 400
+    assert chamar(alvos_fn, db, "POST", None, body)[0] == 409
+    assert chamar(alvos_fn, db, "POST", None, {"acao": "remover", "id": "fulano"})[0] == 200
+    assert chamar(alvos_fn, db, "POST", None, {"acao": "xyz"})[0] == 400
 
 
 def test_index_html_slots_fila_e_alvos():
@@ -486,7 +430,7 @@ def test_index_html_slots_fila_e_alvos():
     p = Scripts()
     p.feed(raw)
     js = "\n".join(p.scripts)
-    assert 'fetch("/api/alvos"' in js and '"Authorization": basicHeader(senha)' in js
+    assert 'fetch("/api/alvos"' in js and "Authorization" not in js
     assert 'id="alvo-form"' in raw and 'id="alvos"' in raw
     for campo in ("slots", "ocupados", "fila", "pc_fixo", "owner", "fase", "entrada", "_id"):
         assert campo in js
