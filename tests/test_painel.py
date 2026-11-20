@@ -317,7 +317,7 @@ def test_status_serializa_history_com_datetime_em_json(db):
 def test_status_inclui_slots_fila_e_alvos(db):
     db.workers.update_one({"_id": "w-2"}, {"$set": {
         "slots": {"twitch": 2, "kick": 0}, "ocupados": {"twitch": 1}, "fila": {"janelas": 1, "busca": 0}}})
-    assert _nucleo.criar_alvo(db, "fulano", "PC-2", NOW) == (201, {"ok": True, "_id": "fulano"})
+    assert _nucleo.criar_alvo(db, "fulano", "PC-2", NOW) == (201, {"ok": True, "_id": "fulano", "tipo": "live"})
     assert _nucleo.criar_alvo(db, "twitch.tv/outro", "", NOW + timedelta(seconds=1))[0] == 201
     assert _nucleo.criar_alvo(db, "kick.com/terceiro", "", NOW + timedelta(seconds=2))[0] == 201
     assert _nucleo.remover_alvo(db, "kick_terceiro")[0] == 200
@@ -329,8 +329,8 @@ def test_status_inclui_slots_fila_e_alvos(db):
     assert ws["w-2"]["fila"] == {"janelas": 1, "busca": 0}
     assert ws["w-1"]["slots"] is None and ws["w-1"]["fila"] is None
     assert [a["_id"] for a in r["alvos"]] == ["fulano", "outro"]  # removido nao aparece
-    assert r["alvos"][0] == {"_id": "fulano", "plataforma": "twitch", "entrada": "fulano",
-                             "owner": None, "pc_fixo": "PC-2", "fase": "sem vaga"}
+    assert r["alvos"][0] == {"_id": "fulano", "tipo": "live", "plataforma": "twitch", "entrada": "fulano",
+                             "owner": None, "pc_fixo": "PC-2", "fase": "sem vaga", "url": None}
     json.dumps(r)
 
 
@@ -366,12 +366,12 @@ def test_parse_alvo_paridade_com_o_bot(entrada):
 def test_criar_alvo_valida_duplicado_e_grava_doc_como_o_bot(db):
     assert _nucleo.criar_alvo(db, "https://x.invalid/nope", "", NOW) == (400, {"erro": "alvo invalido"})
     assert _nucleo.criar_alvo(db, "  ", "", NOW) == (400, {"erro": "alvo invalido"})
-    assert _nucleo.criar_alvo(db, "twitch.tv/Fulano", " PC-1 ", NOW) == (201, {"ok": True, "_id": "fulano"})
+    assert _nucleo.criar_alvo(db, "twitch.tv/Fulano", " PC-1 ", NOW) == (201, {"ok": True, "_id": "fulano", "tipo": "live"})
     doc = db.alvos.find_one({"_id": "fulano"})
     assert doc == {"_id": "fulano", "tipo": "live", "plataforma": "twitch", "entrada": "fulano",
                    "canal": "fulano", "url": None, "estado": "ativo", "pc_fixo": "PC-1", "owner": None,
                    "lease_until": None, "fase": "sem vaga", "criado_por": "painel", "criado_em": NOW,
-                   "erro": None}
+                   "erro": None, "auto_vod": False}
     assert _nucleo.criar_alvo(db, "fulano", "", NOW) == (409, {"erro": "alvo ja acompanhado"})
 
     assert _nucleo.criar_alvo(db, "youtu.be/abcd1234", "", NOW)[0] == 201
@@ -400,7 +400,7 @@ def test_alvos_handler_origem_json_e_codigos(db, env):
     assert chamar(alvos_fn, db, "POST", raw_body=b"alvo=fulano")[0] == 415
     assert chamar(alvos_fn, db, "POST", None, body, headers={"Origin": "https://atacante.invalid"})[0] == 403
     code, _, corpo = chamar(alvos_fn, db, "POST", None, body)
-    assert code == 201 and json.loads(corpo) == {"ok": True, "_id": "fulano"}
+    assert code == 201 and json.loads(corpo) == {"ok": True, "_id": "fulano", "tipo": "live"}
     assert chamar(alvos_fn, db, "POST", None, body)[0] == 409
     assert chamar(alvos_fn, db, "POST", None, {"acao": "remover", "id": "fulano"})[0] == 200
     assert chamar(alvos_fn, db, "POST", None, {"acao": "xyz"})[0] == 400

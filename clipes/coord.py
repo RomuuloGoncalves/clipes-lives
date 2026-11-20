@@ -262,7 +262,7 @@ class Coord:
                 "pc_fixo": {"$in": pc_vals},
                 "$or": [{"owner": None}, {"lease_until": {"$lt": now}}, {"owner": self.worker_id}],
             },
-            {"$set": {"owner": self.worker_id, "lease_until": lease_until}},
+            {"$set": {"owner": self.worker_id, "lease_until": lease_until, "fase": "processando"}},
             sort=[("criado_em", 1)],
             return_document=ReturnDocument.AFTER,
         )
@@ -271,10 +271,12 @@ class Coord:
         """Grava estado final (`feito` ou `falhou`) de um VOD deste PC com erro sanitizado."""
         if estado not in ("feito", "falhou"):
             raise ValueError(f"estado de VOD invalido: {estado!r}")
+        fase = "concluido" if estado == "feito" else "falhou"
         res = self.db.alvos.update_one(
-            {"_id": alvo_id, "tipo": "vod", "owner": self.worker_id},
+            {"_id": alvo_id, "tipo": "vod", "owner": self.worker_id, "estado": "ativo"},
             {"$set": {
                 "estado": estado,
+                "fase": fase,
                 "erro": _sanitize_erro(erro),
                 "owner": None,
                 "lease_until": None,
@@ -282,6 +284,43 @@ class Coord:
             }},
         )
         return res.matched_count == 1
+
+    def promover_para_vod(self, alvo_id: str, url: str) -> str:
+        """Promove alvo live (YouTube video_id) deste PC para VOD na fila.
+
+        Retorna:
+          - "promovido": atualizado atomicamente in-place para tipo='vod'
+          - "duplicado": ja existia VOD ativo para a mesma URL; live marcado 'removido'
+          - "ignorado": alvo nao pertence mais a este PC ou nao esta ativo
+        """
+        # Verifica se ja existe outro VOD ativo para a mesma URL (evita duplicatas)
+        existente = self.db.alvos.find_one({
+            "tipo": "vod",
+            "estado": "ativo",
+            "url": url,
+            "_id": {"$ne": alvo_id},
+        })
+        if existente:
+            self.db.alvos.update_one(
+                {"_id": alvo_id, "tipo": "live", "estado": "ativo", "owner": self.worker_id},
+                {"$set": {"estado": "removido", "fase": "cancelado", "owner": None, "lease_until": None}},
+            )
+            return "duplicado"
+
+        res = self.db.alvos.update_one(
+            {"_id": alvo_id, "tipo": "live", "estado": "ativo", "owner": self.worker_id},
+            {"$set": {
+                "tipo": "vod",
+                "url": url,
+                "entrada": url,
+                "fase": "na fila",
+                "owner": None,
+                "lease_until": None,
+                "erro": None,
+                "auto_vod": False,
+            }},
+        )
+        return "promovido" if res.matched_count == 1 else "ignorado"
 
     # ---- heartbeat e config por alias ----
 

@@ -660,7 +660,7 @@ def _clipar_vod(
             "_id": vod_id,
             "tipo": "vod",
             "plataforma": plataforma,
-            "entrada": "",
+            "entrada": clean_url,
             "url": clean_url,
             "estado": "ativo",
             "pc_fixo": None,

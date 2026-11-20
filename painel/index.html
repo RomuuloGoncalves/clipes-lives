@@ -338,6 +338,22 @@
       border: 1px solid var(--border);
       color: var(--text);
     }
+    .fase-badge.processando { background: var(--accent-bg); color: var(--accent-fg); border-color: var(--accent); }
+    .fase-badge.fila { background: var(--warn-bg); color: var(--warn-fg); border-color: var(--warn); }
+    .fase-badge.gravando { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--ok); }
+
+    .tipo-badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+    .tipo-badge.vod { background: var(--accent-bg); color: var(--accent-fg); border-color: var(--accent); }
+    .tipo-badge.live { background: var(--ok-bg); color: var(--ok-fg); border-color: var(--ok); }
 
     .nd {
       display: inline-block;
@@ -750,6 +766,86 @@
       gap: 8px;
       margin-left: auto;
     }
+
+    /* VODs recentes section */
+    #vods-recentes {
+      margin-top: 16px;
+      padding: 12px 0;
+    }
+    #vods-recentes h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin: 0 0 10px;
+      color: var(--text);
+    }
+    .vods-lista {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+    .vod-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      font-size: 0.875rem;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .vod-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+    }
+    .vod-plataforma {
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      color: var(--muted);
+    }
+    .vod-badge {
+      display: inline-block;
+      padding: 2px 8px;
+      border-radius: 6px;
+      font-size: 0.7rem;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+    .vod-badge.feito {
+      background: var(--ok-bg);
+      color: var(--ok-fg);
+      border: 1px solid var(--ok);
+    }
+    .vod-badge.falhou {
+      background: var(--off-bg);
+      color: var(--off-fg);
+      border: 1px solid var(--off);
+    }
+    .vod-entrada {
+      word-break: break-all;
+      color: var(--text);
+    }
+    .vod-pc {
+      font-size: 0.75rem;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+    .vod-erro {
+      font-size: 0.75rem;
+      color: var(--off-fg);
+    }
+    .vod-tempo {
+      font-size: 0.7rem;
+      color: var(--muted);
+      font-family: var(--mono);
+    }
+
+    @media (min-width: 721px) {
+      .vods-lista {
+        grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      }
+    }
   </style>
 </head>
 <body>
@@ -826,7 +922,12 @@
       <span id="alvos-count" class="sec-sub"></span>
     </div>
     <form id="alvo-form" class="alvo-form">
-      <input id="alvo-entrada" class="alvo-entrada" type="text" placeholder="URL ou login (ex: twitch.tv/canal)" aria-label="Alvo" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <input id="alvo-entrada" class="alvo-entrada" type="text" placeholder="URL (live ou VOD) ou login Twitch" aria-label="Alvo" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <select id="alvo-tipo" class="alvo-tipo" aria-label="Tipo do alvo">
+        <option value="auto">Auto</option>
+        <option value="live">Live</option>
+        <option value="vod">VOD</option>
+      </select>
       <input id="alvo-pc" type="text" placeholder="PC fixo (opcional)" aria-label="PC fixo (opcional)" autocomplete="off">
       <button type="submit" id="alvo-btn" class="btn-primary">adicionar alvo</button>
     </form>
@@ -835,6 +936,7 @@
         <thead>
           <tr>
             <th>Alvo</th>
+            <th>Tipo</th>
             <th>Plataforma</th>
             <th>PC fixo</th>
             <th>Dono</th>
@@ -844,6 +946,10 @@
         </thead>
         <tbody id="alvos"></tbody>
       </table>
+    </div>
+
+    <div id="vods-recentes" class="sec-head" hidden>
+      <h2>VODs recentes (24 h)</h2>
     </div>
 
     <div class="sec-head">
@@ -881,6 +987,7 @@
       var alvosEl = document.getElementById("alvos");
       var alvoForm = document.getElementById("alvo-form");
       var alvoEntradaEl = document.getElementById("alvo-entrada");
+      var alvoTipoEl = document.getElementById("alvo-tipo");
       var alvoPcEl = document.getElementById("alvo-pc");
       var alvoBtn = document.getElementById("alvo-btn");
       var jobsEl = document.getElementById("jobs");
@@ -1007,7 +1114,7 @@
           });
       }
 
-      function enviarAlvo(corpo, btn, okMsg, aoOk) {
+      function enviarAlvo(corpo, btn, okMsg, aoOk, tipoAdicionado) {
         btn.disabled = true;
         fetch("/api/alvos", {
           method: "POST",
@@ -1024,8 +1131,12 @@
           })
           .then(function (res) {
             if (res.status >= 200 && res.status < 300) {
-              mostrarMsg(okMsg, "ok");
-              if (aoOk) aoOk();
+              var msg = okMsg;
+              if (tipoAdicionado === "vod" && res.body && res.body.tipo === "vod") {
+                msg = "VOD adicionado à fila: " + (corpo.alvo || corpo.id) + ".";
+              }
+              mostrarMsg(msg, "ok");
+              if (aoOk) aoOk(res);
               atualizar();
             } else {
               var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
@@ -1049,10 +1160,12 @@
           return;
         }
         var pc = (alvoPcEl.value || "").trim();
-        enviarAlvo({ acao: "adicionar", alvo: alvo, pc: pc }, alvoBtn, "Alvo adicionado: " + alvo + ".", function () {
+        var tipo = (alvoTipoEl.value || "auto").trim();
+        enviarAlvo({ acao: "adicionar", alvo: alvo, pc: pc, tipo: tipo }, alvoBtn, "Alvo adicionado: " + alvo + ".", function () {
           alvoEntradaEl.value = "";
           alvoPcEl.value = "";
-        });
+          alvoTipoEl.value = "auto";
+        }, tipo);
       });
 
       refreshBtn.addEventListener("click", function () {
@@ -1065,13 +1178,19 @@
           nomes[w.id] = w.alias || w.id;
         });
         var totalAlvos = alvos ? alvos.length : 0;
+        var liveCount = 0, vodCount = 0;
+        (alvos || []).forEach(function (a) {
+          if ((a.tipo || "live") === "vod") vodCount++; else liveCount++;
+        });
         kpiAlvosEl.textContent = String(totalAlvos);
-        alvosCountEl.textContent = totalAlvos ? (totalAlvos + " ativo(s)") : "";
+        alvosCountEl.textContent = totalAlvos
+          ? (totalAlvos + " ativo(s)" + (liveCount || vodCount ? " — " + liveCount + " live" + (liveCount !== 1 ? "s" : "") + ", " + vodCount + " VOD" + (vodCount !== 1 ? "s" : "") : ""))
+          : "";
 
         if (!alvos || !alvos.length) {
           var trVazio = el("tr", "tr-vazia");
           var tdVazio = el("td", "meta", "Nenhum alvo ativo.");
-          tdVazio.colSpan = 6;
+          tdVazio.colSpan = 7;
           trVazio.appendChild(tdVazio);
           alvosEl.replaceChildren(trVazio);
           return;
@@ -1082,6 +1201,11 @@
 
           tr.appendChild(tdLabel("Alvo", "td-alvo", entrada));
 
+          var tdTipo = tdLabel("Tipo");
+          var tipoCls = (a.tipo || "live") === "vod" ? "tipo-badge vod" : "tipo-badge live";
+          tdTipo.appendChild(el("span", tipoCls, a.tipo === "vod" ? "VOD" : "live"));
+          tr.appendChild(tdTipo);
+
           var tdPlat = tdLabel("Plataforma");
           tdPlat.appendChild(el("span", "plat-badge", a.plataforma || "-"));
           tr.appendChild(tdPlat);
@@ -1090,7 +1214,11 @@
           tr.appendChild(tdLabel("Dono", null, a.owner ? (nomes[a.owner] || a.owner) : "sem PC"));
 
           var tdFase = tdLabel("Fase");
-          tdFase.appendChild(el("span", "fase-badge", a.fase || "-"));
+          var faseCls = "fase-badge";
+          if (a.fase === "processando") faseCls += " processando";
+          else if (a.fase === "na fila" || a.fase === "fila") faseCls += " fila";
+          else if (a.fase === "gravando") faseCls += " gravando";
+          tdFase.appendChild(el("span", faseCls, a.fase || "-"));
           tr.appendChild(tdFase);
 
           var tdAcao = el("td", "td-acao");
@@ -1105,6 +1233,34 @@
           return tr;
         });
         alvosEl.replaceChildren.apply(alvosEl, rows);
+      }
+
+      function renderVodsRecentes(vods) {
+        var sec = document.getElementById("vods-recentes");
+        if (!sec) return;
+        if (!vods || !vods.length) {
+          sec.hidden = true;
+          return;
+        }
+        sec.hidden = false;
+        var lista = sec.querySelector(".vods-lista");
+        if (!lista) {
+          lista = el("div", "vods-lista");
+          sec.appendChild(lista);
+        }
+        lista.replaceChildren.apply(lista, vods.map(function (v) {
+          var card = el("div", "card vod-card");
+          var top = el("div", "vod-top");
+          top.appendChild(el("span", "vod-plataforma", v.plataforma || "-"));
+          var estadoCls = v.estado === "feito" ? "vod-badge feito" : "vod-badge falhou";
+          top.appendChild(el("span", estadoCls, v.estado === "feito" ? "feito" : "falhou"));
+          card.appendChild(top);
+          card.appendChild(el("div", "vod-entrada", v.entrada || v._id));
+          if (v.pc_fixo) card.appendChild(el("div", "vod-pc", "PC fixo: " + v.pc_fixo));
+          if (v.erro) card.appendChild(el("div", "vod-erro", "Erro: " + v.erro));
+          if (v.finalizado_em) card.appendChild(el("div", "vod-tempo", "Finalizado: " + new Date(v.finalizado_em).toLocaleString()));
+          return card;
+        }));
       }
 
       function renderWorkers(workers) {
@@ -1424,6 +1580,7 @@
             renderWorkers(dados.workers || []);
             renderLives(dados.lives || [], dados.workers || []);
             renderAlvos(dados.alvos || [], dados.workers || []);
+            renderVodsRecentes(dados.vods_recentes || []);
             renderJobs(dados.jobs_24h || {});
             statusDotEl.className = "brand-mark";
             atualizadoEl.textContent = "Atualizado: " + new Date().toLocaleTimeString();

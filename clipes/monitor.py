@@ -367,7 +367,7 @@ def streamlink_cmd(channel: str) -> list[str]:
 
 def ytdlp_live_cmd(url: str) -> list[str]:
     return [
-        "yt-dlp", "-q", "--no-progress", "--no-part", "-f", "b[height<=1080]/b",
+        "yt-dlp", "-q", "--no-progress", "--no-part", "-f", "b[height<=1080]/bv*[height<=1080]+ba/b",
         "--retries", "infinite", "--fragment-retries", "infinite", "--socket-timeout", "30",
         "--hls-use-mpegts", *js_runtime_args(), "-o", "-", "--", url,
     ]

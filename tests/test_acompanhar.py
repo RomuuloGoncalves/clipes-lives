@@ -497,6 +497,7 @@ def test_follow_live_e_monitor_logam_not_claimed(tmp_path, capsys):
         "C",
         (),
         {
+            "worker_id": "w-test",
             "ensure_indexes": lambda *a: None,
             "ensure_live": lambda *a, **k: None,
             "claim_live": lambda *a: False,

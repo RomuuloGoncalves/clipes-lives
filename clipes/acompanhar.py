@@ -61,6 +61,7 @@ class Alvo:
     video_id: str | None = None
     channel_id: str | None = None
     raw: str = ""
+    is_recorded_vod: bool = False
 
 
 @dataclass
@@ -72,6 +73,7 @@ class _ManagedAlvo:
     fase: str = "aguardando live"
     next_check_at: float = float("-inf")
     session_key: str | None = None
+    auto_vod: bool = False
 
 
 def parse_alvo(s: str) -> Alvo:
@@ -757,6 +759,7 @@ class Supervisor:
         self._avisados: set[tuple[str, str]] = set()
         self._lost_lives: set[str] = set()
         self._pending_lease_lost: set[str] = set()
+        self._cancelled_vod_ids: set[str] = set()
         self._alvo_by_key: dict[str, Alvo] = {a.chave: a for a in self.alvos}
         self._mongo_offline_until = float("-inf")
         self._need_replay = self.coord is not None
@@ -966,7 +969,14 @@ class Supervisor:
             alvo.canal = handle
         elif alvo.channel_id:
             alvo.canal = alvo.channel_id.lower()
-        if meta.get("is_live") is False:
+        # Detecta se e um video gravado/live encerrada (nao live ativa nem proxima)
+        is_live = meta.get("is_live")
+        live_status = str(meta.get("live_status") or "").strip().lower()
+        if is_live is False and live_status != "is_upcoming":
+            alvo.is_recorded_vod = True
+            print(f"[acompanhar] {self._label(alvo)} video gravado/live encerrada detectado", flush=True)
+            return False
+        if is_live is False:
             print(f"[acompanhar] {self._label(alvo)} offline; ignorado", flush=True)
             return False
         return True
@@ -1074,6 +1084,7 @@ class Supervisor:
             if limite < 1 or self._ativos_na_plataforma(alvo.plataforma) >= limite:
                 self._safe_release_alvo(c, alvo_id)
                 continue
+            auto_vod = bool(doc.get("auto_vod"))
             with self._lock:
                 self._managed_alvos[alvo_id] = _ManagedAlvo(
                     alvo_id=alvo_id,
@@ -1082,6 +1093,7 @@ class Supervisor:
                     plataforma=alvo.plataforma,
                     fase="aguardando live",
                     next_check_at=float("-inf"),
+                    auto_vod=auto_vod,
                 )
 
     def _stop_removed_alvo(self, m: _ManagedAlvo, c_active: Any) -> None:
@@ -1166,6 +1178,7 @@ class Supervisor:
                         plataforma=alvo.plataforma,
                         fase="aguardando live",
                         next_check_at=float("-inf"),
+                        auto_vod=bool(doc.get("auto_vod")),
                     )
 
     def _tick_managed_alvos(
@@ -1195,6 +1208,30 @@ class Supervisor:
             except ValueError:
                 m.next_check_at = t + ALVO_RECHECK_S
                 continue
+
+            # Promocao automatica YouTube live -> VOD
+            if (
+                m.auto_vod
+                and m.plataforma == "youtube"
+                and m.alvo.video_id is not None
+            ):
+                # Sonda YouTube para verificar se ja e video gravado/live encerrada
+                _ = self._probe_youtube(fresh_alvo, probe_fn)
+                if fresh_alvo.is_recorded_vod:
+                    c_now = self._coord_active()
+                    if c_now is not None:
+                        promovido = c_now.promover_para_vod(m.alvo_id, fresh_alvo.url)
+                        if promovido == "promovido":
+                            print(f"[acompanhar] alvo {m.alvo_id} promovido para VOD ({fresh_alvo.url})", flush=True)
+                            with self._lock:
+                                self._managed_alvos.pop(m.alvo_id, None)
+                            continue
+                        elif promovido == "duplicado":
+                            print(f"[acompanhar] alvo {m.alvo_id} duplicado (VOD ativo existe), marcado removido", flush=True)
+                            with self._lock:
+                                self._managed_alvos.pop(m.alvo_id, None)
+                            continue
+
             limite = self._limite(m.plataforma)
             status = self._try_start_alvo(
                 fresh_alvo,
@@ -1631,6 +1668,16 @@ class Supervisor:
             bloqueio = self._check_vod_policy(vod, url, probe_fn)
             if bloqueio is not None:
                 raise PermissionError(bloqueio)
+
+            # Revalidar se o VOD ainda esta ativo antes de rodar o pipeline
+            renew_alvos_fn = getattr(c, "renew_alvos", None)
+            if callable(renew_alvos_fn):
+                renewed = renew_alvos_fn({vod_id: "processando"})
+                if vod_id not in renewed:
+                    # VOD foi removido durante a validacao - aborta silenciosamente
+                    print(f"[vod] alvo removido antes do pipeline {vod_id}", flush=True)
+                    return True
+
             runner = self.vod_pipeline or self._run_vod_cli
             rc = runner(url, self.out_root)
             if isinstance(rc, int) and rc != 0:
@@ -1648,9 +1695,13 @@ class Supervisor:
                 except Exception as mexc:
                     if monitor._is_mongo_error(mexc):
                         self._on_mongo_err(mexc)
-            msg = f"[vod] falha {vod_id}: {erro_limpo}"
-            print(msg, flush=True)
-            self.aviso_fn(msg)
+            # Se o VOD foi cancelado intencionalmente (removido no painel), evita notificacao ruidosa de falha
+            if vod_id in self._cancelled_vod_ids:
+                self._cancelled_vod_ids.discard(vod_id)
+            else:
+                msg = f"[vod] falha {vod_id}: {erro_limpo}"
+                print(msg, flush=True)
+                self.aviso_fn(msg)
             return True
         else:
             c_fin = self._coord_active() or self.coord
@@ -1823,7 +1874,11 @@ class Supervisor:
                                         renew_alvos_fn(fases_k)
                                     vod_k = self._active_vod_id[0]
                                     if vod_k:
-                                        renew_alvos_fn([vod_k])
+                                        # Renova VOD com fase="processando" para detectar cancelamento
+                                        renewed_vod = renew_alvos_fn({vod_k: "processando"})
+                                        if vod_k not in renewed_vod:
+                                            self._cancelled_vod_ids.add(vod_k)
+                                            print(f"[vod] alvo removido durante execucao {vod_k}", flush=True)
                                 with self._lock:
                                     active_snapshot = list(self._active.items())
                                     already_lost = set(self._pending_lease_lost)

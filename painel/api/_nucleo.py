@@ -6,6 +6,7 @@ Sem imports de `clipes` (a Vercel so instala pymongo): o parser de alvos espelha
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -45,17 +46,32 @@ class LiveStatus(TypedDict):
 
 class AlvoStatus(TypedDict):
     _id: Any
+    tipo: str          # "live" | "vod"
     plataforma: Any
-    entrada: Any
+    entrada: Any       # entrada or url or _id
+    url: Any           # URL canonica para VODs (ou None para lives sem url)
     owner: Any
     pc_fixo: Any
     fase: Any
+
+
+class VodRecenteStatus(TypedDict):
+    _id: Any
+    plataforma: Any
+    entrada: Any
+    url: Any
+    pc_fixo: Any
+    estado: str        # "feito" | "falhou"
+    fase: Any          # "concluido" | "falhou"
+    erro: Any          # mensagem sanitizada ou None
+    finalizado_em: str | None
 
 
 class StatusPayload(TypedDict):
     workers: list[WorkerStatus]
     lives: list[LiveStatus]
     alvos: list[AlvoStatus]
+    vods_recentes: list[VodRecenteStatus]
     jobs_24h: dict[str, int]
     config_schema: dict[str, dict[str, Any]]
 
@@ -155,10 +171,39 @@ def status(db: Any, now: datetime, beat_s: float = BEAT_S) -> StatusPayload:
               "lease_until": _iso(l.get("lease_until"))}
              for l in db.lives.find({"status": "live", "owner": {"$ne": None},
                                      "lease_until": {"$gte": now}})]
-    alvos: list[AlvoStatus] = [{"_id": a["_id"], "plataforma": a.get("plataforma"),
-                                "entrada": a.get("entrada"), "owner": a.get("owner"),
-                                "pc_fixo": a.get("pc_fixo"), "fase": a.get("fase")}
-                               for a in db.alvos.find({"tipo": "live", "estado": "ativo"}).sort("criado_em", 1)]
+    # Alvos ativos: live + VOD, ordenados por criado_em
+    alvos: list[AlvoStatus] = []
+    for a in db.alvos.find({"tipo": {"$in": ["live", "vod"]}, "estado": "ativo"}).sort("criado_em", 1):
+        entrada = a.get("entrada") or a.get("url") or a["_id"]
+        alvos.append({
+            "_id": a["_id"],
+            "tipo": a.get("tipo", "live"),
+            "plataforma": a.get("plataforma"),
+            "entrada": entrada,
+            "url": a.get("url"),
+            "owner": a.get("owner"),
+            "pc_fixo": a.get("pc_fixo"),
+            "fase": a.get("fase"),
+        })
+    # VODs recentes (ultimas 24h, ate 10)
+    vods_recentes: list[VodRecenteStatus] = []
+    cutoff = now - timedelta(hours=24)
+    for v in db.alvos.find({
+        "tipo": "vod",
+        "estado": {"$in": ["feito", "falhou"]},
+        "finalizado_em": {"$gte": cutoff}
+    }).sort("finalizado_em", -1).limit(10):
+        vods_recentes.append({
+            "_id": v["_id"],
+            "plataforma": v.get("plataforma"),
+            "entrada": v.get("entrada") or v.get("url") or v["_id"],
+            "url": v.get("url"),
+            "pc_fixo": v.get("pc_fixo"),
+            "estado": v.get("estado"),
+            "fase": v.get("fase"),
+            "erro": v.get("erro"),
+            "finalizado_em": _iso(v.get("finalizado_em")),
+        })
     jobs: dict[str, int] = {}
     for j in db.jobs.find({"updated_at": {"$gte": now - timedelta(hours=24)}}):
         jobs[j["status"]] = jobs.get(j["status"], 0) + 1
@@ -166,6 +211,7 @@ def status(db: Any, now: datetime, beat_s: float = BEAT_S) -> StatusPayload:
         "workers": workers,
         "lives": lives,
         "alvos": alvos,
+        "vods_recentes": vods_recentes,
         "jobs_24h": jobs,
         "config_schema": CONFIG_SCHEMA,
     }
@@ -216,13 +262,14 @@ def criar_comando(
 # ---- alvos (espelho de acompanhar.parse_alvo + bot._parse_live_alvo; paridade em tests/test_painel.py)
 
 MAX_ALVOS_ATIVOS: int = 30
+MAX_VODS_ATIVOS: int = 20
 _CANAL_RE = re.compile(r"[a-z0-9_]{1,25}")
 _YT_ID_RE = re.compile(r"[A-Za-z0-9_-]{4,32}")
 _YT_HANDLE_RE = re.compile(r"@([A-Za-z0-9_.-]{1,64})")
 _KICK_SLUG_RE = re.compile(r"[a-z0-9_-]{1,25}")  # espelho de acompanhar._KICK_SLUG_RE (aplicado em minusculas)
 _KICK_RESERVED = frozenset({"video", "videos", "categories", "search", "auth", "clips"})
 _TWITCH_HOSTS = frozenset({"twitch.tv", "www.twitch.tv", "m.twitch.tv"})
-_YT_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com"})
+_YT_HOSTS = frozenset({"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"})
 _KICK_HOSTS = frozenset({"kick.com", "www.kick.com", "m.kick.com"})
 
 
@@ -257,6 +304,8 @@ def _parse_alvo(raw: Any) -> dict[str, str] | None:
         if not path or "/" in path or not _CANAL_RE.fullmatch(path.lower()):
             return None
         return _alvo_dict("twitch", path.lower(), path.lower(), f"https://www.twitch.tv/{path.lower()}")
+    if host == "youtu.be":
+        return _alvo_youtube(path) if path and "/" not in path and _YT_ID_RE.fullmatch(path) else None
     if host in _YT_HOSTS:
         parts = [x for x in path.split("/") if x]
         if parts == ["watch"]:
@@ -269,8 +318,6 @@ def _parse_alvo(raw: Any) -> dict[str, str] | None:
             safe = re.sub(r"[^A-Za-z0-9_-]", "_", handle.lower())
             return _alvo_dict("youtube", f"yt_{safe}", handle.lower(), f"https://www.youtube.com/@{handle}/live")
         return None
-    if host == "youtu.be":
-        return _alvo_youtube(path) if path and "/" not in path and _YT_ID_RE.fullmatch(path) else None
 
     # Kick: o bot usa urlsplit (sem `;params`) e aceita so http(s) sem credenciais
     sk = urlsplit(url)
@@ -282,11 +329,186 @@ def _parse_alvo(raw: Any) -> dict[str, str] | None:
     return None
 
 
-def criar_alvo(db: Any, alvo: Any, pc: Any, now: datetime) -> tuple[int, dict[str, Any]]:
-    """Adiciona alvo de live como o bot (`_live_adicionar`): mesmo doc, limite e recusa de duplicado."""
-    parsed = _parse_alvo(alvo)
+# ---- VOD parsing ----
+
+_TWITCH_VOD_RE = re.compile(r"(?:www\.|m\.)?twitch\.tv/(?:videos?/|[^/]+/videos?/|clips?/|[^/]+/clip/)(\d+|[a-zA-Z0-9_-]+)")
+_KICK_VOD_RE = re.compile(r"(?:www\.|m\.)?kick\.com/(?:video/|[^/]+/videos?/|[^/]+/clips/)(\d+|[a-zA-Z0-9_-]+)")
+_YT_SHORTS_RE = re.compile(r"(?:www\.|m\.)?youtube\.com/shorts/([A-Za-z0-9_-]{4,32})")
+
+import ipaddress
+
+def _is_ssrf_host(host: str) -> bool:
+    """Verifica se o host e perigoso (SSRF): localhost, IPs literais, .local, .internal."""
+    if not host:
+        return True
+    host_lower = host.lower()
+    if host_lower in ("localhost", "localhost.localdomain"):
+        return True
+    if host_lower.endswith(".local") or host_lower.endswith(".internal") or host_lower.endswith(".localhost"):
+        return True
+    # IP literal (IPv4 ou IPv6)
+    try:
+        ipaddress.ip_address(host_lower.strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _canonicalize_vod_url(url: str) -> str:
+    """Canonicaliza URL de VOD removendo fragmento e normalizando."""
+    p = urlparse(url)
+    # Remove fragmento
+    clean = p._replace(fragment="").geturl()
+    # Remove barra final supérflua
+    if clean.endswith("/") and urlparse(clean).path == "/":
+        clean = clean[:-1]
+    return clean
+
+
+def _vod_hash(url: str) -> str:
+    """Gera hash curto para _id do VOD."""
+    return f"vod:{hashlib.sha256(url.encode('utf-8')).hexdigest()[:8]}"
+
+
+def _parse_vod_alvo(raw: str) -> dict[str, str] | None:
+    """Parseia URL de VOD explicita (Twitch, Kick, YouTube Shorts, generica).
+    Retorna {plataforma, chave, entrada, url} ou None se invalido."""
+    clean = raw.strip()
+    if not clean:
+        return None
+    # SSRF: rejeita credenciais embutidas
+    if "@" in clean and "://" in clean:
+        sp = urlsplit(clean)
+        if sp.username or sp.password:
+            return None
+    # Adiciona https:// se necessario
+    if "://" not in clean:
+        clean = f"https://{clean}"
+    sp = urlsplit(clean)
+    if sp.scheme.lower() not in ("http", "https"):
+        return None
+    host = sp.netloc.lower()
+    path = sp.path.strip("/")
+    if _is_ssrf_host(sp.hostname or ""):
+        return None
+
+    # Twitch VOD/Clip
+    m = _TWITCH_VOD_RE.search(clean)
+    if m and host in _TWITCH_HOSTS:
+        vod_id = m.group(1)
+        canonical = f"https://www.twitch.tv/videos/{vod_id}" if vod_id.isdigit() else f"https://clips.twitch.tv/{vod_id}"
+        return {
+            "plataforma": "twitch",
+            "chave": _vod_hash(canonical),
+            "entrada": canonical,
+            "url": canonical,
+        }
+
+    # Kick VOD/Clip
+    m = _KICK_VOD_RE.search(clean)
+    if m and host in _KICK_HOSTS:
+        vod_id = m.group(1)
+        canonical = f"https://kick.com/video/{vod_id}"
+        return {
+            "plataforma": "kick",
+            "chave": _vod_hash(canonical),
+            "entrada": canonical,
+            "url": canonical,
+        }
+
+    # YouTube Shorts
+    m = _YT_SHORTS_RE.search(clean)
+    if m and host in _YT_HOSTS:
+        shorts_id = m.group(1)
+        canonical = f"https://www.youtube.com/shorts/{shorts_id}"
+        return {
+            "plataforma": "youtube",
+            "chave": _vod_hash(canonical),
+            "entrada": canonical,
+            "url": canonical,
+        }
+
+    # Plataforma generica: URL publica HTTP(S) com dominio valido e path nao vazio
+    # So aceita generico para dominios NAO conhecidos como Twitch/Kick/YouTube
+    # (para canais conhecidos, so VODs com padroes especificos sao aceitos acima)
+    _KNOWN_LIVE_HOSTS = _TWITCH_HOSTS | _YT_HOSTS | _KICK_HOSTS
+    _RESERVED_TLDS = frozenset({"invalid", "test", "localhost", "example", "local", "internal"})
+    host_parts = host.split(".")
+    if (
+        path
+        and host not in _KNOWN_LIVE_HOSTS
+        and len(host_parts) >= 2
+        and host_parts[-1] not in _RESERVED_TLDS
+        and not _is_ssrf_host(sp.hostname or "")
+    ):
+        canonical = _canonicalize_vod_url(clean)
+        # Extrai host limpo para plataforma
+        plat_host = host.replace("www.", "").replace("m.", "")[:32]
+        return {
+            "plataforma": plat_host,
+            "chave": _vod_hash(canonical),
+            "entrada": canonical,
+            "url": canonical,
+        }
+
+    return None
+
+
+def _parse_alvo_painel(raw: Any, tipo: str = "auto") -> dict[str, Any] | None:
+    """Parser unificado para painel: aceita live, VOD ou auto.
+    Retorna dict com tipo, plataforma, chave, entrada, url, auto_vod, ou None se invalido."""
+    if tipo not in ("auto", "live", "vod"):
+        return None
+    clean = raw.strip() if isinstance(raw, str) else ""
+    if not clean or any(ch.isspace() for ch in clean):
+        return None
+
+    # Tenta parsear como VOD primeiro (se tipo vod ou auto)
+    if tipo in ("auto", "vod"):
+        vod_parsed = _parse_vod_alvo(clean)
+        if vod_parsed:
+            if tipo == "vod":
+                return {**vod_parsed, "tipo": "vod", "auto_vod": False}
+            # tipo == "auto": VOD explicito -> vod
+            return {**vod_parsed, "tipo": "vod", "auto_vod": False}
+
+    # Tenta parsear como live
+    live_parsed = _parse_alvo(clean)
+    if live_parsed:
+        if tipo == "live":
+            return {**live_parsed, "tipo": "live", "auto_vod": False}
+        # tipo == "auto": verifica se e YouTube watch?v= / youtu.be / /live/<id> (ambiguo)
+        if live_parsed["plataforma"] == "youtube" and live_parsed.get("chave", "").startswith("yt_"):
+            return {**live_parsed, "tipo": "live", "auto_vod": True}
+        return {**live_parsed, "tipo": "live", "auto_vod": False}
+
+    return None
+
+
+def criar_alvo(db: Any, alvo: Any, pc: Any, now: datetime, tipo: str = "auto") -> tuple[int, dict[str, Any]]:
+    """Adiciona alvo (live ou VOD) com suporte a tipo auto/live/vod e pc_fixo."""
+    parsed = _parse_alvo_painel(alvo, tipo)
     if parsed is None:
         return 400, {"erro": "alvo invalido"}
+    if parsed.get("tipo") == "vod":
+        # VOD: usa chave hash, verifica limite de VODs
+        chave = parsed["chave"]
+        # Duplicata: por _id OU por url
+        if db.alvos.find_one({"$or": [{"_id": chave}, {"tipo": "vod", "url": parsed["url"], "estado": "ativo"}]}) is not None:
+            return 409, {"erro": "alvo ja acompanhado"}
+        if db.alvos.count_documents({"tipo": "vod", "estado": "ativo"}) >= MAX_VODS_ATIVOS:
+            return 409, {"erro": f"limite de {MAX_VODS_ATIVOS} VODs ativos atingido"}
+        pc_fixo = pc.strip() if isinstance(pc, str) else ""
+        doc = {
+            "_id": chave, "tipo": "vod", "plataforma": parsed["plataforma"],
+            "entrada": parsed["entrada"], "url": parsed["url"], "estado": "ativo",
+            "pc_fixo": pc_fixo or None, "owner": None, "lease_until": None, "fase": "na fila",
+            "criado_por": "painel", "criado_em": now, "erro": None, "auto_vod": False,
+        }
+        db.alvos.replace_one({"_id": chave}, doc, upsert=True)
+        return 201, {"ok": True, "_id": chave, "tipo": "vod"}
+
+    # Live: usa chave do parser original
     chave = parsed["chave"]
     if db.alvos.find_one({"_id": chave, "estado": "ativo"}) is not None:
         return 409, {"erro": "alvo ja acompanhado"}
@@ -298,17 +520,19 @@ def criar_alvo(db: Any, alvo: Any, pc: Any, now: datetime) -> tuple[int, dict[st
         "entrada": parsed["canal"] if parsed["plataforma"] == "twitch" else parsed["url"],
         "canal": parsed["canal"], "url": None, "estado": "ativo",
         "pc_fixo": pc_fixo or None, "owner": None, "lease_until": None, "fase": "sem vaga",
-        "criado_por": "painel", "criado_em": now, "erro": None,
+        "criado_por": "painel", "criado_em": now, "erro": None, "auto_vod": parsed.get("auto_vod", False),
     }, upsert=True)
-    return 201, {"ok": True, "_id": chave}
+    return 201, {"ok": True, "_id": chave, "tipo": "live"}
 
 
 def remover_alvo(db: Any, alvo_id: Any) -> tuple[int, dict[str, Any]]:
-    """Marca `estado=removido` como o bot (`_live_remover`); o Supervisor para o alvo no proximo ciclo."""
+    """Marca `estado=removido` e `fase=cancelado` para live ou VOD ativo."""
     if not isinstance(alvo_id, str) or not alvo_id:
         return 400, {"erro": "alvo invalido"}
-    res = db.alvos.update_one({"_id": alvo_id, "tipo": "live", "estado": "ativo"},
-                              {"$set": {"estado": "removido"}})
+    res = db.alvos.update_one(
+        {"_id": alvo_id, "tipo": {"$in": ["live", "vod"]}, "estado": "ativo"},
+        {"$set": {"estado": "removido", "fase": "cancelado"}}
+    )
     if res.matched_count == 0:
         return 404, {"erro": "alvo nao encontrado"}
     return 200, {"ok": True}
@@ -317,7 +541,7 @@ def remover_alvo(db: Any, alvo_id: Any) -> tuple[int, dict[str, Any]]:
 def gerir_alvo(db: Any, corpo: Mapping[str, Any], now: datetime) -> tuple[int, dict[str, Any]]:
     acao = corpo.get("acao")
     if acao == "adicionar":
-        return criar_alvo(db, corpo.get("alvo"), corpo.get("pc"), now)
+        return criar_alvo(db, corpo.get("alvo"), corpo.get("pc"), now, corpo.get("tipo", "auto"))
     if acao == "remover":
         return remover_alvo(db, corpo.get("id"))
     return 400, {"erro": "acao invalida"}

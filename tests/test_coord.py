@@ -737,3 +737,139 @@ def test_beat_retorna_config_salvo_em_unica_operacao(env):
     cfg = a.beat("PC-1", CAP, None, 3, 0.4, beat_s=20)
     assert cfg == {"CLIPES_SLOTS": "twitch=2,busca=0"}
     assert db.workers.find_one({"_id": "w-a"})["heartbeat_at"] is not None
+
+
+# ---- Onda 10 T1: pegar_vod marca fase=processando, fim_vod atualiza fase e nao sobrescreve removido, promover_para_vod ----
+
+def test_pegar_vod_marca_fase_processando_e_pc_fixo(env):
+    clock, db, a, b = env
+    # Limpa alvos existentes do env
+    db.alvos.delete_many({})
+    db.alvos.insert_many([
+        {"_id": "vod:1", "tipo": "vod", "url": "https://twitch.tv/videos/1", "estado": "ativo", "criado_em": 10, "pc_fixo": "PC-1"},
+        {"_id": "vod:2", "tipo": "vod", "url": "https://twitch.tv/videos/2", "estado": "ativo", "criado_em": 20, "pc_fixo": "PC-2"},
+        {"_id": "vod:3", "tipo": "vod", "url": "https://twitch.tv/videos/3", "estado": "ativo", "criado_em": 30},  # sem pc_fixo
+    ])
+
+    v1 = a.pegar_vod("PC-1")
+    assert v1 is not None and v1["_id"] == "vod:1"
+    assert v1["fase"] == "processando"
+    assert v1["owner"] == "w-a"
+
+    # PC-2 nao pode pegar vod:1 (pc_fixo=PC-1) - deve pular para vod:2
+    v2 = b.pegar_vod("PC-2")
+    assert v2 is not None and v2["_id"] == "vod:2" and v2["fase"] == "processando"
+    assert v2["owner"] == "w-b"
+
+    # PC-3 pega vod:3 (sem pc_fixo)
+    c = Coord(db, "w-c", now=clock)
+    v3 = c.pegar_vod("PC-3")
+    assert v3 is not None and v3["_id"] == "vod:3" and v3["fase"] == "processando"
+
+    # PC-1 tentando de novo imediatamente: vod:1 ainda tem owner=w-a (lease valida) -> re-reivindica
+    v1_again = a.pegar_vod("PC-1")
+    assert v1_again is not None and v1_again["_id"] == "vod:1"
+
+    # PC-2 tentando pegar vod:1 (pc_fixo=PC-1) deve falhar e pegar vod:2 (seu proprio, lease valida)
+    v2_again = b.pegar_vod("PC-2")
+    assert v2_again is not None and v2_again["_id"] == "vod:2"
+
+    # Teste que pc_fixo e respeitado: cria VOD sem pc_fixo e PC-1 pega (mas vod:1 vem antes no sort)
+    # Entao testa com VOD de criado_em maior que so PC-1 pode pegar
+    db.alvos.insert_one({"_id": "vod:livre", "tipo": "vod", "url": "https://twitch.tv/videos/99", "estado": "ativo", "criado_em": 5, "pc_fixo": "PC-1"})
+    v_livre = a.pegar_vod("PC-1")
+    assert v_livre is not None and v_livre["_id"] == "vod:livre"
+
+
+def test_fim_vod_atualiza_fase_e_nao_sobrescreve_removido(env, monkeypatch):
+    clock, db, a, _ = env
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok_super_secreto_12345")
+    db.alvos.insert_one({"_id": "vod:ok", "tipo": "vod", "url": "https://twitch.tv/videos/1", "estado": "ativo", "criado_em": 10})
+    db.alvos.insert_one({"_id": "vod:removed", "tipo": "vod", "url": "https://twitch.tv/videos/2", "estado": "ativo", "criado_em": 20})
+
+    # Pega e finaliza com sucesso
+    a.pegar_vod("PC-1")
+    assert a.fim_vod("vod:ok", "feito") is True
+    d1 = db.alvos.find_one({"_id": "vod:ok"})
+    assert (d1["estado"], d1["fase"], d1["owner"], d1["lease_until"]) == ("feito", "concluido", None, None)
+    assert d1["finalizado_em"] is not None
+
+    # Remove manualmente enquanto outro PC processa
+    b = Coord(db, "w-b", now=clock)
+    b.pegar_vod("PC-2")
+    # Operador remove no painel -> estado=removido, fase=cancelado
+    db.alvos.update_one({"_id": "vod:removed"}, {"$set": {"estado": "removido", "fase": "cancelado", "owner": None, "lease_until": None}})
+    # fim_vod do worker original NAO deve sobrescrever removido
+    assert b.fim_vod("vod:removed", "feito") is False
+    d2 = db.alvos.find_one({"_id": "vod:removed"})
+    assert (d2["estado"], d2["fase"]) == ("removido", "cancelado")
+
+    # Erro sanitizado
+    assert a.fim_vod(
+        "vod:ok",  # ja finalizado, mas testa sanitizacao
+        "falhou",
+        "erro em mongodb+srv://user:senha@cluster.local/db com tok_super_secreto_12345",
+    ) is False  # matched_count = 0 pois estado != "ativo"
+
+
+def test_promover_para_vod_in_place_e_duplicado(env):
+    clock, db, a, _ = env
+    # Cria alvo live do YouTube com auto_vod=True
+    db.alvos.insert_one({
+        "_id": "yt_AbC123", "tipo": "live", "plataforma": "youtube",
+        "entrada": "https://www.youtube.com/watch?v=AbC123",
+        "url": "https://www.youtube.com/watch?v=AbC123",
+        "estado": "ativo", "owner": "w-a", "lease_until": a._dt(90),
+        "fase": "aguardando live", "pc_fixo": "PC-1",
+        "criado_por": "painel", "criado_em": 100.0, "auto_vod": True,
+    })
+
+    # Promove in-place
+    res = a.promover_para_vod("yt_AbC123", "https://www.youtube.com/watch?v=AbC123")
+    assert res == "promovido"
+    doc = db.alvos.find_one({"_id": "yt_AbC123"})
+    assert doc["tipo"] == "vod"
+    assert doc["fase"] == "na fila"
+    assert doc["owner"] is None
+    assert doc["lease_until"] is None
+    assert doc["auto_vod"] is False
+    # Preservados
+    assert doc["pc_fixo"] == "PC-1"
+    assert doc["criado_por"] == "painel"
+    assert doc["criado_em"] == 100.0
+    assert doc["url"] == "https://www.youtube.com/watch?v=AbC123"
+    assert doc["entrada"] == "https://www.youtube.com/watch?v=AbC123"
+
+    # Testa duplicado: cria outro VOD ativo com a mesma URL
+    db.alvos.insert_one({
+        "_id": "vod:dup1111", "tipo": "vod", "url": "https://www.youtube.com/watch?v=AbC123",
+        "estado": "ativo", "criado_em": 200.0,
+    })
+    # Cria outro alvo live para testar duplicado
+    db.alvos.insert_one({
+        "_id": "yt_XyZ789", "tipo": "live", "plataforma": "youtube",
+        "entrada": "https://www.youtube.com/watch?v=XyZ789",
+        "url": "https://www.youtube.com/watch?v=XyZ789",
+        "estado": "ativo", "owner": "w-a", "lease_until": a._dt(90),
+        "fase": "aguardando live", "pc_fixo": "PC-1",
+        "criado_por": "painel", "criado_em": 300.0, "auto_vod": True,
+    })
+    res2 = a.promover_para_vod("yt_XyZ789", "https://www.youtube.com/watch?v=AbC123")
+    assert res2 == "duplicado"
+    doc2 = db.alvos.find_one({"_id": "yt_XyZ789"})
+    assert (doc2["estado"], doc2["fase"]) == ("removido", "cancelado")
+
+    # Ignorado: alvo nao pertence a este worker (outro worker) ou nao esta ativo
+    # Cria alvo live de outro worker
+    db.alvos.insert_one({
+        "_id": "yt_Outro999", "tipo": "live", "plataforma": "youtube",
+        "entrada": "https://www.youtube.com/watch?v=Outro999",
+        "url": "https://www.youtube.com/watch?v=Outro999",
+        "estado": "ativo", "owner": "w-b", "lease_until": a._dt(90),
+        "fase": "aguardando live", "pc_fixo": "PC-2",
+        "criado_por": "painel", "criado_em": 400.0, "auto_vod": True,
+    })
+    res3 = a.promover_para_vod("yt_Outro999", "https://www.youtube.com/watch?v=Outro999")
+    assert res3 == "ignorado"
+    doc3 = db.alvos.find_one({"_id": "yt_Outro999"})
+    assert doc3["tipo"] == "live"  # nao alterado
