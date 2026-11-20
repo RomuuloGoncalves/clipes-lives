@@ -913,7 +913,7 @@ def test_master_mode_discord_flags_720_last_stage_rerender_and_livre(tmp_path: P
     clip_livre = SnappedClip(peak=30.0, start=0.0, end=60.0, score=0.9, title="Modo livre")
     render_mod.render_clip(clip_livre, 4, [], "", out_dir, cache_dir, live_video_path=src)
     assert len(cmds) == 1
-    assert "-maxrate" not in cmds[0]
+    assert cmds[0][cmds[0].index("-maxrate") + 1] == "6000k"  # teto do modo livre (T9)
     assert "scale=720:1280" not in cmds[0][cmds[0].index("-filter_complex") + 1]
     assert clip_livre.cabe_discord is False
 
