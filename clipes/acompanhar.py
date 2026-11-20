@@ -306,6 +306,7 @@ class LiveSession:
         self.min_dur = float(min_dur) if min_dur is not None else None
         self.pad = self.max_dur / 2
         self.min_free = config.env_float("CLIPES_MIN_FREE_GB", 5.0, min_value=0.0) if min_free_gb is None else float(min_free_gb)
+        self.max_backlog = config.env_int("CLIPES_MAX_BACKLOG", 6, min_value=1)
         self.coord_getter = coord_getter or (lambda: None)
         self.on_mongo_error = on_mongo_error or (lambda _exc: None)
         self.live_id = live_id
@@ -484,8 +485,13 @@ class LiveSession:
             raise
 
         backlog = self.pending()
-        if len(backlog) > monitor.LIVE_MAX_BACKLOG:
-            print(f"[live] backlog {len(backlog)} > {monitor.LIVE_MAX_BACKLOG}: {backlog[0].name} lost", flush=True)
+        disco_baixo = self.disk_usage(self.out_root).free < self.min_free * 1e9
+        if len(backlog) > self.max_backlog or (disco_baixo and len(backlog) > 1):
+            print(
+                f"[live] backlog {len(backlog)} (limite {self.max_backlog}, disco_baixo={disco_baixo}): "
+                f"{backlog[0].name} lost",
+                flush=True,
+            )
             lost_dir = backlog[0]
             try:
                 lost_job = monitor._read_job(lost_dir)

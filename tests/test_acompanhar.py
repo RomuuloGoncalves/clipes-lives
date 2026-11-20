@@ -254,6 +254,7 @@ def test_live_session_backlog_lost_avisa_discord(tmp_path, monkeypatch, capsys):
     clock = Clock(B + 10)
     monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
     monkeypatch.setenv("CLIPES_MAX_LIVES", "1")
+    monkeypatch.setenv("CLIPES_MAX_BACKLOG", "2")  # limite antigo: força a perda com poucas janelas
     avisos: list[str] = []
     pool = FakeMultiPool(clock, {"gaules": B + 2500})
     calls: list[str] = []
@@ -1189,3 +1190,90 @@ def test_vod_dns_falha_bloqueia(tmp_path, monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", boom)
     sup = acompanhar.Supervisor([], tmp_path / "o", pipeline=lambda d, o: {}, now=lambda: B, sleep=lambda _s: None)
     assert sup._check_vod_policy({}, "https://exemplo.test/v", lambda u: {}) == "host nao permitido"
+
+
+# ---- T20: backlog configuravel (CLIPES_MAX_BACKLOG) e descarte antecipado por disco ------------
+
+
+class _PoolBacklog:
+    def video_start_ts(self, ch, s, e):
+        return float(s)
+
+    def freeze_and_concat(self, ch, s, e, dst):
+        dst.write_bytes(b"x")
+        return dst
+
+    def hold(self, ch, ts):
+        pass
+
+
+def _sessao_backlog(tmp_path, monkeypatch, *, disco_livre_gb, env=None):
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.delenv("CLIPES_MAX_BACKLOG", raising=False)
+    monkeypatch.delenv("CLIPES_MIN_FREE_GB", raising=False)
+    if env is not None:
+        monkeypatch.setenv("CLIPES_MAX_BACKLOG", env)
+    out = tmp_path / "out"
+    out.mkdir()
+    queue = monitor.DiskQueue(tmp_path / "queue")
+    avisos: list[str] = []
+    sess = acompanhar.LiveSession(
+        acompanhar.parse_alvo("gaules"), out, queue, _PoolBacklog(), lambda d, r: {"clips": []},
+        is_live=lambda u: True, now=lambda: 0.0,
+        disk_usage=lambda p: SimpleNamespace(free=disco_livre_gb * 1e9),
+        on_backlog_lost=lambda a, nome: avisos.append(nome),
+    )
+    return sess, queue, avisos
+
+
+def _fechar_n_janelas(sess, n, inicio=0):
+    for i in range(inicio, inicio + n):
+        sess.fechar_janela(1000.0 + i * 300, last=False)
+
+
+def _contagem(queue):
+    return (
+        len(list((queue.root / "pending").iterdir())),
+        sorted(p.name for p in (queue.root / "rejected").iterdir()),
+    )
+
+
+def test_backlog_padrao_6_nao_perde_com_6_pendentes(tmp_path, monkeypatch):
+    sess, queue, avisos = _sessao_backlog(tmp_path, monkeypatch, disco_livre_gb=100)
+    _fechar_n_janelas(sess, 6)
+    assert _contagem(queue) == (6, [])
+    assert avisos == []
+
+
+def test_backlog_padrao_6_perde_1_com_7_pendentes(tmp_path, monkeypatch):
+    sess, queue, avisos = _sessao_backlog(tmp_path, monkeypatch, disco_livre_gb=100)
+    _fechar_n_janelas(sess, 7)
+    pendentes, rejeitados = _contagem(queue)
+    assert pendentes == 6
+    assert rejeitados == ["gaules_1000"]  # a mais antiga e a perdida
+    assert avisos == ["gaules_1000"]
+
+
+def test_backlog_env_2_mantem_comportamento_antigo(tmp_path, monkeypatch):
+    sess, queue, avisos = _sessao_backlog(tmp_path, monkeypatch, disco_livre_gb=100, env="2")
+    _fechar_n_janelas(sess, 2)
+    assert _contagem(queue) == (2, [])
+    _fechar_n_janelas(sess, 1, inicio=2)  # 3a janela: 3 > 2 -> perde a mais antiga
+    pendentes, rejeitados = _contagem(queue)
+    assert pendentes == 2
+    assert len(rejeitados) == 1
+
+
+def test_disco_baixo_descarta_antes_do_limite(tmp_path, monkeypatch):
+    sess, queue, avisos = _sessao_backlog(tmp_path, monkeypatch, disco_livre_gb=1)
+    _fechar_n_janelas(sess, 2)  # 2 < limite 6, mas disco livre 1 GB < 5 GB
+    pendentes, rejeitados = _contagem(queue)
+    assert pendentes == 1
+    assert rejeitados == ["gaules_1000"]
+    assert avisos == ["gaules_1000"]
+
+
+def test_modulo_acompanhar_sem_discord_rest_direto():
+    fonte = Path(acompanhar.__file__).read_text(encoding="utf-8")
+    assert "DiscordRest(" not in fonte
+    assert "client.post" not in fonte
