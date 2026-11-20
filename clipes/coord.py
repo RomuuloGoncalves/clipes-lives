@@ -283,11 +283,53 @@ class Coord:
         )
         return res.matched_count == 1
 
-    # ---- heartbeat ----
+    # ---- heartbeat e config por alias ----
+
+    def reconcile_alias(self, alias: str) -> dict:
+        """Unifica documentos antigos/pre-criados com o mesmo `alias` em `self.worker_id` e retorna o `config`."""
+        alias_clean = (alias or "").strip()
+        if not alias_clean:
+            doc = self.db.workers.find_one({"_id": self.worker_id}) or {}
+            return dict(doc.get("config") or {})
+
+        docs = list(
+            self.db.workers.find(
+                {"$or": [{"alias": alias_clean}, {"_id": alias_clean}, {"_id": self.worker_id}]}
+            )
+        )
+        if not docs:
+            return {}
+
+        def _sort_key(d: dict) -> tuple[datetime, datetime, int]:
+            cfg_ts = d.get("config_updated_at")
+            hb_ts = d.get("heartbeat_at")
+            has_cfg = 1 if isinstance(d.get("config"), dict) and d.get("config") else 0
+            return (
+                cfg_ts.replace(tzinfo=None) if isinstance(cfg_ts, datetime) else datetime.min,
+                hb_ts.replace(tzinfo=None) if isinstance(hb_ts, datetime) else datetime.min,
+                has_cfg,
+            )
+
+        docs.sort(key=_sort_key)
+        newest = docs[-1]
+        merged_config = dict(newest.get("config") or {})
+        update_fields: dict = {"alias": alias_clean, "config": merged_config}
+        if isinstance(newest.get("config_updated_at"), datetime):
+            update_fields["config_updated_at"] = newest["config_updated_at"]
+
+        self.db.workers.update_one(
+            {"_id": self.worker_id},
+            {"$set": update_fields},
+            upsert=True,
+        )
+        self.db.workers.delete_many(
+            {"$or": [{"alias": alias_clean}, {"_id": alias_clean}], "_id": {"$ne": self.worker_id}}
+        )
+        return merged_config
 
     def beat(self, alias: str, capacity: dict, job_atual: str | None, max_lives: int, razao: float,
              beat_s: float | None = None, *, slots: dict[str, int] | None = None,
-             ocupados: dict[str, int] | None = None, fila: dict[str, int] | None = None) -> None:
+             ocupados: dict[str, int] | None = None, fila: dict[str, int] | None = None) -> dict:
         now = self._dt()
         fields: dict = {"alias": alias, "capacity": capacity, "job_atual": job_atual,
                         "max_lives": max_lives, "razao": razao, "heartbeat_at": now}
@@ -299,13 +341,15 @@ class Coord:
             fields["ocupados"] = dict(ocupados)
         if fila is not None:
             fields["fila"] = dict(fila)
-        self.db.workers.update_one(
+        doc = self.db.workers.find_one_and_update(
             {"_id": self.worker_id},
             {"$set": fields,
              "$push": {"history": {"$each": [{"t": now, "cpu_pct": capacity.get("cpu_pct"),
                                               "temp_c": capacity.get("temp_c")}], "$slice": -180}}},
             upsert=True,
+            return_document=ReturnDocument.AFTER,
         )
+        return dict((doc or {}).get("config") or {})
 
     # ---- comandos do painel ----
 

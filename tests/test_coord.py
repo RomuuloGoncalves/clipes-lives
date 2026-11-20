@@ -700,3 +700,40 @@ def test_beat_estendido_grava_slots_ocupados_e_fila(env):
     assert doc["ocupados"] == ocupados
     assert doc["fila"] == fila
     assert doc["beat_s"] == 20.0
+
+
+def test_reconcile_alias_migra_config_e_remove_duplicata(env):
+    from datetime import datetime
+
+    _, db, a, _ = env
+    # Simula documento antigo e pre-cadastro do painel para o mesmo alias PC-1
+    db.workers.insert_one({
+        "_id": "w-antigo",
+        "alias": "PC-1",
+        "config": {"CLIPES_LAYOUT": "full"},
+        "config_updated_at": datetime(2026, 1, 1, 10, 0),
+        "heartbeat_at": datetime(2026, 1, 1, 10, 0),
+    })
+    db.workers.insert_one({
+        "_id": "PC-1",
+        "alias": "PC-1",
+        "config": {"CLIPES_LAYOUT": "split-barra", "CLIPES_WHISPER_MODEL": "large-v3-turbo"},
+        "config_updated_at": datetime(2026, 1, 2, 10, 0),
+        "heartbeat_at": None,
+    })
+
+    cfg = a.reconcile_alias("PC-1")
+    assert cfg == {"CLIPES_LAYOUT": "split-barra", "CLIPES_WHISPER_MODEL": "large-v3-turbo"}
+    # Documentos antigos/duplicados removidos; apenas w-a permanece
+    docs = list(db.workers.find({"alias": "PC-1"}))
+    assert len(docs) == 1
+    assert docs[0]["_id"] == "w-a"
+    assert docs[0]["config"] == cfg
+
+
+def test_beat_retorna_config_salvo_em_unica_operacao(env):
+    _, db, a, _ = env
+    db.workers.insert_one({"_id": "w-a", "alias": "PC-1", "config": {"CLIPES_SLOTS": "twitch=2,busca=0"}})
+    cfg = a.beat("PC-1", CAP, None, 3, 0.4, beat_s=20)
+    assert cfg == {"CLIPES_SLOTS": "twitch=2,busca=0"}
+    assert db.workers.find_one({"_id": "w-a"})["heartbeat_at"] is not None
