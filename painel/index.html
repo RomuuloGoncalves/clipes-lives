@@ -3,180 +3,705 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#090d16">
   <title>Clipes Lives - Painel</title>
   <style>
     :root {
       color-scheme: dark;
-      --bg: #0f172a;
-      --card: #1e293b;
-      --border: #334155;
-      --text: #e2e8f0;
+      --bg: #090d16;
+      --surface: #111827;
+      --surface-2: #182235;
+      --border: #263248;
+      --border-strong: #364663;
+      --text: #f1f5f9;
       --muted: #94a3b8;
       --ok: #22c55e;
+      --ok-bg: rgba(34, 197, 94, 0.14);
+      --ok-fg: #86efac;
       --off: #ef4444;
+      --off-bg: rgba(239, 68, 68, 0.14);
+      --off-fg: #fca5a5;
       --warn: #f59e0b;
+      --warn-bg: rgba(245, 158, 11, 0.16);
+      --warn-fg: #fde68a;
+      --accent: #3b82f6;
+      --accent-hover: #2563eb;
+      --accent-bg: rgba(59, 130, 246, 0.15);
+      --accent-fg: #93c5fd;
       --btn: #dc2626;
+      --btn-hover: #b91c1c;
+      --radius: 12px;
+      --radius-sm: 8px;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
     }
+
     * { box-sizing: border-box; }
-    body {
+
+    html, body {
       margin: 0;
-      padding: 16px;
-      font-family: system-ui, -apple-system, sans-serif;
+      padding: 0;
+      max-width: 100%;
+      overflow-x: clip;
       background: var(--bg);
       color: var(--text);
-      line-height: 1.4;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      line-height: 1.45;
+      -webkit-font-smoothing: antialiased;
+      overscroll-behavior-y: contain;
     }
-    header {
+
+    .app {
+      width: 100%;
+      max-width: 1360px;
+      margin: 0 auto;
+      padding: 12px 12px 32px;
+    }
+
+    /* Top bar */
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
       display: flex;
       flex-wrap: wrap;
-      justify-content: space-between;
       align-items: center;
-      gap: 8px;
-      margin-bottom: 16px;
-    }
-    .header-dir { display: flex; align-items: center; gap: 8px; }
-    h1 { font-size: 1.25rem; margin: 0; }
-    h2 { font-size: 1rem; margin: 20px 0 8px; color: var(--muted); }
-    .meta { font-size: 0.875rem; color: var(--muted); }
-    .msg {
-      padding: 8px 12px;
-      border-radius: 6px;
-      margin-bottom: 12px;
-      background: var(--card);
-      border: 1px solid var(--border);
-      font-size: 0.9rem;
-    }
-    .msg:empty { display: none; }
-    .msg.erro { border-color: var(--off); color: #fecaca; }
-    .msg.ok { border-color: var(--ok); color: #bbf7d0; }
-    .wrap {
-      overflow-x: auto;
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 8px;
-    }
-    table {
-      width: 100%;
-      border-collapse: collapse;
-      font-size: 0.9rem;
-    }
-    th, td {
+      justify-content: space-between;
+      gap: 10px;
       padding: 10px 12px;
-      text-align: left;
+      margin: -12px -12px 14px;
+      background: rgba(9, 13, 22, 0.92);
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
       border-bottom: 1px solid var(--border);
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .brand-mark {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--ok);
+      box-shadow: 0 0 0 4px var(--ok-bg);
+      flex-shrink: 0;
+    }
+
+    .brand-mark.erro {
+      background: var(--off);
+      box-shadow: 0 0 0 4px var(--off-bg);
+    }
+
+    h1 {
+      font-size: 1.125rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      margin: 0;
       white-space: nowrap;
     }
-    th { color: var(--muted); font-weight: 600; font-size: 0.8rem; text-transform: uppercase; }
-    tr:last-child td { border-bottom: 0; }
-    .badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 999px;
+
+    .header-dir {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-left: auto;
+    }
+
+    .meta {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .btn-ghost {
+      min-height: 44px;
+      min-width: 44px;
+      padding: 0 12px;
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius-sm);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.875rem;
+      font-weight: 600;
+      cursor: pointer;
+      touch-action: manipulation;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      transition: background-color 0.15s ease, border-color 0.15s ease;
+    }
+
+    .btn-ghost:hover:not(:disabled) {
+      background: var(--surface-2);
+      border-color: var(--muted);
+    }
+
+    /* Feedback banner */
+    .msg {
+      padding: 12px 14px;
+      border-radius: var(--radius-sm);
+      margin-bottom: 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      font-size: 0.9375rem;
+      word-break: break-word;
+    }
+
+    .msg:empty { display: none; }
+    .msg.erro { border-color: var(--off); border-left-color: var(--off); background: var(--off-bg); color: var(--off-fg); }
+    .msg.ok { border-color: var(--ok); border-left-color: var(--ok); background: var(--ok-bg); color: var(--ok-fg); }
+
+    /* Summary KPI strip */
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+
+    .kpi {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .kpi-label {
       font-size: 0.75rem;
       font-weight: 600;
+      color: var(--muted);
+      letter-spacing: 0.02em;
     }
-    .on { background: rgba(34, 197, 94, 0.18); color: #86efac; }
-    .off { background: rgba(239, 68, 68, 0.18); color: #fca5a5; }
-    .nd {
-      background: rgba(245, 158, 11, 0.22);
-      color: #fde68a;
-      border: 1px solid var(--warn);
-      padding: 2px 6px;
-      border-radius: 4px;
+
+    .kpi-val {
+      font-family: var(--mono);
+      font-size: 1.375rem;
       font-weight: 700;
+      font-variant-numeric: tabular-nums;
+      color: var(--text);
     }
-    .acao { display: flex; gap: 6px; align-items: center; }
+
+    .kpi-val.ok { color: var(--ok-fg); }
+
+    /* Section headings */
+    .sec-head {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 8px;
+      margin: 22px 0 10px;
+    }
+
+    h2 {
+      font-size: 1rem;
+      font-weight: 700;
+      margin: 0;
+      color: var(--text);
+      letter-spacing: -0.01em;
+    }
+
+    .sec-sub {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Form & controls (44px+ touch targets, 16px input font to avoid iOS/Android zoom) */
     input[type="text"] {
-      width: 88px;
-      padding: 5px 8px;
-      border-radius: 4px;
-      border: 1px solid var(--border);
+      min-height: 44px;
+      padding: 10px 12px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-strong);
       background: var(--bg);
       color: var(--text);
-      font-size: 0.85rem;
+      font-size: 1rem;
+      font-family: inherit;
+      width: 100%;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
     }
+
+    input[type="text"]::placeholder {
+      color: var(--muted);
+      opacity: 0.75;
+    }
+
+    input[type="text"]:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-bg);
+    }
+
     button {
-      padding: 6px 10px;
+      min-height: 44px;
+      padding: 10px 14px;
       border: 0;
-      border-radius: 4px;
+      border-radius: var(--radius-sm);
       background: var(--btn);
       color: #fff;
       font-weight: 600;
-      font-size: 0.85rem;
+      font-size: 0.9375rem;
+      font-family: inherit;
       cursor: pointer;
+      touch-action: manipulation;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      white-space: nowrap;
+      transition: background-color 0.15s ease, transform 0.08s ease;
     }
+
+    button:hover:not(:disabled) { background: var(--btn-hover); }
+    button:active:not(:disabled) { transform: scale(0.98); }
+    button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
     button:disabled { opacity: 0.5; cursor: not-allowed; }
-    .cards { display: flex; flex-wrap: wrap; gap: 10px; }
-    .pill {
-      background: var(--card);
-      border: 1px solid var(--border);
-      border-radius: 6px;
-      padding: 8px 12px;
-      font-size: 0.875rem;
+
+    .btn-primary {
+      background: var(--accent);
     }
-    .alvo-form { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 8px; }
-    input[type="text"].alvo-entrada { width: 260px; }
+    .btn-primary:hover:not(:disabled) {
+      background: var(--accent-hover);
+    }
+
+    .btn-outline-danger {
+      background: var(--off-bg);
+      color: var(--off-fg);
+      border: 1px solid rgba(239, 68, 68, 0.35);
+    }
+    .btn-outline-danger:hover:not(:disabled) {
+      background: var(--btn);
+      color: #fff;
+      border-color: var(--btn);
+    }
+
+    .alvo-form {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      margin-bottom: 12px;
+      padding: 12px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+
+    /* Badges & chips */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      white-space: nowrap;
+    }
+
+    .badge::before {
+      content: "";
+      width: 6px;
+      height: 6px;
+      border-radius: 999px;
+      background: currentColor;
+    }
+
+    .on { background: var(--ok-bg); color: var(--ok-fg); }
+    .off { background: var(--off-bg); color: var(--off-fg); }
+
+    .plat-badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: var(--surface-2);
+      border: 1px solid var(--border-strong);
+      color: var(--accent-fg);
+    }
+
+    .fase-badge {
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      color: var(--text);
+    }
+
+    .nd {
+      display: inline-block;
+      background: var(--warn-bg);
+      color: var(--warn-fg);
+      border: 1px solid var(--warn);
+      padding: 2px 7px;
+      border-radius: 6px;
+      font-size: 0.75rem;
+      font-weight: 700;
+      font-family: var(--mono);
+    }
+
+    .temp-warn { color: var(--warn-fg); font-weight: 700; }
+    .temp-hot { color: var(--off-fg); font-weight: 700; }
+
+    .slot-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 4px;
+    }
+
+    .slot-chip {
+      display: inline-block;
+      padding: 2px 7px;
+      border-radius: 6px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      font-family: var(--mono);
+      font-size: 0.75rem;
+      font-variant-numeric: tabular-nums;
+      white-space: nowrap;
+    }
+
+    .mono {
+      font-family: var(--mono);
+      font-variant-numeric: tabular-nums;
+    }
+
+    .acao {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      width: 100%;
+    }
+
+    .acao input[type="text"] {
+      font-family: var(--mono);
+      text-transform: uppercase;
+      min-width: 96px;
+      flex: 1;
+    }
+
+    /* Cards lists (Lives ativas & Jobs 24h) */
+    .cards {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+    }
+
+    .pill {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      font-size: 0.9375rem;
+      word-break: break-word;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .pill.meta {
+      color: var(--muted);
+      justify-content: flex-start;
+    }
+
+    /* Mobile-first card layout for tables (<= 720px) */
+    .wrap {
+      background: transparent;
+      border: 0;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9375rem;
+    }
+
+    @media (max-width: 720px) {
+      thead {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        overflow: hidden;
+        clip: rect(0, 0, 0, 0);
+        white-space: nowrap;
+      }
+
+      table, tbody {
+        display: block;
+        width: 100%;
+      }
+
+      tbody tr {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 10px 12px;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+        padding: 14px;
+        margin-bottom: 12px;
+      }
+
+      tbody tr:last-child {
+        margin-bottom: 0;
+      }
+
+      tbody tr.tr-vazia {
+        display: block;
+        text-align: center;
+        padding: 18px 14px;
+      }
+
+      tbody td {
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+        padding: 0;
+        border: 0;
+        white-space: normal;
+        word-break: break-word;
+        min-width: 0;
+      }
+
+      tbody td[data-label]::before {
+        content: attr(data-label);
+        font-size: 0.72rem;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        color: var(--muted);
+      }
+
+      /* PC card header: name + online badge */
+      #pcs td.td-nome {
+        grid-column: 1 / 2;
+        font-size: 1.0625rem;
+        font-weight: 700;
+        justify-content: center;
+      }
+      #pcs td.td-nome::before { display: none; }
+
+      #pcs td.td-status {
+        grid-column: 2 / 3;
+        align-items: flex-end;
+        justify-content: center;
+      }
+      #pcs td.td-status::before { display: none; }
+
+      #pcs td.td-full,
+      #pcs td.td-acao {
+        grid-column: 1 / -1;
+      }
+
+      #pcs td.td-acao {
+        margin-top: 4px;
+        padding-top: 12px;
+        border-top: 1px solid var(--border);
+      }
+      #pcs td.td-acao::before { display: none; }
+
+      #pcs .acao {
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      /* Alvo card header: entrada + plataforma */
+      #alvos td.td-alvo {
+        grid-column: 1 / -1;
+        font-weight: 700;
+        font-size: 1rem;
+      }
+
+      #alvos td.td-acao {
+        grid-column: 1 / -1;
+        margin-top: 4px;
+        padding-top: 10px;
+        border-top: 1px solid var(--border);
+      }
+      #alvos td.td-acao::before { display: none; }
+      #alvos td.td-acao button { width: 100%; }
+    }
+
+    /* Tablet & Desktop enhancements (>= 721px) */
+    @media (min-width: 721px) {
+      .app {
+        padding: 20px 24px 40px;
+      }
+
+      .topbar {
+        margin: -20px -24px 20px;
+        padding: 12px 24px;
+      }
+
+      h1 { font-size: 1.25rem; }
+
+      .kpis {
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+      }
+
+      .alvo-form {
+        grid-template-columns: minmax(220px, 2fr) minmax(140px, 1fr) auto;
+        align-items: center;
+      }
+
+      .wrap {
+        overflow-x: auto;
+        background: var(--surface);
+        border: 1px solid var(--border);
+        border-radius: var(--radius);
+      }
+
+      table {
+        font-size: 0.875rem;
+      }
+
+      th, td {
+        padding: 11px 12px;
+        text-align: left;
+        border-bottom: 1px solid var(--border);
+        vertical-align: middle;
+      }
+
+      th {
+        color: var(--muted);
+        font-weight: 600;
+        font-size: 0.75rem;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        background: rgba(24, 34, 53, 0.55);
+        white-space: nowrap;
+      }
+
+      tbody tr:hover {
+        background: rgba(255, 255, 255, 0.02);
+      }
+
+      tr:last-child td { border-bottom: 0; }
+
+      td.td-nome { font-weight: 600; white-space: nowrap; }
+      td.td-alvo { max-width: 300px; word-break: break-word; font-weight: 500; }
+
+      .acao input[type="text"] {
+        width: 104px;
+        flex: 0 0 auto;
+      }
+
+      .cards {
+        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+        gap: 10px;
+      }
+    }
   </style>
 </head>
 <body>
-  <header>
-    <h1>Clipes Lives</h1>
-    <div class="header-dir">
-      <div id="atualizado" class="meta">Carregando...</div>
+  <div class="app">
+    <header class="topbar">
+      <div class="brand">
+        <span id="status-dot" class="brand-mark" aria-hidden="true"></span>
+        <h1>Clipes Lives</h1>
+      </div>
+      <div class="header-dir">
+        <div id="atualizado" class="meta">Carregando...</div>
+        <button id="refresh-btn" class="btn-ghost" type="button" aria-label="Atualizar agora">Atualizar</button>
+      </div>
+    </header>
+
+    <div id="feedback" class="msg" role="status" aria-live="polite"></div>
+
+    <section class="kpis" aria-label="Resumo geral">
+      <div class="kpi">
+        <span class="kpi-label">PCs online</span>
+        <span id="kpi-pcs" class="kpi-val">-</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Lives ativas</span>
+        <span id="kpi-lives" class="kpi-val">-</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Alvos ativos</span>
+        <span id="kpi-alvos" class="kpi-val">-</span>
+      </div>
+      <div class="kpi">
+        <span class="kpi-label">Jobs (24 h)</span>
+        <span id="kpi-jobs" class="kpi-val">-</span>
+      </div>
+    </section>
+
+    <div class="sec-head">
+      <h2>PCs e workers</h2>
+      <span id="pcs-count" class="sec-sub"></span>
     </div>
-  </header>
+    <div class="wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>PC</th>
+            <th>Status</th>
+            <th>CPU</th>
+            <th>RAM</th>
+            <th>Disco</th>
+            <th>Temp</th>
+            <th>GPU</th>
+            <th>Job atual</th>
+            <th>Slots</th>
+            <th>Fila</th>
+            <th>max_lives</th>
+            <th>Acao</th>
+          </tr>
+        </thead>
+        <tbody id="pcs"></tbody>
+      </table>
+    </div>
 
-  <div id="feedback" class="msg" role="status"></div>
+    <div class="sec-head">
+      <h2>Lives ativas</h2>
+      <span id="lives-count" class="sec-sub"></span>
+    </div>
+    <div id="lives" class="cards"></div>
 
-  <div class="wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>PC</th>
-          <th>Status</th>
-          <th>CPU</th>
-          <th>RAM</th>
-          <th>Disco</th>
-          <th>Temp</th>
-          <th>GPU</th>
-          <th>Job atual</th>
-          <th>Slots</th>
-          <th>Fila</th>
-          <th>max_lives</th>
-          <th>Acao</th>
-        </tr>
-      </thead>
-      <tbody id="pcs"></tbody>
-    </table>
+    <div class="sec-head">
+      <h2>Alvos ativos</h2>
+      <span id="alvos-count" class="sec-sub"></span>
+    </div>
+    <form id="alvo-form" class="alvo-form">
+      <input id="alvo-entrada" class="alvo-entrada" type="text" placeholder="URL ou login (ex: twitch.tv/canal)" aria-label="Alvo" autocomplete="off" autocapitalize="none" spellcheck="false">
+      <input id="alvo-pc" type="text" placeholder="PC fixo (opcional)" aria-label="PC fixo (opcional)" autocomplete="off">
+      <button type="submit" id="alvo-btn" class="btn-primary">adicionar alvo</button>
+    </form>
+    <div class="wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Alvo</th>
+            <th>Plataforma</th>
+            <th>PC fixo</th>
+            <th>Dono</th>
+            <th>Fase</th>
+            <th>Acao</th>
+          </tr>
+        </thead>
+        <tbody id="alvos"></tbody>
+      </table>
+    </div>
+
+    <div class="sec-head">
+      <h2>Jobs (24 h)</h2>
+    </div>
+    <div id="jobs" class="cards"></div>
   </div>
-
-  <h2>Lives ativas</h2>
-  <div id="lives" class="cards"></div>
-
-  <h2>Alvos ativos</h2>
-  <form id="alvo-form" class="alvo-form">
-    <input id="alvo-entrada" class="alvo-entrada" type="text" placeholder="URL ou login" aria-label="Alvo">
-    <input id="alvo-pc" type="text" placeholder="PC fixo" aria-label="PC fixo (opcional)">
-    <button type="submit" id="alvo-btn">adicionar alvo</button>
-  </form>
-  <div class="wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>Alvo</th>
-          <th>Plataforma</th>
-          <th>PC fixo</th>
-          <th>Dono</th>
-          <th>Fase</th>
-          <th>Acao</th>
-        </tr>
-      </thead>
-      <tbody id="alvos"></tbody>
-    </table>
-  </div>
-
-  <h2>Jobs (24 h)</h2>
-  <div id="jobs" class="cards"></div>
 
   <script>
     (function () {
@@ -190,6 +715,15 @@
       var jobsEl = document.getElementById("jobs");
       var atualizadoEl = document.getElementById("atualizado");
       var feedbackEl = document.getElementById("feedback");
+      var refreshBtn = document.getElementById("refresh-btn");
+      var statusDotEl = document.getElementById("status-dot");
+      var kpiPcsEl = document.getElementById("kpi-pcs");
+      var kpiLivesEl = document.getElementById("kpi-lives");
+      var kpiAlvosEl = document.getElementById("kpi-alvos");
+      var kpiJobsEl = document.getElementById("kpi-jobs");
+      var pcsCountEl = document.getElementById("pcs-count");
+      var livesCountEl = document.getElementById("lives-count");
+      var alvosCountEl = document.getElementById("alvos-count");
       var drafts = Object.create(null);
       var carregando = false;
 
@@ -198,6 +732,12 @@
         if (cls) n.className = cls;
         if (txt !== undefined && txt !== null) n.textContent = String(txt);
         return n;
+      }
+
+      function tdLabel(label, cls, txt) {
+        var td = el("td", cls, txt);
+        if (label) td.setAttribute("data-label", label);
+        return td;
       }
 
       function mostrarMsg(texto, tipo) {
@@ -322,13 +862,21 @@
         });
       });
 
+      refreshBtn.addEventListener("click", function () {
+        atualizar();
+      });
+
       function renderAlvos(alvos, workers) {
         var nomes = Object.create(null);
         (workers || []).forEach(function (w) {
           nomes[w.id] = w.alias || w.id;
         });
+        var totalAlvos = alvos ? alvos.length : 0;
+        kpiAlvosEl.textContent = String(totalAlvos);
+        alvosCountEl.textContent = totalAlvos ? (totalAlvos + " ativo(s)") : "";
+
         if (!alvos || !alvos.length) {
-          var trVazio = el("tr");
+          var trVazio = el("tr", "tr-vazia");
           var tdVazio = el("td", "meta", "Nenhum alvo ativo.");
           tdVazio.colSpan = 6;
           trVazio.appendChild(tdVazio);
@@ -338,13 +886,22 @@
         var rows = alvos.map(function (a) {
           var tr = el("tr");
           var entrada = a.entrada || a._id;
-          tr.appendChild(el("td", null, entrada));
-          tr.appendChild(el("td", null, a.plataforma || "-"));
-          tr.appendChild(el("td", null, a.pc_fixo || "-"));
-          tr.appendChild(el("td", null, a.owner ? (nomes[a.owner] || a.owner) : "sem PC"));
-          tr.appendChild(el("td", null, a.fase || "-"));
-          var tdAcao = el("td");
-          var btn = el("button", null, "remover");
+
+          tr.appendChild(tdLabel("Alvo", "td-alvo", entrada));
+
+          var tdPlat = tdLabel("Plataforma");
+          tdPlat.appendChild(el("span", "plat-badge", a.plataforma || "-"));
+          tr.appendChild(tdPlat);
+
+          tr.appendChild(tdLabel("PC fixo", null, a.pc_fixo || "-"));
+          tr.appendChild(tdLabel("Dono", null, a.owner ? (nomes[a.owner] || a.owner) : "sem PC"));
+
+          var tdFase = tdLabel("Fase");
+          tdFase.appendChild(el("span", "fase-badge", a.fase || "-"));
+          tr.appendChild(tdFase);
+
+          var tdAcao = el("td", "td-acao");
+          var btn = el("button", "btn-outline-danger", "remover");
           btn.type = "button";
           btn.setAttribute("aria-label", "Remover " + entrada);
           btn.addEventListener("click", function () {
@@ -358,9 +915,15 @@
       }
 
       function renderWorkers(workers) {
+        var list = workers || [];
+        var onlineCount = list.filter(function (w) { return Boolean(w.online); }).length;
+        kpiPcsEl.textContent = String(onlineCount) + "/" + String(list.length);
+        kpiPcsEl.className = "kpi-val" + (onlineCount > 0 ? " ok" : "");
+        pcsCountEl.textContent = list.length ? (onlineCount + " online de " + list.length) : "";
+
         var rows = [];
-        if (!workers || !workers.length) {
-          var trVazio = el("tr");
+        if (!list.length) {
+          var trVazio = el("tr", "tr-vazia");
           var tdVazio = el("td", "meta", "Nenhum PC registrado.");
           tdVazio.colSpan = 12;
           trVazio.appendChild(tdVazio);
@@ -368,53 +931,66 @@
           pcsEl.replaceChildren.apply(pcsEl, rows);
           return;
         }
-        workers.forEach(function (w) {
+        list.forEach(function (w) {
           var cap = w.capacity || {};
           var tr = el("tr");
           var label = w.alias || w.id;
 
-          tr.appendChild(el("td", null, label));
+          tr.appendChild(tdLabel("PC", "td-nome", label));
 
-          var tdOn = el("td");
+          var tdOn = tdLabel("Status", "td-status");
           tdOn.appendChild(el("span", "badge " + (w.online ? "on" : "off"), w.online ? "online" : "offline"));
           tr.appendChild(tdOn);
 
-          tr.appendChild(el("td", null, fmtCpu(cap)));
-          tr.appendChild(el("td", null, fmtNum(cap.ram_gb, " GB")));
-          tr.appendChild(el("td", null, fmtNum(cap.disco_livre_gb, " GB")));
+          tr.appendChild(tdLabel("CPU", "mono", fmtCpu(cap)));
+          tr.appendChild(tdLabel("RAM", "mono", fmtNum(cap.ram_gb, " GB")));
+          tr.appendChild(tdLabel("Disco livre", "mono", fmtNum(cap.disco_livre_gb, " GB")));
 
-          var tdTemp = el("td");
+          var tdTemp = tdLabel("Temp", "mono");
           if (cap.temp_c === null || cap.temp_c === undefined) {
             tdTemp.appendChild(el("span", "nd", "n/d"));
           } else {
-            tdTemp.textContent = String(cap.temp_c) + " C";
+            var tempVal = Number(cap.temp_c);
+            var tempCls = tempVal >= 85 ? "temp-hot" : (tempVal >= 75 ? "temp-warn" : "");
+            tdTemp.appendChild(el("span", tempCls, String(cap.temp_c) + " C"));
           }
           tr.appendChild(tdTemp);
 
-          tr.appendChild(el("td", null, fmtGpu(cap.gpu)));
-          tr.appendChild(el("td", null, w.job_atual || "-"));
+          tr.appendChild(tdLabel("GPU", "td-full", fmtGpu(cap.gpu)));
+          tr.appendChild(tdLabel("Job atual", "td-full", w.job_atual || "-"));
 
           var slots = w.slots || {};
           var ocupados = w.ocupados || {};
-          var partesSlots = Object.keys(slots).map(function (p) {
-            return p + " " + (ocupados[p] || 0) + "/" + slots[p];
-          });
-          tr.appendChild(el("td", null, partesSlots.length ? partesSlots.join(", ") : "-"));
+          var tdSlots = tdLabel("Slots", "td-full");
+          var slotKeys = Object.keys(slots);
+          if (slotKeys.length) {
+            var slotWrap = el("div", "slot-list");
+            slotKeys.forEach(function (p) {
+              slotWrap.appendChild(el("span", "slot-chip", p + " " + (ocupados[p] || 0) + "/" + slots[p]));
+            });
+            tdSlots.appendChild(slotWrap);
+          } else {
+            tdSlots.textContent = "-";
+          }
+          tr.appendChild(tdSlots);
 
           var fila = w.fila || {};
           var tamFila = Object.keys(fila).reduce(function (s, k) {
             return s + (Number(fila[k]) || 0);
           }, 0);
-          tr.appendChild(el("td", null, w.fila ? String(tamFila) : "-"));
+          tr.appendChild(tdLabel("Fila", "mono", w.fila ? String(tamFila) : "-"));
 
-          tr.appendChild(el("td", null, fmtNum(w.max_lives)));
+          tr.appendChild(tdLabel("max_lives", "mono", fmtNum(w.max_lives)));
 
-          var tdAcao = el("td");
+          var tdAcao = el("td", "td-acao");
           var box = el("div", "acao");
           var input = el("input");
           input.type = "text";
           input.placeholder = "LIBERAR";
           input.setAttribute("aria-label", "Digite LIBERAR para " + label);
+          input.setAttribute("autocomplete", "off");
+          input.setAttribute("autocapitalize", "characters");
+          input.setAttribute("spellcheck", "false");
           if (drafts[w.id]) input.value = drafts[w.id];
           input.addEventListener("input", function () {
             drafts[w.id] = input.value;
@@ -439,6 +1015,10 @@
         (workers || []).forEach(function (w) {
           nomes[w.id] = w.alias || w.id;
         });
+        var totalLives = lives ? lives.length : 0;
+        kpiLivesEl.textContent = String(totalLives);
+        livesCountEl.textContent = totalLives ? (totalLives + " em andamento") : "";
+
         if (!lives || !lives.length) {
           livesEl.replaceChildren(el("div", "pill meta", "Nenhuma live ativa."));
           return;
@@ -446,19 +1026,28 @@
         var items = lives.map(function (l) {
           var dono = nomes[l.owner] || l.owner || "-";
           var canal = l.channel || l.id;
-          return el("div", "pill", canal + " (" + dono + ")");
+          var card = el("div", "pill");
+          card.appendChild(el("span", null, canal));
+          card.appendChild(el("span", "plat-badge", dono));
+          return card;
         });
         livesEl.replaceChildren.apply(livesEl, items);
       }
 
       function renderJobs(jobs) {
         var keys = jobs ? Object.keys(jobs) : [];
+        var totalJobs = keys.reduce(function (acc, k) { return acc + (Number(jobs[k]) || 0); }, 0);
+        kpiJobsEl.textContent = String(totalJobs);
+
         if (!keys.length) {
           jobsEl.replaceChildren(el("div", "pill meta", "Sem jobs nas ultimas 24 h."));
           return;
         }
         var items = keys.sort().map(function (k) {
-          return el("div", "pill", k + ": " + String(jobs[k]));
+          var card = el("div", "pill");
+          card.appendChild(el("span", "meta", k));
+          card.appendChild(el("strong", "mono", String(jobs[k])));
+          return card;
         });
         jobsEl.replaceChildren.apply(jobsEl, items);
       }
@@ -466,6 +1055,7 @@
       function atualizar() {
         if (carregando) return;
         carregando = true;
+        refreshBtn.disabled = true;
         fetch("/api/status", {
           credentials: "same-origin"
         })
@@ -482,14 +1072,17 @@
             renderLives(dados.lives || [], dados.workers || []);
             renderAlvos(dados.alvos || [], dados.workers || []);
             renderJobs(dados.jobs_24h || {});
+            statusDotEl.className = "brand-mark";
             atualizadoEl.textContent = "Atualizado: " + new Date().toLocaleTimeString();
           })
           .catch(function (err) {
+            statusDotEl.className = "brand-mark erro";
             atualizadoEl.textContent = "Erro ao atualizar";
             mostrarMsg("Falha ao consultar /api/status: " + (err && err.message ? err.message : "erro"), "erro");
           })
           .finally(function () {
             carregando = false;
+            refreshBtn.disabled = false;
           });
       }
 
