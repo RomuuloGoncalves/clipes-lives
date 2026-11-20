@@ -727,16 +727,13 @@ def notify_discord(
                     attach_path: Path | None = None
                     too_large_path: Path | None = None
                     if mp4_path is not None and mp4_path.is_file():
-                        if master_mode == "discord" and not clip_fits_discord:
+                        preview_impl = preview_fn
+                        if preview_impl is None:
+                            from .previa import preview_for_discord as preview_impl
+                        duration = float(clip.get("rendered_duration") or clip.get("duration") or 60.0)
+                        attach_path = preview_impl(mp4_path, duration, out_path / ".cache")
+                        if attach_path is None:
                             too_large_path = mp4_path
-                        else:
-                            preview_impl = preview_fn
-                            if preview_impl is None:
-                                from .previa import preview_for_discord as preview_impl
-                            duration = float(clip.get("rendered_duration") or clip.get("duration") or 60.0)
-                            attach_path = preview_impl(mp4_path, duration, out_path / ".cache")
-                            if attach_path is None:
-                                too_large_path = mp4_path
 
                     post_kw: dict[str, Any] = (
                         {"components": _approve_components(clip_id)} if supports_components else {}
@@ -775,6 +772,15 @@ def notify_discord(
                         fallback_text = _format_clip_discord_message(clip, clip_id, policy_status, too_large_path=mp4_path)
                         msg_resp = client.post(thread_id, fallback_text, file=None, **post_kw)
                         attach_path = None
+
+                    if mp4_path is not None and mp4_path.is_file() and attach_path is None:
+                        from .previa import _resolve_limit_mb
+
+                        post_aviso(
+                            f"prévia não coube no Discord: {clip_id} "
+                            f"({mp4_path.stat().st_size / (1024 * 1024):.1f} MB, limite {_resolve_limit_mb(None):g} MB)",
+                            discord_client=client,
+                        )
 
                     msg_id = str(msg_resp["id"])  # type: ignore[index]
                     posted_now += 1

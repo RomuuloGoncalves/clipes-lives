@@ -274,6 +274,7 @@ def test_notify_sem_env_discord_registra_local(tmp_path, monkeypatch):
 
 
 def test_notify_ack_ok_divergencias_verificar_0_e_retry_e_liberar(tmp_path, monkeypatch):
+    monkeypatch.setattr("clipes.notificar.post_aviso", lambda *a, **k: None)  # aviso vai ao mesmo fake client
     import hashlib
     from clipes.discord_rest import DiscordRestError
     from clipes.publicacao import LocalStore
@@ -489,6 +490,7 @@ def test_notify_ack_ok_divergencias_verificar_0_e_retry_e_liberar(tmp_path, monk
 
 
 def test_notify_envia_botoes_publicar_com_custom_id_no_post_e_fallback_413(tmp_path, monkeypatch):
+    monkeypatch.setattr("clipes.notificar.post_aviso", lambda *a, **k: None)  # aviso vai ao mesmo fake client
     from clipes.discord_rest import DiscordRestError
 
     monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
@@ -713,13 +715,14 @@ def test_notify_fecha_mongoclient_criado_internamente(tmp_path, monkeypatch):
 
 
 def test_notify_cabe_discord_false_nao_refaz_upload_e_oserror_faz_fallback(tmp_path, monkeypatch):
+    monkeypatch.setattr("clipes.notificar.post_aviso", lambda *a, **k: None)  # aviso vai ao mesmo fake client
     from clipes.discord_rest import DiscordRest
 
     monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
     monkeypatch.setenv("CLIPES_MASTER_MODE", "discord")
 
-    # 1. Pre-existing cabe_discord=False skips preview_fn and upload, posts text-only, saves message_id
+    # 1. cabe_discord=False ainda tenta a prévia; prévia None -> texto sem anexo, saves message_id
     out_false = _make_out_dir(
         tmp_path / "prefalse",
         [{"index": 1, "clip_id": "cf_c01", "file": "c1.mp4", "title": "Big", "cabe_discord": False, "duration": 20.0}],
@@ -729,7 +732,7 @@ def test_notify_cabe_discord_false_nao_refaz_upload_e_oserror_faz_fallback(tmp_p
     def fail_if_preview(src, dur, cache):
         nonlocal preview_calls
         preview_calls += 1
-        return src
+        return None
 
     client_cf = FakeDiscordClient()
     notify_discord(
@@ -739,7 +742,7 @@ def test_notify_cabe_discord_false_nao_refaz_upload_e_oserror_faz_fallback(tmp_p
         preview_fn=fail_if_preview,
         out_root=tmp_path / "prefalse",
     )
-    assert preview_calls == 0
+    assert preview_calls == 1
     assert len(client_cf.posts) == 2
     assert client_cf.posts[-1]["file"] is None
     assert "arquivo grande demais para o Discord" in client_cf.posts[-1]["content"]
@@ -1006,3 +1009,58 @@ def test_post_aviso_usa_discord_log_channel_id_com_fallback(monkeypatch):
     monkeypatch.setenv("DISCORD_LOG_CHANNEL_ID", "   ")
     post_aviso("aviso fallback", discord_client=client)
     assert client.posts[-1]["channel_id"] == FAKE_CHANNEL
+
+
+def _clip_grande(tmp_path):
+    return _make_out_dir(
+        tmp_path,
+        [{"index": 1, "clip_id": "big_c01", "file": "c1.mp4", "title": "Big", "score": 0.9,
+          "duration": 20.0, "cabe_discord": False}],
+    )
+
+
+def test_modo_discord_cabe_false_ainda_chama_preview_fn(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    monkeypatch.setenv("CLIPES_MASTER_MODE", "discord")
+    chamadas = []
+    client = FakeDiscordClient()
+    notify_discord(
+        _clip_grande(tmp_path), policy=ChannelPolicy(), discord_client=client,
+        preview_fn=lambda s, d, c: chamadas.append(s) or s, out_root=tmp_path / "run",
+    )
+    assert len(chamadas) == 1
+    assert client.posts[-1]["file"] is not None
+
+
+def test_preview_none_posta_aviso_com_clip_id(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    avisos = []
+    monkeypatch.setattr("clipes.notificar.post_aviso", lambda t, **k: avisos.append(t))
+    notify_discord(
+        _clip_grande(tmp_path), policy=ChannelPolicy(), discord_client=FakeDiscordClient(),
+        preview_fn=lambda s, d, c: None, out_root=tmp_path / "run",
+    )
+    assert len(avisos) == 1
+    assert "prévia não coube no Discord: big_c01" in avisos[0]
+    assert "limite" in avisos[0]
+
+
+def test_anexo_recusado_posta_aviso(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    avisos = []
+    monkeypatch.setattr("clipes.notificar.post_aviso", lambda t, **k: avisos.append(t))
+
+    class Recusa(FakeDiscordClient):
+        def post(self, channel_id, content, file=None, components=None):
+            if file is not None:
+                return {"id": "x", "attachments": []}
+            return super().post(channel_id, content, file, components)
+
+    notify_discord(
+        _clip_grande(tmp_path), policy=ChannelPolicy(), discord_client=Recusa(),
+        preview_fn=lambda s, d, c: s, out_root=tmp_path / "run",
+    )
+    assert len(avisos) == 1 and "big_c01" in avisos[0]
