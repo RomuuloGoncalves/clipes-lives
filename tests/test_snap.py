@@ -3,9 +3,9 @@
 import numpy as np
 
 from clipes.eval import cuts_mid_word, evaluate_clips
-from clipes.models import CandidatePeak, Word
+from clipes.models import CandidatePeak, SnappedClip, Word
 from clipes.signals import FPS_RMS
-from clipes.snap import select_clips, snap_candidate, snap_topic_parts
+from clipes.snap import cortar_silencio_inicial, select_clips, snap_candidate, snap_topic_parts
 
 
 def _make_speech_timeline(
@@ -298,3 +298,37 @@ def test_select_clips_peak_candidate_emits_only_part_containing_peak():
     assert len(chosen_quota) == 3
     assert [c.part_index for c in chosen_quota] == [1, 2, 3]
     assert all(c.part_total == 3 for c in chosen_quota)
+
+
+def _clip_para_silencio(start: float, end: float) -> SnappedClip:
+    return SnappedClip(peak=(start + end) / 2, start=start, end=end, score=1.0)
+
+
+def test_cortar_silencio_inicial_palavra_atrasada_avanca_start():
+    clip = _clip_para_silencio(100.0, 160.0)
+    words = [Word(start=103.0, end=103.4, text=" oi")]
+    cortar_silencio_inicial(clip, words, max_atraso=1.0, min_dur=25.0, lead=0.2)
+    assert abs(clip.start - 102.8) < 1e-9
+    assert clip.end == 160.0
+
+
+def test_cortar_silencio_inicial_atraso_pequeno_nao_muda():
+    clip = _clip_para_silencio(100.0, 160.0)
+    words = [Word(start=100.5, end=100.9, text=" oi")]
+    cortar_silencio_inicial(clip, words, max_atraso=1.0, min_dur=25.0, lead=0.2)
+    assert clip.start == 100.0
+
+
+def test_cortar_silencio_inicial_resultado_menor_que_min_nao_muda():
+    clip = _clip_para_silencio(100.0, 130.0)
+    words = [Word(start=118.0, end=118.4, text=" oi")]
+    cortar_silencio_inicial(clip, words, max_atraso=1.0, min_dur=25.0, lead=0.2)
+    assert clip.start == 100.0
+    assert clip.end == 130.0
+
+
+def test_cortar_silencio_inicial_sem_palavras_nao_muda():
+    clip = _clip_para_silencio(100.0, 160.0)
+    words = [Word(start=200.0, end=200.4, text=" fora")]
+    cortar_silencio_inicial(clip, words, max_atraso=1.0, min_dur=25.0, lead=0.2)
+    assert clip.start == 100.0

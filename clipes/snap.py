@@ -578,3 +578,28 @@ def select_clips(
             continue
         chosen.extend(parts)
     return chosen
+
+
+def cortar_silencio_inicial(
+    clip: SnappedClip,
+    words: list[Word],
+    max_atraso: float,
+    min_dur: float,
+    lead: float = 0.2,
+) -> SnappedClip:
+    """Move clip.start to just before the first spoken word when it starts too late.
+
+    Only moves forward; keeps clip unchanged when there is no word in the clip,
+    when the first word is within max_atraso, or when the result would be shorter than min_dur.
+    """
+    no_trecho = [w for w in words if clip.start <= w.start < clip.end]
+    if not no_trecho:
+        return clip
+    primeira = min(no_trecho, key=lambda w: w.start)
+    if primeira.start <= clip.start + max_atraso:
+        return clip
+    novo_start = primeira.start - lead
+    if novo_start <= clip.start or clip.end - novo_start < min_dur:
+        return clip
+    clip.start = novo_start
+    return clip
