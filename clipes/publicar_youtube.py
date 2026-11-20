@@ -38,8 +38,10 @@ def _resolve_token(token: str | Callable[[], str]) -> str:
     return str(token() if callable(token) else token)
 
 
-def _resolve_privacy() -> str:
-    raw = os.environ.get("CLIPES_YT_PRIVACY", "").strip().lower()
+def _resolve_privacy(explicit: str | None = None) -> str:
+    raw = (explicit or "").strip().lower()
+    if raw not in _VALID_PRIVACY:
+        raw = os.environ.get("CLIPES_YT_PRIVACY", "").strip().lower()
     return raw if raw in _VALID_PRIVACY else PRIVACY_STATUS
 
 
@@ -158,8 +160,9 @@ def publish(
     probe_duration_fn: Callable[[Path], float] | None = None,
     sleep: Callable[[float], None] = time.sleep,
     rand: Callable[[], float] = random.random,
+    privacy: str | None = None,
 ) -> dict[str, Any]:
-    """Upload an MP4 clip as a private YouTube Short using resumable upload."""
+    """Upload an MP4 clip as a YouTube Short (resumable). `privacy` (válido) vence o env; None = env."""
     mp4_path = Path(mp4)
     duration_fn = probe_duration_fn or probe_duration
     duration = duration_fn(mp4_path)
@@ -170,7 +173,7 @@ def publish(
     total_size = len(mp4_bytes)
     access_token = _resolve_token(token)
     refreshed = False
-    privacy_status = _resolve_privacy()
+    privacy_status = _resolve_privacy(privacy)
 
     metadata = {
         "snippet": {

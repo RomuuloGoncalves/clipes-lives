@@ -47,8 +47,10 @@ def _resolve_token(token: str | Callable[[], str]) -> str:
     return str(token() if callable(token) else token)
 
 
-def _resolve_privacy(privacy_opts: list[str]) -> str | None:
-    raw = os.environ.get("CLIPES_TIKTOK_PRIVACY", "").strip().upper()
+def _resolve_privacy(privacy_opts: list[str], explicit: str | None = None) -> str | None:
+    raw = (explicit or "").strip().upper()
+    if raw not in _VALID_PRIVACY:
+        raw = os.environ.get("CLIPES_TIKTOK_PRIVACY", "").strip().upper()
     requested = raw if raw in _VALID_PRIVACY else PRIVACY_LEVEL
     if requested in privacy_opts:
         return requested
@@ -108,8 +110,9 @@ def publish(
     *,
     refresh: Callable[[], str] | None = None,
     rand: Callable[[], float] = random.random,
+    privacy: str | None = None,
 ) -> dict[str, Any]:
-    """Upload and direct-post an MP4 clip as private (SELF_ONLY) on TikTok."""
+    """Upload and direct-post an MP4 clip on TikTok. `privacy` (válido) vence o env; None = env."""
     mp4_path = Path(mp4)
     mp4_bytes = mp4_path.read_bytes()
     file_size = len(mp4_bytes)
@@ -186,7 +189,7 @@ def publish(
     if err is not None:
         return err
     privacy_opts = (info_resp or {}).get("data", {}).get("privacy_level_options", [])
-    privacy_level = _resolve_privacy(privacy_opts)
+    privacy_level = _resolve_privacy(privacy_opts, privacy)
     if privacy_level is None:
         return _account_error()
 

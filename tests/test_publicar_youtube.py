@@ -318,3 +318,40 @@ def test_publish_youtube_privacy_env_and_invalid_fallback(tmp_path: Path, monkey
     res_inv = publish(mp4, "Gancho forte", "Desc", "tok", fake_urlopen, probe_duration_fn=lambda _: 25.0)
     assert res_inv["privacidade"] == "private"
     assert captured_json[2]["status"]["privacyStatus"] == "private"
+
+
+def test_publish_youtube_privacy_param_none_uses_env_explicit_wins_and_reports(tmp_path: Path, monkeypatch):
+    mp4 = tmp_path / "clip.mp4"
+    mp4.write_bytes(b"MP4DATA")
+    captured_json: list[dict[str, Any]] = []
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float = 30) -> FakeResponse:
+        if req.get_method() == "POST":
+            captured_json.append(json.loads(req.data.decode("utf-8")))
+            return FakeResponse(200, headers={"Location": "https://upload.example/u-param"})
+        return FakeResponse(200, body={"id": "yt_param"})
+
+    def _run(privacy: str | None) -> dict[str, Any]:
+        return publish(mp4, "Gancho forte", "Desc", "tok", fake_urlopen, probe_duration_fn=lambda _: 25.0, privacy=privacy)
+
+    # None -> segue o env
+    monkeypatch.setenv("CLIPES_YT_PRIVACY", "public")
+    res_none = _run(None)
+    assert res_none["privacidade"] == "public"
+    assert captured_json[-1]["status"]["privacyStatus"] == "public"
+
+    # Explícito válido vence o env
+    res_exp = _run("unlisted")
+    assert res_exp["privacidade"] == "unlisted"
+    assert captured_json[-1]["status"]["privacyStatus"] == "unlisted"
+
+    # Explícito inválido é ignorado -> segue o env
+    res_bad = _run("bogus")
+    assert res_bad["privacidade"] == "public"
+    assert captured_json[-1]["status"]["privacyStatus"] == "public"
+
+    # Sem env e sem explícito -> private
+    monkeypatch.delenv("CLIPES_YT_PRIVACY")
+    res_def = _run(None)
+    assert res_def["privacidade"] == "private"
+    assert captured_json[-1]["status"]["privacyStatus"] == "private"

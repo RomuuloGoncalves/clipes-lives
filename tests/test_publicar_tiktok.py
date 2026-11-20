@@ -286,3 +286,53 @@ def test_publish_tiktok_privacy_env_and_fallback_to_self_only(tmp_path: Path, mo
     assert res_inv["status"] == "ok"
     assert res_inv["privacidade"] == "SELF_ONLY"
     assert lvls_inv == ["SELF_ONLY"]
+
+
+def test_publish_tiktok_privacy_param_none_uses_env_explicit_wins_and_reports(tmp_path: Path, monkeypatch):
+    mp4 = tmp_path / "clip.mp4"
+    mp4.write_bytes(b"MP4")
+    upload_url = "https://open-upload.tiktokapis.com/upload/param"
+
+    def _run(opts: list[str], privacy: str | None):
+        init_levels: list[str] = []
+
+        def fake_urlopen(req: urllib.request.Request, timeout: float = 30) -> FakeResponse:
+            if req.full_url.endswith("/creator_info/query/"):
+                return FakeResponse(200, {"data": {"privacy_level_options": opts}, "error": {"code": "ok"}})
+            if req.full_url.endswith("/video/init/"):
+                init_levels.append(json.loads(req.data.decode("utf-8"))["post_info"]["privacy_level"])
+                return FakeResponse(200, {"data": {"publish_id": "v_p", "upload_url": upload_url}, "error": {"code": "ok"}})
+            if req.full_url == upload_url:
+                return FakeResponse(200)
+            return FakeResponse(200, {"data": {"status": "PUBLISH_COMPLETE"}, "error": {"code": "ok"}})
+
+        res = publish(mp4, "Legenda", "tok", fake_urlopen, lambda _: None, privacy=privacy)
+        return res, init_levels
+
+    both = ["SELF_ONLY", "PUBLIC_TO_EVERYONE"]
+
+    # None -> comportamento atual: segue o env
+    monkeypatch.setenv("CLIPES_TIKTOK_PRIVACY", "PUBLIC_TO_EVERYONE")
+    res_none, lvls_none = _run(both, None)
+    assert res_none["status"] == "ok"
+    assert res_none["privacidade"] == "PUBLIC_TO_EVERYONE"
+    assert lvls_none == ["PUBLIC_TO_EVERYONE"]
+
+    # Explícito válido vence o env
+    monkeypatch.setenv("CLIPES_TIKTOK_PRIVACY", "SELF_ONLY")
+    res_exp, lvls_exp = _run(both, "PUBLIC_TO_EVERYONE")
+    assert res_exp["status"] == "ok"
+    assert res_exp["privacidade"] == "PUBLIC_TO_EVERYONE"
+    assert lvls_exp == ["PUBLIC_TO_EVERYONE"]
+
+    # Explícito inválido é ignorado -> segue o env
+    monkeypatch.setenv("CLIPES_TIKTOK_PRIVACY", "PUBLIC_TO_EVERYONE")
+    res_bad, lvls_bad = _run(both, "NAO_EXISTE")
+    assert res_bad["privacidade"] == "PUBLIC_TO_EVERYONE"
+    assert lvls_bad == ["PUBLIC_TO_EVERYONE"]
+
+    # Explícito pedido sem opção pública no creator_info -> cai em SELF_ONLY e reporta
+    res_sem, lvls_sem = _run(["SELF_ONLY"], "PUBLIC_TO_EVERYONE")
+    assert res_sem["status"] == "ok"
+    assert res_sem["privacidade"] == "SELF_ONLY"
+    assert lvls_sem == ["SELF_ONLY"]
