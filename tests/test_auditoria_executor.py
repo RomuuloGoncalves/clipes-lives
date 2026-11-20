@@ -767,8 +767,8 @@ def test_m16_fechar_janela_grava_max_dur_e_min_dur_no_job_json(tmp_path, monkeyp
     pool.first["alanzoka"] = B - 300
     sess_def.fechar_janela(float(B + 300), last=False)
     job_def = monitor._read_job(queue.root / "pending" / f"alanzoka_{B + 300}")
-    assert job_def["max_dur"] == 60.0
-    assert "min_dur" not in job_def
+    assert job_def["max_dur"] == 45.0
+    assert job_def["min_dur"] == 15.0
 
 
 def test_m16_run_local_pipeline_repassa_max_dur_e_min_dur_e_respeita_job_antigo(tmp_path, monkeypatch):
@@ -804,15 +804,15 @@ def test_m16_run_local_pipeline_repassa_max_dur_e_min_dur_e_respeita_job_antigo(
     (j2 / "job.json").write_text(json.dumps({"job_id": "job_max_only", "max_dur": 60.0}), encoding="utf-8")
     monitor.run_local_pipeline(j2, out_root)
     assert seen_args[-1].max_dur == 60.0
-    assert seen_args[-1].min_dur == 25.0  # padrao do CLI
+    assert seen_args[-1].min_dur == 15.0  # padrao do CLI (CLIPES_DUR_MIN)
 
     # 3) Job antigo sem os campos -> comportamento atual (padrao do CLI: 65 / 25)
     j3 = tmp_path / "job_legacy"
     j3.mkdir()
     (j3 / "job.json").write_text(json.dumps({"job_id": "job_legacy", "channel": "gaules"}), encoding="utf-8")
     monitor.run_local_pipeline(j3, out_root)
-    assert seen_args[-1].max_dur == 65.0
-    assert seen_args[-1].min_dur == 25.0
+    assert seen_args[-1].max_dur == 45.0
+    assert seen_args[-1].min_dur == 15.0
 
 
 def test_m16_acompanhar_main_repassa_max_dur_e_min_dur_ao_supervisor(tmp_path, monkeypatch):

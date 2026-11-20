@@ -241,7 +241,7 @@ def test_cli_skip_render_writes_part_metadata_in_manifest_and_readme(tmp_path: P
             words.append(Word(s + j * 1.5, s + j * 1.5 + 1.2, (" " + tok) if j else tok))
     monkeypatch.setattr(cli, "transcribe_candidates", lambda **kwargs: (words, "pt"))
 
-    rc = cli.main(["https://www.youtube.com/watch?v=vod_parts", "--out-dir", str(out_root), "--skip-render"])
+    rc = cli.main(["https://www.youtube.com/watch?v=vod_parts", "--out-dir", str(out_root), "--skip-render", "--max-dur", "65"])
     assert rc == 0
     manifest = json.loads((vid_dir / "clips.json").read_text(encoding="utf-8"))
     assert "topics_s" in manifest["timings"]

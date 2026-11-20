@@ -58,7 +58,8 @@ def test_real_llama_server_enrich_clips_smoke(tmp_path: Path, monkeypatch: pytes
     assert clip.llm_score is not None
     assert 0.0 <= clip.llm_score <= 10.0
     assert len(clip.caption.splitlines()) == 3
-    assert "Crédito: gaules · Live completa: https://www.twitch.tv/gaules" in clip.caption.splitlines()[1]
+    assert "Crédito: gaules" in clip.caption.splitlines()[1]
+    assert "http" not in clip.caption  # T11: caption sem URL
     assert 3 <= len(clip.hashtags) <= 5
     for tag in clip.hashtags:
         assert tag.lower() not in FORBIDDEN_HASHTAGS

@@ -532,5 +532,5 @@ def test_run_local_pipeline_usa_min_per_hour_zero_e_mantem_duracoes(tmp_path, mo
     j2.mkdir()
     monitor.run_local_pipeline(j2, out_root)
     assert seen_args[-1].min_per_hour == 0.0
-    assert seen_args[-1].max_dur == 65.0
-    assert seen_args[-1].min_dur == 25.0
+    assert seen_args[-1].max_dur == 45.0
+    assert seen_args[-1].min_dur == 15.0
