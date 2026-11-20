@@ -6,6 +6,7 @@ import inspect
 import json
 import os
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
@@ -178,11 +179,14 @@ def _is_attachment_error(exc: BaseException) -> bool:
     return isinstance(getattr(exc, "__cause__", None), OSError)
 
 
+_threads_vivas: set[str] = set()  # threads confirmadas neste processo (evita 1 GET por ciclo)
+
+
 def _is_404_error(exc: BaseException) -> bool:
-    if getattr(exc, "status", None) == 404 or getattr(exc, "code", None) == 10008:
+    if getattr(exc, "status", None) == 404 or getattr(exc, "code", None) in (10003, 10008):
         return True
     text = str(exc)
-    return "HTTP 404" in text or "code=10008" in text
+    return "HTTP 404" in text or "code=10008" in text or "code=10003" in text
 
 
 def _format_live_header(
@@ -577,8 +581,10 @@ def notify_discord(
         needs_work = False
         for idx, clip in enumerate(clips, start=1):
             cid = str(clip.get("clip_id") or f"{video_id}_c{int(clip.get('index', idx)):02d}")
-            has_msg = isinstance(clip.get("discord"), dict) and bool(clip["discord"].get("message_id"))
-            if not has_msg or _needs_ack_retry(clip, cid):
+            d_clip = clip.get("discord")
+            has_msg = isinstance(d_clip, dict) and bool(d_clip.get("message_id"))
+            # ponytail: thread ainda nao confirmada neste processo segue ao loop, que a sonda 1x (pode ter sido apagada)
+            if not has_msg or _needs_ack_retry(clip, cid) or d_clip.get("thread_id") not in _threads_vivas:
                 needs_work = True
                 break
 
@@ -667,49 +673,79 @@ def notify_discord(
                         flush=True,
                     )
 
+        def _new_thread() -> None:
+            nonlocal thread_id, header_msg_id, live_discord, created_live_header
+            if live_id:
+                header = _format_live_header(channel_name, live_title, len(clips), live_url, encerrada=live_ended)
+                thread_name = _format_live_thread_name(channel_name, live_title, created_at)
+            else:
+                header_title = f"**{channel_name}** — {live_title}" if channel_name else f"**{live_title}**"
+                header = f"{header_title}\nClipes: {len(clips)}"
+                if live_url:
+                    header += f"\n{live_url}"
+                thread_name = f"{channel_name} · {live_title[:70]}" if channel_name else live_title[:70]
+            header_resp = client.post(target_channel, header[:2000])
+            header_msg_id = str(header_resp["id"])
+            thread_id = str(client.thread_from(target_channel, header_msg_id, thread_name, auto_archive_duration=1440))
+
+            if live_id:
+                created_live_header = True
+                live_discord = {
+                    "thread_id": thread_id,
+                    "header_message_id": header_msg_id,
+                    "header_channel_id": target_channel,
+                    "channel_id": target_channel,
+                    "clipes": len(clips),
+                    "channel": channel_name,
+                    "title": live_title,
+                    "url": live_url,
+                }
+                _save_live_discord(live_discord)
+
+            if manifest is not None and clips_json_path is not None:
+                manifest_discord = dict(manifest.get("discord") or {})
+                manifest_discord.update(thread_id=thread_id, header_message_id=header_msg_id)
+                manifest["discord"] = manifest_discord
+                _write_json_atomic(clips_json_path, manifest)
+
+            if job_path is not None:
+                job_discord = dict(completed_job.get("discord") or {})
+                job_discord.update(thread_id=thread_id, header_message_id=header_msg_id)
+                completed_job["discord"] = job_discord
+                _write_job(job_path, completed_job)
+
+        recovered = False  # fallback de thread apagada: no maximo 1 vez por chamada
+
+        def _recover_dead_thread() -> None:
+            nonlocal thread_id, header_msg_id, recovered, reused_live_header
+            recovered = True
+            dead = thread_id
+            gone = [
+                str(c.get("clip_id") or f"{video_id}_c{int(c.get('index', i)):02d}")
+                for i, c in enumerate(clips, start=1)
+                if isinstance(c.get("discord"), dict) and str(c["discord"].get("thread_id") or "") == dead
+            ]
+            for c in clips:
+                if isinstance(c.get("discord"), dict) and str(c["discord"].get("thread_id") or "") == dead:
+                    c.pop("discord")
+            if job_path is not None:
+                job_discord = dict(completed_job.get("discord") or {})
+                job_discord["clips"] = {k: v for k, v in (job_discord.get("clips") or {}).items() if k not in gone}
+                completed_job["discord"] = job_discord
+            thread_id = header_msg_id = None
+            reused_live_header = False
+            _new_thread()
+            print(f"[discord] thread {dead} inexistente; criada nova {thread_id}", flush=True)
+
+        probed: set[str] = set()
         try:
             if not thread_id:
-                if live_id:
-                    header = _format_live_header(channel_name, live_title, len(clips), live_url, encerrada=live_ended)
-                    thread_name = _format_live_thread_name(channel_name, live_title, created_at)
-                else:
-                    header_title = f"**{channel_name}** — {live_title}" if channel_name else f"**{live_title}**"
-                    header = f"{header_title}\nClipes: {len(clips)}"
-                    if live_url:
-                        header += f"\n{live_url}"
-                    thread_name = f"{channel_name} · {live_title[:70]}" if channel_name else live_title[:70]
-                header_resp = client.post(target_channel, header[:2000])
-                header_msg_id = str(header_resp["id"])
-                thread_id = str(client.thread_from(target_channel, header_msg_id, thread_name, auto_archive_duration=1440))
-
-                if live_id:
-                    created_live_header = True
-                    live_discord = {
-                        "thread_id": thread_id,
-                        "header_message_id": header_msg_id,
-                        "header_channel_id": target_channel,
-                        "channel_id": target_channel,
-                        "clipes": len(clips),
-                        "channel": channel_name,
-                        "title": live_title,
-                        "url": live_url,
-                    }
-                    _save_live_discord(live_discord)
-
-                if manifest is not None and clips_json_path is not None:
-                    manifest_discord = dict(manifest.get("discord") or {})
-                    manifest_discord.update(thread_id=thread_id, header_message_id=header_msg_id)
-                    manifest["discord"] = manifest_discord
-                    _write_json_atomic(clips_json_path, manifest)
-
-                if job_path is not None:
-                    job_discord = dict(completed_job.get("discord") or {})
-                    job_discord.update(thread_id=thread_id, header_message_id=header_msg_id)
-                    completed_job["discord"] = job_discord
-                    _write_job(job_path, completed_job)
+                _new_thread()
 
             posted_now = 0
-            for idx, clip in enumerate(clips, start=1):
+            todo = deque(enumerate(clips, start=1))
+            while todo:
+                idx, clip = todo.popleft()
                 try:
                     clip_id = str(clip.get("clip_id") or f"{video_id}_c{int(clip.get('index', idx)):02d}")
                     has_msg = isinstance(clip.get("discord"), dict) and bool(clip["discord"].get("message_id"))
@@ -728,6 +764,22 @@ def notify_discord(
                                 _verify_ack(reg, clip_id, local_size, local_sha, att, client, token)  # type: ignore[arg-type]
                                 if reg.last_mongo_error:  # type: ignore[union-attr]
                                     mongo_unreachable = True
+                        elif (
+                            hasattr(client, "get_message")
+                            and clip["discord"].get("thread_id") not in probed
+                            and clip["discord"].get("thread_id") not in _threads_vivas
+                        ):
+                            # ponytail: 1 GET por thread; confirma que o clipe "ja postado" ainda existe
+                            probed.add(clip["discord"].get("thread_id"))
+                            try:
+                                client.get_message(clip["discord"]["thread_id"], clip["discord"]["message_id"])
+                                _threads_vivas.add(clip["discord"]["thread_id"])
+                            except Exception as pexc:
+                                if _is_404_error(pexc):
+                                    if clip["discord"]["thread_id"] == thread_id and not recovered:
+                                        raise
+                                    clip.pop("discord")
+                                    todo.appendleft((idx, clip))
                         continue
 
                     file_rel = clip.get("file")
@@ -796,6 +848,7 @@ def notify_discord(
                         )
 
                     msg_id = str(msg_resp["id"])  # type: ignore[index]
+                    _threads_vivas.add(str(thread_id))
                     posted_now += 1
                     clip["discord"] = {"thread_id": thread_id, "message_id": msg_id}
                     if manifest is not None and clips_json_path is not None:
@@ -841,6 +894,13 @@ def notify_discord(
                                 flush=True,
                             )
                 except Exception as exc:
+                    if _is_404_error(exc) and not recovered and thread_id:
+                        try:
+                            _recover_dead_thread()
+                            todo.appendleft((idx, clip))
+                            continue
+                        except Exception as rexc:
+                            exc = rexc
                     _record_error(exc)
 
             if live_id and posted_now > 0 and reused_live_header:
@@ -975,6 +1035,9 @@ def encerrar_cartao_live(
                 )
                 return True
             except Exception as exc2:
+                if _is_404_error(exc2):
+                    print("[discord] cartao encerrado inexistente; ignorado", flush=True)
+                    return False
                 print(f"[discord] falha ao recriar cartao encerrado ({_format_safe_err(exc2, token)})", flush=True)
                 return False
         print(f"[discord] falha ao encerrar cartao ({_format_safe_err(exc, token)})", flush=True)

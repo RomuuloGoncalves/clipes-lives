@@ -1160,3 +1160,151 @@ def test_sem_gate_igual_a_hoje(tmp_path, monkeypatch):
     clip_post = client.posts[1]
     assert "Bloqueado" not in clip_post["content"]
     assert clip_post["components"] is not None
+
+
+# --- fallback de thread apagada (404 Unknown Channel/Message) ---
+
+
+class _Dead404(RuntimeError):
+    def __init__(self, code=10003, status=404):
+        super().__init__(f"Discord HTTP {status}: code={code} Unknown Channel")
+        self.status = status
+        self.code = code
+
+
+class _DeadThreadClient(FakeDiscordClient):
+    """Threads em `dead` respondem 404; erro opcional (status) em todos os posts de thread."""
+
+    def __init__(self, dead=("thr-dead",), fail_status=None):
+        super().__init__()
+        self.dead = set(dead)
+        self.fail_status = fail_status
+        self.gets: list[tuple[str, str]] = []
+
+    def post(self, channel_id, content, file=None, components=None):
+        if str(channel_id) in self.dead:
+            raise _Dead404()
+        if self.fail_status and str(channel_id).startswith("thr-"):
+            raise _Dead404(code=0, status=self.fail_status)
+        return super().post(channel_id, content, file=file, components=components)
+
+    def get_message(self, channel_id, message_id):
+        self.gets.append((str(channel_id), str(message_id)))
+        if str(channel_id) in self.dead:
+            raise _Dead404()
+        return {"id": message_id, "attachments": []}
+
+
+def _clip(n, discord=None):
+    c = {"index": n, "clip_id": f"vid1_c0{n}", "file": f"c{n}.mp4", "title": f"Clip {n}", "score": 0.9, "duration": 30.0}
+    if discord:
+        c["discord"] = discord
+    return c
+
+
+def _run(out_dir, client, **kw):
+    notify_discord(out_dir, policy=ChannelPolicy(), discord_client=client, preview_fn=lambda s, d, c: s, **kw)
+
+
+def test_thread_apagada_cria_nova_e_reposta_clipes_ja_marcados(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    old = {"thread_id": "thr-dead", "message_id": "msg-old"}
+    out_dir = _make_out_dir(
+        tmp_path, [_clip(1, old), _clip(2, old)], discord={"thread_id": "thr-dead", "header_message_id": "hdr-old"}
+    )
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    job = {"job_id": "j", "status": "done", "discord": {"thread_id": "thr-dead", "header_message_id": "hdr-old", "clips": {"vid1_c01": "msg-old"}}}
+    (job_dir / "job.json").write_text(json.dumps(job), encoding="utf-8")
+    client = _DeadThreadClient()
+
+    _run(out_dir, client, job_dir=job_dir, job=job)
+
+    assert len(client.threads) == 1  # uma thread nova, nao uma por clipe
+    assert [p["channel_id"] for p in client.posts] == [FAKE_CHANNEL, "thr-1", "thr-1"]
+    man = json.loads((out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert man["discord"]["thread_id"] == "thr-1"
+    assert [c["discord"]["thread_id"] for c in man["clips"]] == ["thr-1", "thr-1"]
+    jd = json.loads((job_dir / "job.json").read_text(encoding="utf-8"))["discord"]
+    assert jd["thread_id"] == "thr-1" and set(jd["clips"]) == {"vid1_c01", "vid1_c02"}
+    log = capsys.readouterr().out
+    assert "[discord] thread thr-dead inexistente; criada nova thr-1" in log
+    assert FAKE_TOKEN not in log
+
+
+def test_post_404_em_clipe_novo_recria_thread_uma_vez(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    out_dir = _make_out_dir(tmp_path, [_clip(1), _clip(2)], discord={"thread_id": "thr-dead", "header_message_id": "h"})
+    client = _DeadThreadClient()
+    _run(out_dir, client)
+    assert len(client.threads) == 1
+    assert [p["channel_id"] for p in client.posts] == [FAKE_CHANNEL, "thr-1", "thr-1"]
+
+
+def test_thread_existente_nao_reposta_clipes_ja_postados(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    ok = {"thread_id": "thr-ok", "message_id": "msg-ok"}
+    out_dir = _make_out_dir(tmp_path, [_clip(1, ok)], discord={"thread_id": "thr-ok", "header_message_id": "h"})
+    client = _DeadThreadClient(dead=())
+    _run(out_dir, client)
+    assert client.posts == [] and client.threads == []
+
+
+@pytest.mark.parametrize("status", [403, 429, 500])
+def test_outros_erros_nao_disparam_fallback(tmp_path, monkeypatch, status):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    out_dir = _make_out_dir(tmp_path, [_clip(1)], discord={"thread_id": "thr-x", "header_message_id": "h"})
+    client = _DeadThreadClient(dead=(), fail_status=status)
+    _run(out_dir, client)
+    assert client.threads == [] and client.posts == []
+    man = json.loads((out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert man["discord"]["thread_id"] == "thr-x"
+
+
+def test_fallback_com_live_id_persiste_nova_thread_em_lives_discord(tmp_path, monkeypatch):
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+
+    class _Lives:
+        def __init__(self):
+            self.doc = {"_id": "yt:1", "status": "live", "discord": {"thread_id": "thr-dead", "header_message_id": "h", "clipes": 2}}
+
+        def find_one(self, q):
+            return self.doc
+
+        def update_one(self, q, upd, upsert=False):
+            self.doc["discord"] = upd["$set"]["discord"]
+
+    class _Db:
+        lives = _Lives()
+
+    out_dir = _make_out_dir(tmp_path, [_clip(1)])
+    job = {"job_id": "j", "live_id": "yt:1", "channel": "c", "status": "done"}
+    client = _DeadThreadClient()
+    _run(out_dir, client, job=job, mongo_db=_Db())
+    assert len(client.threads) == 1
+    assert _Db.lives.doc["discord"]["thread_id"] == "thr-1"
+
+
+def test_encerrar_cartao_404_e_tolerado(capsys):
+    from clipes.notificar import encerrar_cartao_live
+
+    class _Lives:
+        def find_one(self, q):
+            return {"_id": "l", "discord": {"thread_id": "thr-dead", "header_message_id": "h", "header_channel_id": "c"}}
+
+    class _Db:
+        lives = _Lives()
+
+    class _C(_DeadThreadClient):
+        def edit(self, ch, mid, text):
+            raise _Dead404(code=10008)
+
+    c = _C()
+    assert encerrar_cartao_live(_Db(), "l", discord_client=c) is False
+    assert c.threads == []
+    assert "inexistente" in capsys.readouterr().out
