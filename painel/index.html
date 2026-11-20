@@ -604,6 +604,152 @@
         gap: 10px;
       }
     }
+
+    /* Modal de configuracao por PC */
+    .sec-head-actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .cfg-modal-backdrop {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      background: rgba(5, 8, 15, 0.78);
+      backdrop-filter: blur(4px);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 12px;
+    }
+
+    .cfg-modal-backdrop[hidden] {
+      display: none;
+    }
+
+    .cfg-modal {
+      width: 100%;
+      max-width: 780px;
+      max-height: 90vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .cfg-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px 16px;
+      border-bottom: 1px solid var(--border);
+      background: var(--surface-2);
+    }
+
+    .cfg-modal-head h3 {
+      margin: 0;
+      font-size: 1rem;
+      font-weight: 700;
+    }
+
+    .cfg-alias-row {
+      padding: 12px 16px 0;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+
+    .cfg-tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .cfg-tab {
+      min-height: 36px;
+      padding: 6px 12px;
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      color: var(--muted);
+      font-size: 0.8125rem;
+    }
+
+    .cfg-tab.active {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    .cfg-modal-body {
+      padding: 14px 16px;
+      overflow-y: auto;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+    }
+
+    .cfg-field {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 10px;
+      border-radius: var(--radius-sm);
+      background: var(--bg);
+      border: 1px solid var(--border);
+    }
+
+    .cfg-field.overridden {
+      border-color: var(--accent);
+    }
+
+    .cfg-field label {
+      font-family: var(--mono);
+      font-size: 0.8125rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .cfg-field-desc {
+      font-size: 0.75rem;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    .cfg-field select {
+      min-height: 40px;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-strong);
+      background: var(--surface);
+      color: var(--text);
+      font-size: 0.9375rem;
+      font-family: inherit;
+      width: 100%;
+    }
+
+    .cfg-modal-foot {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 12px 16px;
+      border-top: 1px solid var(--border);
+      background: var(--surface-2);
+    }
+
+    .cfg-modal-foot-right {
+      display: flex;
+      gap: 8px;
+      margin-left: auto;
+    }
   </style>
 </head>
 <body>
@@ -642,7 +788,10 @@
 
     <div class="sec-head">
       <h2>PCs e workers</h2>
-      <span id="pcs-count" class="sec-sub"></span>
+      <div class="sec-head-actions">
+        <span id="pcs-count" class="sec-sub"></span>
+        <button id="novo-pc-btn" class="btn-ghost" type="button">+ Configurar novo PC</button>
+      </div>
     </div>
     <div class="wrap">
       <table>
@@ -703,6 +852,28 @@
     <div id="jobs" class="cards"></div>
   </div>
 
+  <div id="config-modal" class="cfg-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="cfg-modal-title" hidden>
+    <div class="cfg-modal">
+      <div class="cfg-modal-head">
+        <h3 id="cfg-modal-title">Configurar PC</h3>
+        <button id="cfg-close-btn" class="btn-ghost" type="button" aria-label="Fechar configuracao">Fechar</button>
+      </div>
+      <div id="cfg-alias-row" class="cfg-alias-row" hidden>
+        <label for="cfg-alias-input" class="meta">Apelido do PC (CLIPES_PC_ALIAS / CLIPES_ALIAS)</label>
+        <input id="cfg-alias-input" type="text" placeholder="Ex: PC-1" autocomplete="off" spellcheck="false">
+      </div>
+      <div id="cfg-tabs" class="cfg-tabs" role="tablist"></div>
+      <div id="cfg-fields" class="cfg-modal-body"></div>
+      <div class="cfg-modal-foot">
+        <button id="cfg-reset-btn" class="btn-outline-danger" type="button">Restaurar padroes</button>
+        <div class="cfg-modal-foot-right">
+          <button id="cfg-cancel-btn" class="btn-ghost" type="button">Cancelar</button>
+          <button id="cfg-save-btn" class="btn-primary" type="button">Salvar no MongoDB</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <script>
     (function () {
       var pcsEl = document.getElementById("pcs");
@@ -726,6 +897,28 @@
       var alvosCountEl = document.getElementById("alvos-count");
       var drafts = Object.create(null);
       var carregando = false;
+      var novoPcBtn = document.getElementById("novo-pc-btn");
+      var configModalEl = document.getElementById("config-modal");
+      var cfgModalTitleEl = document.getElementById("cfg-modal-title");
+      var cfgAliasRowEl = document.getElementById("cfg-alias-row");
+      var cfgAliasInputEl = document.getElementById("cfg-alias-input");
+      var cfgTabsEl = document.getElementById("cfg-tabs");
+      var cfgFieldsEl = document.getElementById("cfg-fields");
+      var cfgCloseBtn = document.getElementById("cfg-close-btn");
+      var cfgResetBtn = document.getElementById("cfg-reset-btn");
+      var cfgCancelBtn = document.getElementById("cfg-cancel-btn");
+      var cfgSaveBtn = document.getElementById("cfg-save-btn");
+      var ultimoSchema = {};
+      var cfgAtivoAlias = "";
+      var cfgNovoPc = false;
+      var cfgGrupoAtivo = "lives";
+      var cfgValores = Object.create(null);
+      var GRUPOS_CFG = [
+        { id: "lives", label: "Slots e Lives" },
+        { id: "render", label: "Layout e Marca" },
+        { id: "ia", label: "IA, Portao e Traducao" },
+        { id: "publicacao", label: "Master e Publicacao" }
+      ];
 
       function el(tag, cls, txt) {
         var n = document.createElement(tag);
@@ -1000,6 +1193,13 @@
           btn.addEventListener("click", function () {
             enviarLiberar(w, input, btn);
           });
+          var cfgBtn = el("button", "btn-primary", "configurar");
+          cfgBtn.type = "button";
+          cfgBtn.setAttribute("aria-label", "Configurar " + label);
+          cfgBtn.addEventListener("click", function () {
+            abrirConfigModal(label, w.config || {}, false);
+          });
+          box.appendChild(cfgBtn);
           box.appendChild(input);
           box.appendChild(btn);
           tdAcao.appendChild(box);
@@ -1052,6 +1252,158 @@
         jobsEl.replaceChildren.apply(jobsEl, items);
       }
 
+      function renderCfgTabs() {
+        var tabs = GRUPOS_CFG.map(function (g) {
+          var count = Object.keys(ultimoSchema).filter(function (k) {
+            return ultimoSchema[k].grupo === g.id && cfgValores[k] !== undefined && cfgValores[k] !== "";
+          }).length;
+          var label = count ? (g.label + " (" + count + ")") : g.label;
+          var btn = el("button", "cfg-tab" + (cfgGrupoAtivo === g.id ? " active" : ""), label);
+          btn.type = "button";
+          btn.setAttribute("role", "tab");
+          btn.addEventListener("click", function () {
+            cfgGrupoAtivo = g.id;
+            renderCfgTabs();
+            renderCfgFields();
+          });
+          return btn;
+        });
+        cfgTabsEl.replaceChildren.apply(cfgTabsEl, tabs);
+      }
+
+      function renderCfgFields() {
+        var keys = Object.keys(ultimoSchema).filter(function (k) {
+          return ultimoSchema[k].grupo === cfgGrupoAtivo;
+        });
+        if (!keys.length) {
+          cfgFieldsEl.replaceChildren(el("div", "meta", "Nenhuma variavel neste grupo."));
+          return;
+        }
+        var items = keys.map(function (k) {
+          var meta = ultimoSchema[k];
+          var val = cfgValores[k] || "";
+          var box = el("div", "cfg-field" + (val !== "" ? " overridden" : ""));
+          var lbl = el("label", null, k);
+          lbl.setAttribute("for", "cfg-in-" + k);
+          box.appendChild(lbl);
+          if (meta.descricao) {
+            box.appendChild(el("div", "cfg-field-desc", meta.descricao));
+          }
+          var ctrl;
+          if ((meta.tipo === "enum" || meta.tipo === "bool") && Array.isArray(meta.opcoes)) {
+            ctrl = el("select");
+            var defTxt = meta.default !== "" ? ("Padrao: " + meta.default) : "Padrao: automatico";
+            var optDef = el("option", null, defTxt);
+            optDef.value = "";
+            ctrl.appendChild(optDef);
+            meta.opcoes.forEach(function (op) {
+              var o = el("option", null, op);
+              o.value = op;
+              ctrl.appendChild(o);
+            });
+            ctrl.value = val;
+            ctrl.addEventListener("change", function () {
+              cfgValores[k] = ctrl.value;
+              box.className = "cfg-field" + (ctrl.value !== "" ? " overridden" : "");
+              renderCfgTabs();
+            });
+          } else {
+            ctrl = el("input");
+            ctrl.type = "text";
+            ctrl.placeholder = "Padrao: " + (meta.default !== "" ? meta.default : "vazio");
+            ctrl.value = val;
+            ctrl.setAttribute("autocomplete", "off");
+            ctrl.setAttribute("spellcheck", "false");
+            ctrl.addEventListener("input", function () {
+              cfgValores[k] = ctrl.value;
+              box.className = "cfg-field" + (ctrl.value.trim() !== "" ? " overridden" : "");
+              renderCfgTabs();
+            });
+          }
+          ctrl.id = "cfg-in-" + k;
+          box.appendChild(ctrl);
+          return box;
+        });
+        cfgFieldsEl.replaceChildren.apply(cfgFieldsEl, items);
+      }
+
+      function abrirConfigModal(alias, configAtual, isNovo) {
+        cfgNovoPc = Boolean(isNovo);
+        cfgAtivoAlias = alias || "";
+        cfgValores = Object.create(null);
+        Object.keys(ultimoSchema).forEach(function (k) {
+          cfgValores[k] = (configAtual && configAtual[k] !== undefined && configAtual[k] !== null)
+            ? String(configAtual[k])
+            : "";
+        });
+        cfgGrupoAtivo = "lives";
+        cfgModalTitleEl.textContent = isNovo ? "Configurar novo PC" : ("Configurar PC: " + cfgAtivoAlias);
+        cfgAliasRowEl.hidden = !isNovo;
+        cfgAliasInputEl.value = cfgAtivoAlias;
+        renderCfgTabs();
+        renderCfgFields();
+        configModalEl.hidden = false;
+        if (isNovo) cfgAliasInputEl.focus();
+      }
+
+      function fecharConfigModal() {
+        configModalEl.hidden = true;
+      }
+
+      novoPcBtn.addEventListener("click", function () {
+        abrirConfigModal("", {}, true);
+      });
+      cfgCloseBtn.addEventListener("click", fecharConfigModal);
+      cfgCancelBtn.addEventListener("click", fecharConfigModal);
+      cfgResetBtn.addEventListener("click", function () {
+        Object.keys(ultimoSchema).forEach(function (k) {
+          cfgValores[k] = "";
+        });
+        renderCfgTabs();
+        renderCfgFields();
+      });
+      cfgSaveBtn.addEventListener("click", function () {
+        var alias = cfgNovoPc ? (cfgAliasInputEl.value || "").trim() : cfgAtivoAlias;
+        if (!alias) {
+          mostrarMsg("Informe o apelido do PC.", "erro");
+          cfgAliasInputEl.focus();
+          return;
+        }
+        var payloadCfg = Object.create(null);
+        Object.keys(ultimoSchema).forEach(function (k) {
+          var v = (cfgValores[k] || "").trim();
+          payloadCfg[k] = v;
+        });
+        cfgSaveBtn.disabled = true;
+        fetch("/api/config", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pc_alias: alias, config: payloadCfg })
+        })
+          .then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (body) {
+              return { status: r.status, body: body };
+            });
+          })
+          .then(function (res) {
+            if (res.status >= 200 && res.status < 300) {
+              fecharConfigModal();
+              mostrarMsg("Configuracao salva para " + alias + ".", "ok");
+              atualizar();
+            } else {
+              var erro = (res.body && res.body.erro) ? res.body.erro : ("HTTP " + res.status);
+              mostrarMsg("Falha ao salvar configuracao: " + erro, "erro");
+            }
+          })
+          .catch(function () {
+            mostrarMsg("Erro de rede ao salvar configuracao.", "erro");
+          })
+          .finally(function () {
+            cfgSaveBtn.disabled = false;
+          });
+      });
+
       function atualizar() {
         if (carregando) return;
         carregando = true;
@@ -1068,6 +1420,7 @@
             return r.json();
           })
           .then(function (dados) {
+            if (dados.config_schema) ultimoSchema = dados.config_schema;
             renderWorkers(dados.workers || []);
             renderLives(dados.lives || [], dados.workers || []);
             renderAlvos(dados.alvos || [], dados.workers || []);
