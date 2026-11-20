@@ -1393,7 +1393,35 @@ class Supervisor:
             kwargs["ocupados"] = self._ocupados()
         if has_kw or "fila" in params:
             kwargs["fila"] = self._fila(queue, c)
-        beat_fn(alias, cap, job_atual, ml, razao, **kwargs)
+        res = beat_fn(alias, cap, job_atual, ml, razao, **kwargs)
+        if isinstance(res, dict):
+            self._apply_runtime_config(res, alias=alias, c=c)
+        return res
+
+    def _apply_runtime_config(
+        self,
+        remote_cfg: dict[str, Any] | None,
+        *,
+        alias: str | None = None,
+        c: Any = None,
+    ) -> dict[str, str]:
+        """Aplica overrides do MongoDB em runtime e atualiza slots, lease e sessoes ativas."""
+        applied = config.apply_remote_config(remote_cfg, out_root=self.out_root, alias=alias)
+        new_slots = config.slots(strict=False)
+        with self._lock:
+            self.slots = new_slots
+            new_min_free = (
+                config.env_float("CLIPES_MIN_FREE_GB", 5.0, min_value=0.0)
+                if self.min_free_gb is None
+                else float(self.min_free_gb)
+            )
+            new_captura_morta = _captura_morta_s()
+            for sess in self._active.values():
+                sess.min_free = new_min_free
+                sess.captura_morta_s = new_captura_morta
+        if c is not None and hasattr(c, "lease_s") and "CLIPES_LEASE_S" in applied:
+            c.lease_s = config.env_float("CLIPES_LEASE_S", float(c.lease_s), min_value=30.0)
+        return applied
 
     def _handle_lease_lost(self, key: str, sess: LiveSession, pool: Any, *, msg: str | None = None) -> None:
         lid = sess.live_id or sess.pending_live_id
@@ -1720,11 +1748,26 @@ class Supervisor:
                         source_cmd=_source_cmd,
                     )
 
-                worker_alias = os.environ.get("CLIPES_ALIAS", "").strip()
-                if self.coord is not None and not worker_alias:
-                    from .capacidade import worker_id as get_worker_id
+                worker_alias = config.pc_alias(self.out_root)
+                c_init = self._coord_active()
+                if self.coord is not None:
+                    boot_cfg: dict[str, Any] | None = None
+                    if c_init is not None:
+                        reconcile_fn = getattr(c_init, "reconcile_alias", None)
+                        if callable(reconcile_fn):
+                            try:
+                                boot_cfg = reconcile_fn(worker_alias)
+                            except Exception as exc:
+                                if not monitor._is_mongo_error(exc):
+                                    raise
+                                self._on_mongo_err(exc)
+                    if boot_cfg is None:
+                        boot_cfg = config.load_cached_remote_config(out_root=self.out_root, alias=worker_alias)
+                    if boot_cfg:
+                        self._apply_runtime_config(boot_cfg, alias=worker_alias, c=c_init)
+                    else:
+                        self.slots = config.slots(strict=False)
 
-                    worker_alias = get_worker_id(self.out_root)
                 if self.beat_s is not None:
                     beat_interval = max(0.01, float(self.beat_s))
                 else:
@@ -1848,7 +1891,14 @@ class Supervisor:
                     publish_loop = PublishLoop(_publish_once, beat_interval, name="publicacao")
                     publish_loop.start()
 
-                if busca_chans:
+                def _start_busca() -> None:
+                    nonlocal busca_thread
+                    chans_now = self._resolve_busca_channels()
+                    if not chans_now or (busca_thread is not None and busca_thread.is_alive()):
+                        return
+                    busca_stop_early.clear()
+                    busca_loop_ref[0] = None
+                    busca_stop_ref[0] = None
                     shared_cs = _SupervisorCoordSession(self)
 
                     def _busca_worker() -> None:
@@ -1861,7 +1911,7 @@ class Supervisor:
                                 ev.set()
                                 return
                             await monitor.run_monitor(
-                                busca_chans,
+                                chans_now,
                                 self.out_root,
                                 self.policy,
                                 queue_root=queue.root,
@@ -1888,6 +1938,19 @@ class Supervisor:
 
                     busca_thread = threading.Thread(target=_busca_worker, daemon=True, name="busca-geral")
                     busca_thread.start()
+
+                def _sync_busca_thread() -> None:
+                    nonlocal busca_thread
+                    want_busca = int(self.slots.get("busca", 0)) > 0
+                    alive = busca_thread is not None and busca_thread.is_alive()
+                    if not want_busca and alive:
+                        _stop_busca()
+                        busca_thread = None
+                    elif want_busca and not alive:
+                        _start_busca()
+
+                if busca_chans:
+                    _start_busca()
 
                 def _liberar() -> None:
                     # M-03: para gravadores, mata filhos e solta leases sem marcar ended
@@ -1941,6 +2004,9 @@ class Supervisor:
                                 c_active, worker_alias, cap_now, self._current_job[0], ml_now, razao_now, beat_interval,
                                 queue=queue,
                             )
+                            if self.beat_s is None:
+                                beat_interval = config.env_float("CLIPES_BEAT_S", 20.0, min_value=5.0)
+                            _sync_busca_thread()
                             with self._lock:
                                 active_beat = list(self._active.items())
                             for key, sess in active_beat:

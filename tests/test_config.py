@@ -98,3 +98,147 @@ def test_slots_invalido_sai_codigo_2_com_trecho(monkeypatch, capsys):
         captured = capsys.readouterr()
         msg = captured.err + captured.out
         assert f"CLIPES_SLOTS invalido: {trecho}" in msg
+
+
+def test_slots_non_strict_cai_no_padrao(monkeypatch):
+    monkeypatch.setenv("CLIPES_SLOTS", "invalido")
+    config._avisados.discard("CLIPES_SLOTS")
+    assert config.slots(strict=False) == {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1}
+
+
+def test_config_schema_tem_42_variaveis_e_zero_segredos():
+    assert len(config.CONFIG_SCHEMA) == 42
+    grupos = {meta["grupo"] for meta in config.CONFIG_SCHEMA.values()}
+    assert grupos == {"lives", "render", "ia", "publicacao"}
+    for key, meta in config.CONFIG_SCHEMA.items():
+        assert not config._is_forbidden_key(key)
+        assert "default" in meta
+        assert "tipo" in meta
+        assert "descricao" in meta
+
+
+def test_validate_config_payload_aceita_validos_e_omite_vazios():
+    payload = {
+        "CLIPES_SLOTS": "twitch=2,kick=0,youtube=1,busca=0",
+        "CLIPES_CPU_THREADS": "8",
+        "CLIPES_MIN_FREE_GB": "10.5",
+        "CLIPES_SPLIT_BAR_H": "120",
+        "CLIPES_BLUR_BG": "0",
+        "CLIPES_HOOK_TOP": True,
+        "CLIPES_WHISPER_MODEL": "large-v3-turbo",
+        "CLIPES_AGENDA_HORARIOS": "09:00,18:30",
+        "CLIPES_TZ": "America/Sao_Paulo",
+        "CLIPES_BRAND_NAME": "Canal Teste",
+        "CLIPES_BRAND_LOGO": "assets/logo.png",
+        "CLIPES_RETENCAO_H": "",
+        "CLIPES_BAR": None,
+    }
+    clean, err = config.validate_config_payload(payload)
+    assert err is None
+    assert clean == {
+        "CLIPES_SLOTS": "twitch=2,kick=0,youtube=1,busca=0",
+        "CLIPES_CPU_THREADS": "8",
+        "CLIPES_MIN_FREE_GB": "10.5",
+        "CLIPES_SPLIT_BAR_H": "120",
+        "CLIPES_BLUR_BG": "0",
+        "CLIPES_HOOK_TOP": "1",
+        "CLIPES_WHISPER_MODEL": "large-v3-turbo",
+        "CLIPES_AGENDA_HORARIOS": "09:00,18:30",
+        "CLIPES_TZ": "America/Sao_Paulo",
+        "CLIPES_BRAND_NAME": "Canal Teste",
+        "CLIPES_BRAND_LOGO": "assets/logo.png",
+    }
+    assert "CLIPES_RETENCAO_H" not in clean
+    assert "CLIPES_BAR" not in clean
+
+
+def test_validate_config_payload_rejeita_segredos_e_desconhecidas():
+    segredos = [
+        "CLIPES_MONGO_URI",
+        "PAINEL_MONGO_URI",
+        "PAINEL_SENHA",
+        "DISCORD_BOT_TOKEN",
+        "DISCORD_GUILD_ID",
+        "DISCORD_CHANNEL_ID",
+        "DISCORD_ALLOWED_USER_IDS",
+        "GEMINI_API_KEYS",
+        "GROQ_API_KEY",
+        "YOUTUBE_CLIENT_SECRET",
+        "GOOGLE_CLIENT_ID",
+        "TIKTOK_CLIENT_SECRET",
+        "TWITCH_CLIENT_SECRET",
+        "QUALQUER_TOKEN_NOVO",
+        "VARIAVEL_DESCONHECIDA",
+    ]
+    for chave in segredos:
+        clean, err = config.validate_config_payload({chave: "x"})
+        assert clean == {}
+        assert err == f"variavel nao permitida: {chave}"
+
+
+def test_validate_config_payload_rejeita_valores_invalidos():
+    invalidos = [
+        ("CLIPES_SLOTS", "tiktok=1"),
+        ("CLIPES_SLOTS", "twitch=abc"),
+        ("CLIPES_CPU_THREADS", "0"),
+        ("CLIPES_CPU_THREADS", "65"),
+        ("CLIPES_CPU_THREADS", "3.5"),
+        ("CLIPES_SPLIT_BAR_H", "121"),  # impar
+        ("CLIPES_BAR_H", "999"),
+        ("CLIPES_BEAT_S", "1"),
+        ("CLIPES_LAYOUT", "inexistente"),
+        ("CLIPES_BLUR_BG", "talvez"),
+        ("CLIPES_AGENDA_HORARIOS", "25:99"),
+        ("CLIPES_TZ", "Mars/Olympus"),
+        ("CLIPES_BRAND_LOGO", "../segredo.png"),
+        ("CLIPES_BRAND_NAME", "linha1\nlinha2"),
+    ]
+    for chave, valor in invalidos:
+        clean, err = config.validate_config_payload({chave: valor})
+        assert clean == {}
+        assert err is not None and err.startswith(f"valor invalido para {chave}")
+
+
+def test_pc_alias_prioridade(monkeypatch, tmp_path):
+    monkeypatch.setenv("CLIPES_PC_ALIAS", "PC-PRINCIPAL")
+    monkeypatch.setenv("CLIPES_ALIAS", "PC-ANTIGO")
+    assert config.pc_alias(tmp_path) == "PC-PRINCIPAL"
+
+    monkeypatch.delenv("CLIPES_PC_ALIAS")
+    assert config.pc_alias(tmp_path) == "PC-ANTIGO"
+
+    monkeypatch.delenv("CLIPES_ALIAS")
+    wid = config.pc_alias(tmp_path)
+    assert wid.startswith("w-")
+
+
+def test_apply_remote_config_precedencia_restauracao_e_cache(monkeypatch, tmp_path):
+    monkeypatch.setitem(config._BOOT_ENV, "CLIPES_WHISPER_MODEL", "small")
+    monkeypatch.delitem(config._BOOT_ENV, "CLIPES_LAYOUT", raising=False)
+    monkeypatch.setenv("CLIPES_WHISPER_MODEL", "small")
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", "segredo-local")
+
+    applied = config.apply_remote_config(
+        {
+            "CLIPES_WHISPER_MODEL": "large-v3-turbo",
+            "CLIPES_LAYOUT": "full",
+            "DISCORD_BOT_TOKEN": "tentativa-invasao",
+            "CLIPES_BAR_H": "999",  # invalido -> ignorado
+        },
+        out_root=tmp_path,
+        alias="PC-1",
+    )
+    assert applied == {"CLIPES_WHISPER_MODEL": "large-v3-turbo", "CLIPES_LAYOUT": "full"}
+    assert config.os.environ["CLIPES_WHISPER_MODEL"] == "large-v3-turbo"
+    assert config.os.environ["CLIPES_LAYOUT"] == "full"
+    assert config.os.environ["DISCORD_BOT_TOKEN"] == "segredo-local"
+    assert "CLIPES_BAR_H" not in config.os.environ
+
+    # Cache salvo e legivel
+    assert config.load_cached_remote_config(out_root=tmp_path, alias="PC-1") == applied
+
+    # Limpar override restaura _BOOT_ENV ou remove
+    applied2 = config.apply_remote_config({}, out_root=tmp_path, alias="PC-1")
+    assert applied2 == {}
+    assert config.os.environ["CLIPES_WHISPER_MODEL"] == "small"
+    assert "CLIPES_LAYOUT" not in config.os.environ

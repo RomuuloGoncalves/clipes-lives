@@ -9,7 +9,7 @@ import mongomock
 import pymongo.errors
 import pytest
 
-from clipes import acompanhar, monitor
+from clipes import acompanhar, config as config_mod, monitor
 from clipes.coord import Coord
 from test_acompanhar import B, Clock, FakeMultiPool
 
@@ -1123,3 +1123,105 @@ def test_supervisor_coord_kick_backoff_e_reconexao(tmp_path, monkeypatch):
     assert claimed is True
     assert sess_stub.live_id == "kick:baz-qux:888"
     assert ensure_calls == [("kick:baz-qux:888", "kick", "888")]
+
+
+def test_supervisor_aplica_config_do_mongo_no_boot_e_recarrega_no_heartbeat(tmp_path, monkeypatch):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_PC_ALIAS", "PC-REMOTE")
+    monkeypatch.delenv("CLIPES_WHISPER_MODEL", raising=False)
+    monkeypatch.delenv("CLIPES_SLOTS", raising=False)
+
+    db = mongomock.MongoClient().db
+    # Pre-configuracao salva para PC-REMOTE antes do boot
+    db.workers.insert_one({
+        "_id": "PC-REMOTE",
+        "alias": "PC-REMOTE",
+        "config": {"CLIPES_WHISPER_MODEL": "large-v3-turbo", "CLIPES_SLOTS": "twitch=2,kick=0,youtube=1,busca=0"},
+    })
+    coord = Coord(db, "w-rem", now=clock.now, lease_s=90)
+    pool = FakeMultiPool(clock, {"gaules": B + 320})
+
+    orig_beat = coord.beat
+    beat_count = [0]
+
+    def beat_with_update(*args, **kwargs):
+        beat_count[0] += 1
+        if beat_count[0] == 2:
+            db.workers.update_one(
+                {"_id": "w-rem"},
+                {"$set": {"config": {"CLIPES_WHISPER_MODEL": "small", "CLIPES_SLOTS": "twitch=3,kick=1,youtube=1,busca=0"}}},
+            )
+        return orig_beat(*args, **kwargs)
+
+    coord.beat = beat_with_update
+
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("gaules")],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        beat_s=20,
+        is_live=lambda u: clock.t < B + 320,
+        probe=lambda u: {"id": "tw1", "is_live": True},
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    res = sup.run()
+    assert res["status"] == "ended"
+    assert beat_count[0] >= 2
+    assert sup.slots == {"twitch": 3, "kick": 1, "youtube": 1, "busca": 0}
+    assert config_mod.os.environ["CLIPES_WHISPER_MODEL"] == "small"
+    # Documento antigo PC-REMOTE foi unificado em w-rem
+    assert db.workers.count_documents({"alias": "PC-REMOTE"}) == 1
+    assert db.workers.find_one({"_id": "w-rem"}) is not None
+
+
+def test_supervisor_usa_cache_local_quando_mongo_offline_no_boot(tmp_path, monkeypatch):
+    from clipes import config as config_mod
+
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_PC_ALIAS", "PC-CACHE")
+    out_dir = tmp_path / "out"
+    config_mod.apply_remote_config(
+        {"CLIPES_LAYOUT": "full", "CLIPES_SLOTS": "twitch=2,kick=1,youtube=1,busca=0"},
+        out_root=out_dir,
+        alias="PC-CACHE",
+    )
+    monkeypatch.delenv("CLIPES_LAYOUT", raising=False)
+    monkeypatch.delenv("CLIPES_SLOTS", raising=False)
+
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-cache", now=clock.now, lease_s=90)
+
+    def boom_reconcile(alias):
+        raise pymongo.errors.AutoReconnect("mongo offline")
+
+    def boom_beat(*args, **kwargs):
+        raise pymongo.errors.AutoReconnect("mongo offline")
+
+    coord.reconcile_alias = boom_reconcile
+    coord.beat = boom_beat
+    pool = FakeMultiPool(clock, {"gaules": B + 320})
+
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("gaules")],
+        out_dir,
+        pool=pool,
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        is_live=lambda u: clock.t < B + 320,
+        probe=lambda u: {"id": "tw1", "is_live": True},
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        capacity_fn=lambda _: {"cpus": 4, "score": 30},
+    )
+    res = sup.run()
+    assert res["status"] == "ended"
+    assert sup.slots == {"twitch": 2, "kick": 1, "youtube": 1, "busca": 0}
+    assert config_mod.os.environ["CLIPES_LAYOUT"] == "full"
