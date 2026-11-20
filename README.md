@@ -86,6 +86,8 @@ Detecção (`--mode`): `peaks` usa só os picos de áudio/chat/heatmap; `quota` 
 Variáveis de ambiente de renderização:
 
 - `CLIPES_BLUR_BG` (padrão `0`): por padrão o vídeo 16:9 fica centralizado sobre barras pretas; `1` liga o fundo borrado (`split`/`boxblur`/`overlay`), que consome mais CPU.
+- `CLIPES_LEGENDA_IDIOMA` (padrão `pt`): traduz automaticamente a legenda queimada para `pt-BR` quando o ASR detecta um idioma diferente de português; use `off` ou `original` para manter o idioma original.
+- `CLIPES_LEGENDA_ORIGINAL` (padrão `0`): quando `1`, exibe o texto original menor (`44 px`, `#D0D0D0`) acima da tradução `pt-BR` (`64 px`) no modo bilíngue.
 - Barra fixa de marca no topo (`1080xH`):
   - `CLIPES_BAR`: liga automaticamente quando `CLIPES_BRAND_NAME` está definido; use `0` para desligar ou `1` para ligar só com o título (sem nome/handle).
   - `CLIPES_BRAND_NAME`: `@handle` do canal (ex.: `@cortes_lr1`; o `@` é adicionado se faltar).
