@@ -62,7 +62,7 @@ Processar um VOD ou live ativa. Use o `./clipar` (cria a pasta de saída como se
 ./clipar "https://www.youtube.com/watch?v=cStJTQf9XUk" --live-minutes 4 --max-clips 2
 ```
 
-O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 8 GB), respeitando valores definidos no ambiente; roda com prioridade baixa e liga o `./vigia-temp`: ele grava a temperatura em `<saída>/.temp.log` a cada 5 s, pausa o container a 85 °C (`CLIPES_TEMP_MAX`) e retoma a 75 °C (`CLIPES_TEMP_MIN`). Para uso contínuo, `./clipar servico` (ver "Serviço único" abaixo) mantém a fila de janelas, a busca geral e os VODs em um processo só, com 1 worker que processa um job por vez; se parar, retoma da fila.
+O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 8 GB), respeitando valores definidos no ambiente; roda com prioridade baixa e liga o `./vigia-temp` (detalhes em "Temperatura e vigia" abaixo). Para uso contínuo, `./clipar servico` (ver "Serviço único" abaixo) mantém a fila de janelas, a busca geral e os VODs em um processo só, com 1 worker que processa um job por vez; se parar, retoma da fila.
 
 Opções da CLI:
 
@@ -125,6 +125,22 @@ Rodar a suíte de testes dentro do container:
 ```sh
 docker compose run --rm test
 ```
+
+## Temperatura e vigia
+
+O `./vigia-temp` pausa o container quando o PC esquenta e o retoma quando esfria. Ele grava a temperatura em `<saída>/.temp` a cada 5 s (log em `<saída>/.temp.log`); o painel lê esse valor.
+
+Ajustes pelo painel (aba **Temperatura**, por PC) ou no `.env`:
+
+- `CLIPES_VIGIA` (padrão `1`): `0` desliga a pausa. O vigia segue gravando `.temp`, e o painel mostra a temperatura em cinza.
+- `CLIPES_TEMP_MAX` (60 a 100, padrão `85`): pausa o container ao passar deste valor.
+- `CLIPES_TEMP_MIN` (40 a 95, padrão `75`): retoma o container abaixo deste valor. `MIN` precisa ser menor que `MAX` pelos valores efetivos; o painel rejeita o contrário.
+
+O valor configurado pelo painel chega ao PC no próximo heartbeat (`CLIPES_BEAT_S`), que grava `<saída>/.vigia` com `ativo max min`. O vigia relê esse arquivo a cada ciclo; sem ele, ou com valor inválido, usa `1 85 75`.
+
+- Leitura velha: se `.temp` tiver mais de 30 s, a temperatura é tratada como ausente (`n/d` no painel), então a última leitura não parece atual com o vigia parado.
+- Uma instância por saída: se já houver um `vigia-temp` vivo (`<saída>/.vigia.pid`), o novo sai com código 0. O `./clipar` inicia o vigia só se não houver um vivo e encerra só o que ele mesmo iniciou.
+- **WSL2 (Windows):** o hwmon do Linux não enxerga o sensor do host. O vigia então consulta o Windows por `powershell.exe`, tentando primeiro o LibreHardwareMonitor (WMI, `root/LibreHardwareMonitor`) e depois `MSAcpi_ThermalZoneTemperature`. Essa consulta roda no máximo a cada 15 s. Para ela funcionar, abra o LibreHardwareMonitor no Windows com o servidor WMI ligado. Se nenhuma fonte responder em 5 s, o vigia grava `sem-sensor`, o `./clipar` imprime um aviso para abrir o LibreHardwareMonitor e o painel mostra `n/d`.
 
 ## Saída
 
@@ -204,7 +220,7 @@ processors=12
 ```
 
 3. Execute o `./clipar` a partir de uma distro Linux dentro do WSL2, mantendo `OUT_DIR` dentro do sistema de arquivos da distro (evite `/mnt/c` pelo impacto em I/O).
-4. O contêiner no WSL2 não enxerga sensores térmicos do host Windows: o `./clipar` imprime o aviso de `sem-sensor` e continua sem alterar limites, e o painel exibe `n/d` na temperatura.
+4. No WSL2 a temperatura vem do Windows via LibreHardwareMonitor (servidor WMI ligado), conforme "Temperatura e vigia". Sem sensor, o `./clipar` imprime o aviso de `sem-sensor` e o painel exibe `n/d`.
 
 ### 4. Serviço único por PC (`./clipar servico`) e slots
 
@@ -222,6 +238,7 @@ Um único processo faz tudo: o `Supervisor` acompanha os alvos da coleção `alv
 - **Lease**: se o PC dono para de renovar um alvo por 90 s, outro PC com vaga pode tomá-lo. Ao reiniciar, o PC retoma os alvos de que ainda é dono. Mantenha `CLIPES_LEASE_S` >= `90` (padrão): avisos síncronos ao Discord (timeout de até ~60 s) pausam o laço principal.
 - **Sem live duplicada**: a busca geral ignora picos de canais que são alvo `ativo` em `alvos` (de qualquer PC), então uma live não é gravada por dois PCs.
 - **Disco por live**: cada gravador mantém cerca de 20 minutos de buffer em `queue/.buffer/` (~900 MB por live a 6 Mb/s), respeitando o teto global `BUFFER_CAP_BYTES` (~1,5 GB). `CLIPES_MIN_FREE_GB` evita fechar novas janelas quando o disco aperta, mas não limita o buffer em andamento.
+- **Backlog de janelas (`CLIPES_MAX_BACKLOG`, padrão `6`, mínimo `1`)**: janelas fechadas que aguardam o worker, por sessão. Passou do limite, a mais antiga é descartada (aviso `janela perdida`). Se o disco livre cair abaixo de `CLIPES_MIN_FREE_GB`, a descarte acontece antes do limite. A fonte já fica congelada em `source.mkv`, então segurar mais janelas custa só disco.
 - **YouTube (experimental)**: a gravação de lives do YouTube usa `yt-dlp -f "b[height<=1080]/b" --hls-use-mpegts -o -` sem chat. Se alguma live não entregar formato muxado via `yt-dlp`, o plano B é testar `streamlink <url> best`.
 - **Comandos removidos**: `./clipar monitor`, `monitor --follow`, `<url> --ate-acabar`, `acompanhar` e `bench-live` saem com código 2 e a mensagem `removido: use ./clipar servico (e /live adicionar no Discord)`.
 - **Smoke manual**: rode `./clipar servico` em um PC, adicione 1 live da Twitch e 1 do YouTube com `/live adicionar` e confira nos logs e na fila que janelas das duas são geradas, sem dois jobs simultâneos em `processing/`.
@@ -247,7 +264,7 @@ db.alvos.deleteMany({ estado: { $in: ["feito", "falhou", "removido"] }, criado_e
 
 ## Bot do Discord e Publicação Privada
 
-O `./clipar servico` envia cada live para o canal `#clipes` (`DISCORD_CHANNEL_ID`) como 1 cartão + 1 thread por `live_id`, editados no lugar, e os avisos (recusa, sem vaga, janela descartada por backlog, falha, serviço iniciado/parado) para `#bot-log` (`DISCORD_LOG_CHANNEL_ID`, opcional; sem ela, vão para o canal de clipes). O serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`), usando as variáveis definidas em `.env` e os tokens gravados em `/config/tokens.json`.
+O `./clipar servico` envia cada live para o canal `#clipes` (`DISCORD_CHANNEL_ID`) como 1 cartão + 1 thread por `live_id`, editados no lugar, e os avisos (recusa, sem vaga, janela descartada por backlog, falha, serviço iniciado/parado, prévia que não coube) para `#bot-log`, nunca para o `#clipes`. O canal de avisos é resolvido nesta ordem: `DISCORD_LOG_CHANNEL_ID` (opcional); o cache `OUT_DIR/.discord_log_channel`; um canal de texto `bot-log` já existente na guilda; um `bot-log` criado pelo bot (exige permissão Manage Channels). Sem nada disso, os avisos vão só para o stdout. Avisos repetidos em até 60 s são suprimidos, e o próximo envio desse texto leva `(+N repetidos)`. O serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`), usando as variáveis definidas em `.env` e os tokens gravados em `/config/tokens.json`.
 
 ### 1. Discord Developer Portal
 
@@ -262,8 +279,8 @@ O `./clipar servico` envia cada live para o canal `#clipes` (`DISCORD_CHANNEL_ID
 4. No `.env` (obtidos pelo Modo Desenvolvedor do Discord):
    - `DISCORD_GUILD_ID`, `DISCORD_CHANNEL_ID` e `DISCORD_ALLOWED_USER_IDS` (lista vazia bloqueia todas as publicações e comandos).
    - **Recomendado: IDs explícitos em `DISCORD_ALLOWED_USER_IDS`.** Com `*`, qualquer membro que enxergue o canal pode adicionar lives, enfileirar VODs, publicar e descartar; o bot loga `aviso: comandos liberados para qualquer membro do canal` na inicialização.
-   - `DISCORD_LOG_CHANNEL_ID` (opcional): canal `#bot-log` para avisos do serviço. Vazio = os avisos vão para `DISCORD_CHANNEL_ID`.
-   - `CLIPES_DISCORD_MAX_MB=20` (opcional; no modo padrão `discord`, o master já mira esse teto em uma única codificação, caindo para 720x1280 se o bitrate ficar abaixo de 1500 kbps).
+   - `DISCORD_LOG_CHANNEL_ID` (opcional): canal `#bot-log` para avisos. Vazio = o bot usa ou cria um `bot-log` na guilda (ver acima); nunca cai no `#clipes`.
+   - `CLIPES_DISCORD_MAX_MB=10` (padrão; limite de anexo de bot em servidor sem boost). Se um master passar de 98% desse limite, o bot gera uma prévia 720x1280 mirando 90% do limite.
 
 ### 2. Google Cloud (YouTube Data API v3)
 
@@ -287,6 +304,15 @@ Autorize cada plataforma uma vez (escuta em `127.0.0.1:8765` por padrão e grava
 docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth youtube --bind 0.0.0.0
 docker compose run --rm -p 127.0.0.1:8765:8765 clipes auth tiktok --bind 0.0.0.0
 ```
+
+Conferir os tokens (sem imprimir token, client id ou secret):
+
+```sh
+docker compose run --rm clipes auth status           # ok | ausente | expirado-renovavel | invalido, por plataforma, com caminho e expiração
+docker compose run --rm clipes auth status --renovar # tenta renovar os tokens expirados e grava os novos
+```
+
+Sai com código 0 só se YouTube e TikTok estiverem `ok`.
 
 Subir o serviço contínuo do bot (um único processo por servidor Discord; exige `DISCORD_BOT_TOKEN` definido, caso contrário sai com código 2 em reinício contínuo):
 
@@ -323,7 +349,7 @@ Para acompanhar uma live, não é preciso mexer no terminal: `/live adicionar al
 Todo clipe processado por CLI ou worker é indexado em `OUT_DIR/registro.json` (fonte da verdade local, gravada com `flock` e escrita atômica) com hash SHA-256, tamanho e IDs do Discord (`thread_id`, `message_id`, `attachment_id`). Quando `CLIPES_MONGO_URI` está ativo, uma cópia é enviada para a coleção `clips` (`_id = clip_id`) para busca entre PCs e publicação remota; URLs assinadas do CDN nunca são salvas e são obtidas na hora via API do Discord.
 
 - `CLIPES_MASTER_MODE`: `discord` (padrão; codifica o master uma única vez dentro de `CLIPES_DISCORD_MAX_MB`, re-renderiza uma vez da fonte com 85% do bitrate se passar de 98% do limite e marca `cabe_discord=false` se ainda não couber) ou `livre` (mantém `-crf 21` sem teto de bitrate, gera prévia separada quando precisar e nunca apaga o arquivo local).
-- `CLIPES_DISCORD_MAX_MB`: limite usado para o envio ao Discord (padrão `20`). Uploads rejeitados com HTTP 413 caem automaticamente para aviso sem anexo (`cabe_discord=false`).
+- `CLIPES_DISCORD_MAX_MB`: limite usado para o envio ao Discord (padrão `10`). Uploads rejeitados com HTTP 413 caem automaticamente para aviso sem anexo (`cabe_discord=false`).
 - `CLIPES_REGISTRO_VERIFICAR`: `1` por padrão; após o upload do master no modo `discord`, baixa o anexo em stream e confirma `size` e `sha256` antes de marcar `status="no_discord"`.
 - `CLIPES_RETENCAO_H`: vazio por padrão (retenção **desligada**). Quando definido com um número `>= 0` (horas após o ACK), a varredura ao final de cada envio ao Discord apaga o `.mp4` e `.cache/discord_<stem>.mp4` dos clipes `no_discord` sem pedido de publicação `pending`/`running` (marcando `status="so_discord"`), mantendo `.txt`, `.descricao.txt` e `clips.json`.
 
@@ -339,7 +365,7 @@ Todo clipe processado por CLI ou worker é indexado em `OUT_DIR/registro.json` (
 | Corrida entre worker e CLI | Baixo | `flock` + escrita atômica em `registro.json` e skip de clipes com pedido `pending`/`running` |
 
 **Smoke manual recomendado:**
-1. Envie um clipe de ~19 MB no canal configurado para confirmar o limite do servidor (se voltar HTTP 413, defina `CLIPES_DISCORD_MAX_MB=10`).
+1. Envie um clipe de ~19 MB no canal configurado para confirmar o limite do servidor (se voltar HTTP 413, reduza `CLIPES_DISCORD_MAX_MB`).
 2. Rode uma clipagem curta com `CLIPES_RETENCAO_H=0`, confirme no `registro.json` o `status="so_discord"` e a remoção do `.mp4` local (mantendo `.txt` e `clips.json`).
 3. Envie `publicar <clip_id>` (YouTube privado) e verifique que o download temporário em `.tmp_publicar/` publica com o mesmo SHA-256 e é removido em seguida.
 
