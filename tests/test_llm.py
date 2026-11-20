@@ -333,7 +333,7 @@ def test_sanitize_hashtags_cleans_hyphens_blocks_fyp_and_fills_niche():
     raw = ["#gta-rp", "#FYP", "#viral", "#Reels", "#foryou", "#GTA-RP", "#shorts", "invalid tag!"]
     tags = sanitize_hashtags(raw, channel="Gaules", title="Jogando GTA RP na live")
 
-    assert 3 <= len(tags) <= 5
+    assert 1 <= len(tags) <= 3
     assert "#gtarp" in [t.lower() for t in tags]
     assert "#gaules" in [t.lower() for t in tags]
     for tag in tags:
@@ -342,10 +342,24 @@ def test_sanitize_hashtags_cleans_hyphens_blocks_fyp_and_fills_niche():
     # Case-insensitive deduplication
     assert len({t.lower() for t in tags}) == len(tags)
 
-    # When LLM returns only forbidden tags, deterministic niche bank fills 3..5
+    # Só tags específicas: sem padding genérico quando o LLM manda só banidas
     only_bad = sanitize_hashtags(["#fyp", "#viral", "#foryoupage"], channel="Podpah", title="Podcast ao vivo")
-    assert 3 <= len(only_bad) <= 5
     assert "#podpah" in [t.lower() for t in only_bad]
+    assert not {"#cortes", "#livesbr", "#clipsbr"} & {t.lower() for t in only_bad}
+
+
+def test_sanitize_hashtags_drops_generic_banned_and_respects_clipes_hashtags(monkeypatch):
+    from clipes.llm import sanitize_hashtags
+
+    monkeypatch.delenv("CLIPES_HASHTAGS", raising=False)
+    generic = ["#conflito", "#reacao", "#live", "#livesbr", "#twitchtvgaules", "#twitchbr", "#cortes", "#clipsbr"]
+    assert sanitize_hashtags(generic + ["#gtarp"], channel="Gaules", title="Live de GTA RP") == ["#gtarp", "#gaules"]
+
+    specific = ["#a1", "#b2", "#c3", "#d4", "#e5", "#f6"]
+    assert len(sanitize_hashtags(specific, channel="")) == 3  # padrão CLIPES_HASHTAGS=3
+
+    monkeypatch.setenv("CLIPES_HASHTAGS", "5")
+    assert len(sanitize_hashtags(specific, channel="")) == 5
 
 
 def test_format_three_line_caption_with_and_without_parts():
@@ -355,28 +369,29 @@ def test_format_three_line_caption_with_and_without_parts():
         hook="Gaules perde tudo no último round!\nE ri muito",
         channel="Gaules",
         url="https://twitch.tv/gaules",
-        hashtags=["#gaules", "#cs2br", "#cortes"],
+        hashtags=["#gaules", "#cs2br", "#gtarp"],
         part_index=1,
         part_total=1,
     )
     lines_single = cap_single.splitlines()
     assert len(lines_single) == 3
     assert lines_single[0] == "Gaules perde tudo no último round! E ri muito"
-    assert lines_single[1] == "Crédito: Gaules · Live completa: https://twitch.tv/gaules"
-    assert "Parte" not in lines_single[1]
-    assert lines_single[2] == "#gaules #cs2br #cortes"
+    assert lines_single[1] == "Crédito: Gaules"
+    assert "http" not in cap_single
+    assert lines_single[2] == "#gaules #cs2br #gtarp"
 
     cap_part = format_three_line_caption(
         hook="História completa do assalto!",
         channel="Podpah",
         url="https://youtube.com/watch?v=abc",
-        hashtags=["#podpah", "#podcastbr", "#cortes"],
+        hashtags=["#podpah", "#podcastbr", "#gtarp"],
         part_index=2,
         part_total=3,
     )
     lines_part = cap_part.splitlines()
     assert len(lines_part) == 3
-    assert lines_part[1] == "Crédito: Podpah · Live completa: https://youtube.com/watch?v=abc · Parte 2/3"
+    assert lines_part[1] == "Crédito: Podpah · Parte 2/3"
+    assert "http" not in cap_part
 
 
 def _make_ing(tmp_path: Path, title: str = "Live de GTA RP", url: str = "https://www.twitch.tv/gaules"):
@@ -463,7 +478,7 @@ def test_enrich_clips_batch_single_session_truncation_and_fallback(tmp_path: Pat
     assert c_good.llm_score == 2.5
     assert c_good.llm_reason == "Curto mas engraçado."
     assert len(c_good.caption.splitlines()) == 3
-    assert 3 <= len(c_good.hashtags) <= 5
+    assert 1 <= len(c_good.hashtags) <= 3
     assert "#gtarp" in [t.lower() for t in c_good.hashtags]
     assert "#fyp" not in [t.lower() for t in c_good.hashtags]
 
@@ -475,7 +490,44 @@ def test_enrich_clips_batch_single_session_truncation_and_fallback(tmp_path: Pat
     assert c_silent.llm_score is None
     assert c_silent.title_source == "heuristic_fallback"
     assert len(c_silent.caption.splitlines()) == 3
-    assert 3 <= len(c_silent.hashtags) <= 5
+    assert 1 <= len(c_silent.hashtags) <= 3
+
+
+def test_enrich_caption_sem_url_linha1_diferente_do_hook_e_descricao_com_link(tmp_path: Path, monkeypatch):
+    from contextlib import contextmanager
+    from clipes import llm
+    from clipes.models import SnappedClip
+
+    ing = _make_ing(tmp_path)
+    clip = SnappedClip(peak=11.0, start=5.0, end=35.0, score=0.80, text="Caralho, olha isso!")
+
+    @contextmanager
+    def fake_session(*args, **kwargs):
+        yield "http://127.0.0.1:19999"
+
+    def fake_complete(prompt: str, **kwargs):
+        return {
+            "titulo": "Olha isso aqui!",
+            "gancho": "Momento insano da live!",
+            "gancho_topo": "Momento insano da live!",  # mesmo texto que o gancho -> hook da tela
+            "hashtags": ["#conflito", "#reacao", "#live", "#twitchtvgaules", "#cortes"],
+            "nota": 8.0,
+            "motivo": "Teste.",
+            "descricao_longa": "Caralho, olha isso! " * 8,
+        }
+
+    monkeypatch.setattr(llm, "llama_server_session", fake_session)
+    monkeypatch.setattr(llm, "complete", fake_complete)
+
+    llm.enrich_clips_with_llm([clip], [], ing, enabled=True)
+
+    lines = clip.caption.splitlines()
+    assert "http" not in clip.caption
+    assert lines[0] == clip.title  # gancho repetiu o hook da tela -> usa o título
+    assert lines[0] != clip.hook_top
+    assert lines[1] == "Crédito: gaules"
+    assert lines[2] == "#gaules #gtarp"  # genéricas e banidas fora; só específicas
+    assert f"Live completa: {ing.url}" in clip.description_long  # YouTube mantém o link
 
 
 def test_enrich_clips_tie_breaks_close_scores_and_preserves_group_order(tmp_path: Path, monkeypatch):
@@ -559,7 +611,7 @@ def test_enrich_clips_no_llm_and_server_failure_fallback(tmp_path: Path, monkeyp
     assert c1.llm_score is None
     assert c1.title_source == "heuristic_fallback"
     assert len(c1.caption.splitlines()) == 3
-    assert 3 <= len(c1.hashtags) <= 5
+    assert 1 <= len(c1.hashtags) <= 3
 
     # 2. Server failure when enabled=True degrades cleanly without raising
     c2 = SnappedClip(peak=10.5, start=5.0, end=35.0, score=0.9, text="Olha isso!")
@@ -570,7 +622,7 @@ def test_enrich_clips_no_llm_and_server_failure_fallback(tmp_path: Path, monkeyp
     assert c2.llm_score is None
     assert c2.title_source == "heuristic_fallback"
     assert len(c2.caption.splitlines()) == 3
-    assert 3 <= len(c2.hashtags) <= 5
+    assert 1 <= len(c2.hashtags) <= 3
 
 
 def test_hook_validation_and_prompt_data_delimiting(tmp_path: Path, monkeypatch):

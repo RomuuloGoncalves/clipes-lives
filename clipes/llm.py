@@ -178,7 +178,15 @@ FORBIDDEN_HASHTAGS: frozenset[str] = frozenset({
     "#reels",
     "#shorts",
     "#explore",
+    "#twitchbr",
+    "#live",
+    "#livesbr",
+    "#conflito",
+    "#reacao",
+    "#cortes",
+    "#clipsbr",
 })
+_FORBIDDEN_HASHTAG_PREFIXES: tuple[str, ...] = ("#twitchtv",)
 
 NICHE_HASHTAGS: dict[str, str] = {
     "podpah": "#podpah",
@@ -196,11 +204,7 @@ NICHE_HASHTAGS: dict[str, str] = {
     "minecraft": "#minecraftbr",
     "react": "#react",
     "podcast": "#podcastbr",
-    "twitch": "#twitchbr",
-    "live": "#livesbr",
 }
-
-_DEFAULT_FALLBACK_TAGS = ("#cortes", "#livesbr", "#clipsbr")
 
 
 def _free_port(host: str = "127.0.0.1") -> int:
@@ -498,17 +502,26 @@ def validate_hook(
     return validate_no_hallucinated_entities(clean, transcript, reference_text)
 
 
+def _hashtag_limit() -> int:
+    """CLIPES_HASHTAGS: quantas hashtags específicas manter (1..5, padrão 3)."""
+    try:
+        return min(5, max(1, int(os.environ.get("CLIPES_HASHTAGS", "3"))))
+    except ValueError:
+        return 3
+
+
 def sanitize_hashtags(
     raw_tags: list[str],
     channel: str = "",
     title: str = "",
 ) -> list[str]:
-    """Clean hyphens, drop blocklisted tags, enforce regex, and pad to 3..5 unique tags."""
+    """Limpa hífen, descarta banidas, valida regex e devolve até CLIPES_HASHTAGS específicas (sem padding genérico)."""
+    limit = _hashtag_limit()
     out: list[str] = []
     seen: set[str] = set()
 
     def _add(raw: str) -> None:
-        if len(out) >= 5:
+        if len(out) >= limit:
             return
         tag = raw.strip().replace("-", "")
         if not tag:
@@ -516,7 +529,7 @@ def sanitize_hashtags(
         if not tag.startswith("#"):
             tag = f"#{tag}"
         key = tag.lower()
-        if key in seen or key in FORBIDDEN_HASHTAGS:
+        if key in seen or key in FORBIDDEN_HASHTAGS or key.startswith(_FORBIDDEN_HASHTAG_PREFIXES):
             return
         if not _HASHTAG_RE.match(tag):
             return
@@ -526,7 +539,7 @@ def sanitize_hashtags(
     for raw in raw_tags:
         _add(str(raw))
 
-    if len(out) < 5 and channel:
+    if channel:
         ch_clean = re.sub(r"[^a-zA-Z0-9_À-ÿ]", "", channel.lstrip("@")).lower()
         if ch_clean:
             _add(f"#{ch_clean}")
@@ -534,7 +547,7 @@ def sanitize_hashtags(
     context_folded = _fold(f"{channel} {title}")
     context_tokens = set(re.findall(r"[a-z0-9_-]+", context_folded))
     for kw, niche_tag in NICHE_HASHTAGS.items():
-        if len(out) >= 5:
+        if len(out) >= limit:
             break
         if " " in kw:
             if kw in context_folded:
@@ -542,12 +555,21 @@ def sanitize_hashtags(
         elif kw in context_tokens:
             _add(niche_tag)
 
-    for default_tag in _DEFAULT_FALLBACK_TAGS:
-        if len(out) >= 3:
-            break
-        _add(default_tag)
+    return out
 
-    return out[:5]
+
+def _norm_text(text: str) -> str:
+    """Forma comparável: sem acento, minúscula, só palavras separadas por espaço."""
+    return " ".join(re.findall(r"\w+", _fold(text)))
+
+
+def _pick_caption_hook(gancho: str, title: str, on_screen: str) -> str:
+    """Linha 1 da caption: o gancho; o título se o gancho repetir o hook da tela."""
+    screen = _norm_text(on_screen)
+    for cand in (gancho, title):
+        if cand and _norm_text(cand) != screen:
+            return cand
+    return gancho or title  # ponytail: título curto == hook da tela; sem terceira opção
 
 
 def format_three_line_caption(
@@ -558,9 +580,12 @@ def format_three_line_caption(
     part_index: int = 1,
     part_total: int = 1,
 ) -> str:
-    """Format exact 3-line caption: hook / credit+url(+part) / hashtags."""
+    """Caption de 3 linhas sem URL (TikTok não a torna clicável): hook / Crédito: canal (+ parte) / hashtags.
+
+    `url` não entra na caption; fica na assinatura porque cli.py ainda a passa (o link vai na descrição do YouTube).
+    """
     line1 = " ".join(hook.split()) or "Confira esse momento!"
-    credit = f"Crédito: {channel or 'streamer'} · Live completa: {url}"
+    credit = f"Crédito: {channel or 'streamer'}"
     if part_total > 1:
         credit += f" · Parte {part_index}/{part_total}"
     line3 = " ".join(hashtags)
@@ -731,11 +756,11 @@ def _apply_fallback(
     clip.llm_reason = ""
     part_index = int(getattr(clip, "part_index", 1) or 1)
     part_total = int(getattr(clip, "part_total", 1) or 1)
+    clip.hook_top = pick_hook_top("", clip.title, clip_source_text, clip_ref_text)
     clip.caption = format_three_line_caption(
-        clip.title, channel, ing.url, clip.hashtags,
+        _pick_caption_hook("", clip.title, clip.hook_top), channel, ing.url, clip.hashtags,
         part_index=part_index, part_total=part_total,
     )
-    clip.hook_top = pick_hook_top("", clip.title, clip_source_text, clip_ref_text)
     paragraph = long_paragraph_fallback(clip)
     if paragraph:
         clip.description_source = "fallback"
@@ -873,14 +898,14 @@ def enrich_clips_with_llm(
             clip.llm_reason = " ".join(str(res.get("motivo", "")).split())[:120]
 
             raw_hook = " ".join(str(res.get("gancho", "")).split())
-            hook = raw_hook if validate_hook(raw_hook, clip.text, clip_ref_text) else clip.title
+            gancho = raw_hook if validate_hook(raw_hook, clip.text, clip_ref_text) else ""
             part_index = int(getattr(clip, "part_index", 1) or 1)
             part_total = int(getattr(clip, "part_total", 1) or 1)
+            clip.hook_top = pick_hook_top(str(res.get("gancho_topo", "")), clip.title, clip.text, clip_ref_text)
             clip.caption = format_three_line_caption(
-                hook, channel, ing.url, clip.hashtags,
+                _pick_caption_hook(gancho, clip.title, clip.hook_top), channel, ing.url, clip.hashtags,
                 part_index=part_index, part_total=part_total,
             )
-            clip.hook_top = pick_hook_top(str(res.get("gancho_topo", "")), clip.title, clip.text, clip_ref_text)
             paragraph, clip.description_source = pick_long_description(
                 str(res.get("descricao_longa", "")), clip, clip_ref_text
             )

@@ -105,9 +105,10 @@ def test_cli_no_llm_flag_fills_deterministic_metadata_fast(tmp_path: Path, monke
     assert c0["description_long"].startswith("Olha esse clutch!\n\nOlha esse clutch!")
     assert c0["llm_score"] is None
     assert c0["llm_reason"] == ""
-    assert 3 <= len(c0["hashtags"]) <= 5
+    assert 1 <= len(c0["hashtags"]) <= 3
     assert len(c0["caption"].splitlines()) == 3
     assert "twitch.tv/gaules" in c0["caption"].splitlines()[1]
+    assert "http" not in c0["caption"]
 
     txt_path = ing.out_dir / "clip_01_olha-esse-clutch.txt"
     assert txt_path.is_file()
@@ -261,7 +262,7 @@ def test_cli_llm_failure_falls_back_deterministically_without_aborting(tmp_path:
     assert c0["description_source"] == "fallback"
     assert c0["description_long"]
     assert c0["llm_score"] is None
-    assert 3 <= len(c0["hashtags"]) <= 5
+    assert 1 <= len(c0["hashtags"]) <= 3
     assert len(c0["caption"].splitlines()) == 3
     assert (ing.out_dir / "clip_01_nossa-senhora.txt").is_file()
     assert (ing.out_dir / "clip_01_nossa-senhora.descricao.txt").read_text(encoding="utf-8") == c0["description_long"]
