@@ -354,8 +354,8 @@ def _parse_alvo(raw: Any) -> dict[str, str] | None:
 
 # ---- VOD parsing ----
 
-_TWITCH_VOD_RE = re.compile(r"(?:www\.|m\.)?twitch\.tv/(?:videos?/|[^/]+/videos?/|clips?/|[^/]+/clip/)(\d+|[a-zA-Z0-9_-]+)")
-_KICK_VOD_RE = re.compile(r"(?:www\.|m\.)?kick\.com/(?:video/|[^/]+/videos?/)(\d+|[a-zA-Z0-9_-]+)")
+_TWITCH_VOD_RE = re.compile(r"(?:www\.|m\.)?twitch\.tv/(?:videos?/|[^/]+/videos?/|clips?/|[^/]+/clip/)([a-zA-Z0-9_-]+)")
+_KICK_VOD_RE = re.compile(r"(?:www\.|m\.)?kick\.com/(?:video/|[^/]+/videos?/)([a-zA-Z0-9_-]+)")
 _KICK_CLIP_RE = re.compile(r"(?:www\.|m\.)?kick\.com/([^/?#]+)/clips/([A-Za-z0-9_-]+)")
 _YT_SHORTS_RE = re.compile(r"(?:www\.|m\.)?youtube\.com/shorts/([A-Za-z0-9_-]{4,32})")
 

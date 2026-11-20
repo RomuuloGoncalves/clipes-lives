@@ -769,3 +769,27 @@ def test_html_config_global_em_modal():
     assert "Layout dos clipes (global)" not in html
     assert '<section id="config-global"' not in html
     assert 'id="aviso-privado"' in html
+
+
+# ---- VOD Kick: id/UUID completo na URL canonica
+_KICK_UUID = "01a1f185-4348-7c9a-8921-74f851441f15"
+
+
+@pytest.mark.parametrize("entrada", [
+    f"https://kick.com/mucalol/videos/{_KICK_UUID}",
+    f"https://kick.com/video/{_KICK_UUID}",
+    f"https://www.kick.com/video/{_KICK_UUID}",
+    f"https://m.kick.com/mucalol/videos/{_KICK_UUID}",
+    f"https://kick.com/video/{_KICK_UUID}?t=10",
+    f"https://kick.com/mucalol/videos/{_KICK_UUID}/",
+])
+def test_vod_kick_canonica_mantem_uuid_inteiro(entrada):
+    alvo = _nucleo._parse_vod_alvo(entrada)
+    assert alvo["plataforma"] == "kick" and alvo["url"] == f"https://kick.com/video/{_KICK_UUID}"
+
+
+def test_vod_kick_id_numerico_e_criar_alvo(db):
+    assert _nucleo._parse_vod_alvo("https://kick.com/video/12345")["url"] == "https://kick.com/video/12345"
+    code, body = _nucleo.criar_alvo(db, f"https://kick.com/mucalol/videos/{_KICK_UUID}", "", NOW)
+    assert code == 201 and body["tipo"] == "vod"
+    assert db.alvos.find_one({"_id": body["_id"]})["url"] == f"https://kick.com/video/{_KICK_UUID}"
