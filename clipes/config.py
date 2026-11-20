@@ -487,6 +487,7 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
 _SCHEDULE_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 _INT_STR_RE = re.compile(r"^-?[0-9]+$")
 _BOOT_ENV: dict[str, str] = {k: os.environ[k] for k in CONFIG_SCHEMA if k in os.environ}
+_APPLIED_REMOTE_KEYS: set[str] = set()
 
 
 def _is_forbidden_key(key: str) -> bool:
@@ -661,11 +662,19 @@ def apply_remote_config(
 
     for key in CONFIG_SCHEMA:
         if key in applied:
+            if key not in _APPLIED_REMOTE_KEYS:
+                if key in os.environ:
+                    _BOOT_ENV[key] = os.environ[key]
+                else:
+                    _BOOT_ENV.pop(key, None)
             os.environ[key] = applied[key]
-        elif key in _BOOT_ENV:
-            os.environ[key] = _BOOT_ENV[key]
-        else:
-            os.environ.pop(key, None)
+            _APPLIED_REMOTE_KEYS.add(key)
+        elif key in _APPLIED_REMOTE_KEYS:
+            _APPLIED_REMOTE_KEYS.discard(key)
+            if key in _BOOT_ENV:
+                os.environ[key] = _BOOT_ENV[key]
+            else:
+                os.environ.pop(key, None)
 
     resolved_alias = (alias or "").strip() or pc_alias(out_root)
     cache_file = _cache_path(out_root, resolved_alias)
