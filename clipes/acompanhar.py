@@ -1625,7 +1625,10 @@ class Supervisor:
         argv = [url, "--out-dir", str(out_root), "--max-dur", str(max_dur)]
         if self.min_dur is not None:
             argv.extend(["--min-dur", str(self.min_dur)])
-        return int(cli.main(argv))
+        try:
+            return int(cli.main(argv))
+        except SystemExit as exc:  # erro de argumento do cli nao pode matar o servico
+            raise RuntimeError(f"argumentos invalidos do cli (codigo {exc.code})") from None
 
     def _check_vod_policy(self, vod: dict[str, Any], url: str, probe_fn: Callable[[str], dict[str, Any]]) -> str | None:
         host = urllib.parse.urlparse(url).hostname or ""

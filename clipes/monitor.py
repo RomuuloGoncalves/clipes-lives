@@ -910,11 +910,15 @@ def run_local_pipeline(job_dir: Path, out_root: Path) -> dict[str, Any]:
                 we, vs, md = (float(job_meta[k]) for k in ("window_end", "video_start", "max_dur"))
                 pad = md / 2
                 hi = (we if job_meta["last"] else we - pad) - vs
-                cli_args.extend(["--own-range", f"{we - LIVE_STEP_S - pad - vs},{hi}"])
+                # forma com "=": lo negativo (inicio de live) nao pode virar outra opcao no argparse
+                cli_args.append(f"--own-range={we - LIVE_STEP_S - pad - vs},{hi}")
             except (KeyError, TypeError, ValueError):
                 pass  # job VOD/antigo: sem filtro
 
-    args = cli.build_parser().parse_args(cli_args)
+    try:
+        args = cli.build_parser().parse_args(cli_args)
+    except SystemExit as exc:  # argparse sai com SystemExit (nao e Exception): nao pode matar o servico
+        raise RuntimeError(f"argumentos invalidos do cli (codigo {exc.code})") from None
     original_ingest = cli.ingest
     cli.ingest = ingest_job
     try:

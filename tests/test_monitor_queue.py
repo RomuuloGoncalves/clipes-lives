@@ -300,3 +300,58 @@ def test_run_local_pipeline_passa_own_range_da_regiao_dona(tmp_path, monkeypatch
     (tmp_path / "out" / "old").mkdir()
     monitor.run_local_pipeline(old, tmp_path / "out")
     assert seen[-1].own_range is None
+
+
+def _fake_ingest_local(monkeypatch):
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "clipes.ingest.ingest_local",
+        lambda jd, root, chat: SimpleNamespace(video_id=jd.name, out_dir=(root / jd.name).resolve()),
+    )
+
+
+def test_run_local_pipeline_own_range_negativo_e_parseavel(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    seen = []
+
+    def fake_run_pipeline(args):
+        seen.append(args)
+        ing = cli.ingest(args.url, Path(args.out_dir), args.live_minutes, args.chat)
+        (ing.out_dir / "clips.json").write_text(json.dumps({"clips": []}), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    _fake_ingest_local(monkeypatch)
+    (tmp_path / "out" / "j").mkdir(parents=True)
+    job = tmp_path / "j"
+    job.mkdir()
+    (job / "job.json").write_text(json.dumps(
+        {"window_start": 0.0, "window_end": 100.0, "video_start": 0.0, "max_dur": 60.0, "last": False}))
+    monitor.run_local_pipeline(job, tmp_path / "out")  # parser real: antes dava SystemExit(2)
+    lo, hi = seen[-1].own_range
+    assert lo == 100.0 - monitor.LIVE_STEP_S - 30.0 and lo < 0
+    assert hi == 70.0
+
+
+def test_worker_argv_invalido_do_cli_rejeita_job_e_segue(tmp_path, monkeypatch):
+    _fake_ingest_local(monkeypatch)
+    queue = monitor.DiskQueue(tmp_path / "queue")
+    queue.enqueue(stage_job(tmp_path, channel="boom", z=9.0))
+    queue.enqueue(stage_job(tmp_path, channel="fine", z=1.0))
+    parser_cls = cli.build_parser().__class__
+    real_parse = parser_cls.parse_args
+
+    def parse(self, argv=None, *a, **k):  # argv invalido de verdade para "boom": argparse faz SystemExit(2)
+        if argv and "boom" in argv[0]:
+            argv = [*argv, "--own-range"]
+        return real_parse(self, argv, *a, **k)
+
+    monkeypatch.setattr(parser_cls, "parse_args", parse)
+    monkeypatch.setattr(cli, "run_pipeline", lambda a: 1)
+    policy = monitor.ChannelPolicy()
+    assert monitor.run_worker_step(queue, tmp_path / "out", policy)
+    assert monitor.run_worker_step(queue, tmp_path / "out", policy)  # worker continua vivo
+    failed = json.loads((queue.root / "rejected" / "boom_1763380000" / "job.json").read_text())
+    assert failed["reject_reason"] == "pipeline_error" and "argumentos invalidos" in failed["error"]
