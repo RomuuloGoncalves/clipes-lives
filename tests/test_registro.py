@@ -421,3 +421,49 @@ def test_sync_mongo_fora_do_lock_sem_perder_updates(tmp_path: Path):
     assert lock_free_in_mongo == [True]
     assert reg.get("c_first") is not None and reg.get("c_first")["mongo_synced"] is True
     assert reg.get("c_other") is not None and reg.get("c_other")["mongo_synced"] is False
+
+
+def _pub_rec(out: Path, cid: str, canal: str = "@gaules", **extra: Any) -> Registro:
+    reg = Registro(out)
+    rec, _ = _make_sample_rec(out, cid)
+    rec["canal"] = canal
+    reg.upsert(rec)
+    reg.marcar(cid, publicacoes={"youtube": {"id": "x"}}, **extra)
+    return reg
+
+
+def test_similares_cada_criterio_acha(tmp_path: Path):
+    reg = _pub_rec(tmp_path, "a", inicio_abs=100.0, fim_abs=140.0, texto_hash="h1", phash=0b1111)
+    assert reg.similares("Gaules", 110.0, 150.0) == [("a", "trecho")]  # 30/40 >= 50%
+    assert reg.similares("gaules", 200.0, 240.0, "h1") == [("a", "texto")]
+    assert reg.similares("gaules", 200.0, 240.0, "zz", 0b1110, 6) == [("a", "imagem")]
+    assert reg.similares("gaules", 200.0, 240.0, "zz", 0b0, 6) == [("a", "imagem")]
+    assert reg.similares("gaules", 130.0, 170.0, "zz") == []  # 10/40 < 50%
+
+
+def test_similares_canal_diferente_pendente_e_limite_zero(tmp_path: Path):
+    reg = _pub_rec(tmp_path, "a", canal="@outro", inicio_abs=100.0, fim_abs=140.0, texto_hash="h1", phash=5)
+    assert reg.similares("gaules", 100.0, 140.0, "h1", 5) == []
+    reg.marcar("a", canal="gaules")
+    assert reg.similares("gaules", 200.0, 240.0, "zz", 5, 0) == []  # limite 0 ignora imagem
+    assert reg.similares("gaules", 200.0, 240.0, "zz", 5, 6) == [("a", "imagem")]
+    reg.marcar("a", publicacoes={})
+    assert reg.similares("gaules", 100.0, 140.0) == []  # nem publicado nem pendente
+    reg.marcar("a", publicacao_pendente=True)
+    assert reg.similares("gaules", 100.0, 140.0) == [("a", "trecho")]
+
+
+def test_registrar_metricas_merge_sem_apagar_outra_plataforma(tmp_path: Path):
+    db = mongomock.MongoClient().db
+    reg = Registro(tmp_path, db)
+    rec, _ = _make_sample_rec(tmp_path)
+    reg.upsert(rec)
+    reg.registrar_metricas("vid1_c01", "youtube", {"views": 10, "curtidas": 2}, "manual")
+    reg.registrar_metricas("vid1_c01", "tiktok", {"views": 7}, "csv")
+    out = reg.registrar_metricas("vid1_c01", "youtube", {"views": 20}, "csv")
+    m = out["metricas"]
+    assert m["youtube"]["views"] == 20 and m["youtube"]["curtidas"] == 2
+    assert m["youtube"]["fonte"] == "csv" and m["youtube"]["atualizado_em"]
+    assert m["tiktok"]["views"] == 7
+    assert db.clips.find_one({"_id": "vid1_c01"})["metricas"]["tiktok"]["views"] == 7
+    assert reg.registrar_metricas("nao_existe", "youtube", {}, "x") is None

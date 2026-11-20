@@ -182,6 +182,15 @@ def _next_rev(rec: Any) -> int:
         return 1
 
 
+def _phash_int(v: Any) -> int | None:
+    if v is None or v == "":
+        return None
+    try:
+        return int(v, 16) if isinstance(v, str) else int(v)
+    except ValueError:
+        return None
+
+
 def _is_duplicate_key(exc: Exception) -> bool:
     return type(exc).__name__ == "DuplicateKeyError"
 
@@ -449,6 +458,62 @@ class Registro:
                 if not (_is_mongo_error(exc) or isinstance(exc, OSError)):
                     raise
         return None
+
+    def similares(
+        self,
+        canal: Any,
+        inicio_abs: float,
+        fim_abs: float,
+        texto_hash: str = "",
+        phash: int | str | None = None,
+        phash_max: int = 6,
+        excluir: str = "",
+    ) -> list[tuple[str, str]]:
+        """Clipes do mesmo canal ja publicados/pendentes parecidos: `(clip_id, criterio)`.
+
+        Criterios: `trecho` (sobreposicao >= 50% do trecho absoluto), `texto` (mesmo texto_hash),
+        `imagem` (distancia de phash <= phash_max; 0 desliga). Pendente = `publicacao_pendente` truthy.
+        """
+        data = _read_json(self.path, None)
+        clips = data.get("clips") if isinstance(data, dict) else None
+        if not isinstance(clips, dict):
+            return []
+        canal_n = _normalize_channel(canal)
+        dur = float(fim_abs) - float(inicio_abs)
+        ph = _phash_int(phash)
+        out: list[tuple[str, str]] = []
+        for cid, rec in clips.items():
+            if not isinstance(rec, dict) or cid == excluir or rec.get("canal") != canal_n:
+                continue
+            if not (rec.get("publicacoes") or rec.get("publicacao_pendente")):
+                continue
+            try:
+                inter = min(float(fim_abs), float(rec["fim_abs"])) - max(float(inicio_abs), float(rec["inicio_abs"]))
+            except (KeyError, TypeError, ValueError):
+                inter = 0.0
+            rph = _phash_int(rec.get("phash"))
+            if dur > 0 and inter >= 0.5 * dur:
+                out.append((cid, "trecho"))
+            elif texto_hash and rec.get("texto_hash") == texto_hash:
+                out.append((cid, "texto"))
+            elif phash_max > 0 and ph is not None and rph is not None and (ph ^ rph).bit_count() <= phash_max:
+                out.append((cid, "imagem"))
+        return out
+
+    def registrar_metricas(
+        self, clip_id: str, plataforma: str, dados: dict[str, Any], fonte: str
+    ) -> dict[str, Any] | None:
+        """Merge `dados` em `metricas.<plataforma>` (outras plataformas/campos intactos)."""
+        rec = self.get(clip_id)
+        if rec is None:
+            return None
+        metricas = {k: dict(v) if isinstance(v, dict) else v for k, v in (rec.get("metricas") or {}).items()}
+        atual = dict(metricas.get(plataforma) or {})
+        atual.update(dados)
+        atual["fonte"] = fonte
+        atual["atualizado_em"] = time.time()
+        metricas[plataforma] = atual
+        return self.marcar(clip_id, metricas=metricas)
 
     def buscar(self, texto: str, limite: int = 10) -> list[dict[str, Any]]:
         """Search clips where all normalized tokens appear in titulo+hashtags+canal+legenda, newest first."""
