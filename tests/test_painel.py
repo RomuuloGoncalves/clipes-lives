@@ -697,3 +697,37 @@ def test_salvar_config_global_aceita_chaves_globais_antiflop_e_recusa_nao_globai
     assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_CPU_THREADS": "4"}}, NOW)[0] == 400
     assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_DUR_MAX": "12"}}, NOW)[0] == 400
     assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_DUR_MIN": "30", "CLIPES_DUR_MAX": "30"}}, NOW)[0] == 400
+
+
+# ---- T17: clipes recentes e visibilidade efetiva no status
+def test_status_clips_recentes_campos_e_ordem(db):
+    db.clips.insert_many([
+        {"_id": "antigo", "titulo": "Velho", "canal": "c1", "gate": "ok", "criado_em": NOW - timedelta(days=1),
+         "publicacoes": {}, "metricas": None, "arquivo": "/segredo/local.mp4"},
+        {"_id": "novo", "titulo": "Novo", "canal": "c2", "gate": "bloqueado", "criado_em": NOW,
+         "publicacoes": {"youtube": {"privacidade": "public", "url": "https://yt.invalid/x", "id": "9", "em": NOW}},
+         "metricas": {"views": 10}},
+    ])
+    r = _nucleo.status(db, NOW)
+    assert [c["_id"] for c in r["clips_recentes"]] == ["novo", "antigo"]
+    assert r["clips_recentes"][0] == {
+        "_id": "novo", "titulo": "Novo", "canal": "c2", "gate": "bloqueado",
+        "publicacoes": {"youtube": {"privacidade": "public", "url": "https://yt.invalid/x"}},
+        "metricas": {"views": 10},
+    }
+    assert "arquivo" not in json.dumps(r["clips_recentes"][1])
+    json.dumps(r)
+
+
+def test_status_clips_recentes_limite_50_e_vazio(db):
+    assert _nucleo.status(db, NOW)["clips_recentes"] == []
+    db.clips.insert_many([{"_id": f"c{i}", "criado_em": NOW + timedelta(seconds=i)} for i in range(60)])
+    r = _nucleo.status(db, NOW)
+    assert len(r["clips_recentes"]) == 50
+    assert r["clips_recentes"][0]["_id"] == "c59"
+
+
+def test_status_visibilidade_efetiva_padrao_e_global(db):
+    assert _nucleo.status(db, NOW)["visibilidade_efetiva"] == "padrao"
+    _nucleo.salvar_config_global(db, {"config": {"CLIPES_VISIBILIDADE": "private"}}, NOW)
+    assert _nucleo.status(db, NOW)["visibilidade_efetiva"] == "private"

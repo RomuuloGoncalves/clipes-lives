@@ -76,6 +76,8 @@ class StatusPayload(TypedDict):
     jobs_24h: dict[str, int]
     config_schema: dict[str, dict[str, Any]]
     config_global: dict[str, str]
+    clips_recentes: list[dict[str, Any]]
+    visibilidade_efetiva: str
 
 
 class _Headers(Protocol):
@@ -209,6 +211,22 @@ def status(db: Any, now: datetime, beat_s: float = BEAT_S) -> StatusPayload:
     jobs: dict[str, int] = {}
     for j in db.jobs.find({"updated_at": {"$gte": now - timedelta(hours=24)}}):
         jobs[j["status"]] = jobs.get(j["status"], 0) + 1
+    config_global = _config_str_dict((db.config_global.find_one({"_id": "global"}) or {}).get("config"))
+    # Clipes recentes: so campos de exibicao (sem caminhos locais nem segredos)
+    clips_recentes: list[dict[str, Any]] = []
+    for c in db.clips.find().sort("criado_em", -1).limit(50):
+        pubs = c.get("publicacoes") if isinstance(c.get("publicacoes"), dict) else {}
+        clips_recentes.append({
+            "_id": c["_id"],
+            "titulo": c.get("titulo"),
+            "canal": c.get("canal"),
+            "gate": c.get("gate"),
+            "publicacoes": {
+                plat: {"privacidade": p.get("privacidade"), "url": p.get("url")}
+                for plat, p in pubs.items() if isinstance(p, dict)
+            },
+            "metricas": c.get("metricas"),
+        })
     return {
         "workers": workers,
         "lives": lives,
@@ -216,7 +234,9 @@ def status(db: Any, now: datetime, beat_s: float = BEAT_S) -> StatusPayload:
         "vods_recentes": vods_recentes,
         "jobs_24h": jobs,
         "config_schema": CONFIG_SCHEMA,
-        "config_global": _config_str_dict((db.config_global.find_one({"_id": "global"}) or {}).get("config")),
+        "config_global": config_global,
+        "clips_recentes": clips_recentes,
+        "visibilidade_efetiva": config_global.get("CLIPES_VISIBILIDADE", "padrao"),
     }
 
 
