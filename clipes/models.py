@@ -110,6 +110,11 @@ class SnappedClip:
     description_long: str = ""
     description_source: str = ""
     cabe_discord: bool = True
+    translated_cues: list[Any] | None = None
+    translated_text: str = ""
+    legenda_traduzida: bool = False
+    legenda_idioma: str = ""
+    legenda_fonte: str = "original"
 
     @property
     def duration(self) -> float:
