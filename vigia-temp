@@ -7,6 +7,7 @@ OUT_DIR="${OUT_DIR:-$ROOT/out}"
 LOG="${LOG:-$OUT_DIR/.temp.log}"
 
 ler_temp() {
+  TEMP=""
   t=""
   for h in "$SYSFS_ROOT"/class/hwmon/hwmon*; do
     [ -r "$h/name" ] || continue
@@ -31,11 +32,21 @@ ler_temp() {
       if [ -z "$t" ] || [ "$v" -gt "$t" ]; then t=$v; fi
     done
   fi
-  printf '%s\n' "${t:-sem-sensor}"
+  if [ -z "$t" ] && grep -qi microsoft "${PROC_ROOT:-/proc}/version" 2>/dev/null; then
+    agora=$(date +%s)
+    if [ -z "${WIN_TS:-}" ] || [ $((agora - WIN_TS)) -ge 15 ]; then
+      WIN_TS=$agora
+      WIN_T=$(timeout 5 powershell.exe -NoProfile -Command '$t=(Get-CimInstance -Namespace root/LibreHardwareMonitor -ClassName Sensor -ErrorAction SilentlyContinue | Where-Object {$_.SensorType -eq "Temperature" -and $_.Name -match "CPU|Core|Package"} | Measure-Object -Property Value -Maximum).Maximum; if (-not $t) {$z=(Get-CimInstance -Namespace root/wmi -ClassName MSAcpi_ThermalZoneTemperature -ErrorAction SilentlyContinue | Measure-Object -Property CurrentTemperature -Maximum).Maximum; if ($z) {$t=$z/10-273.15}}; if ($t) {[int]$t}' 2>/dev/null | tr -d '\r' | head -n1)
+      WIN_T=${WIN_T%%.*}
+      case "$WIN_T" in ''|*[!0-9]*) WIN_T="" ;; esac
+    fi
+    t=$WIN_T
+  fi
+  TEMP="${t:-sem-sensor}"
 }
 
 if [ "${1:-}" = "--check" ]; then
-  ler_temp
+  ler_temp; printf '%s\n' "$TEMP"
   exit 0
 fi
 
@@ -63,7 +74,7 @@ trap 'rm -f "$PIDFILE"; ids=$(docker ps -q --filter label=com.docker.compose.pro
 
 while :; do
   ler_cfg
-  t=$(ler_temp)
+  ler_temp; t=$TEMP
   printf '%s\n' "$t" > "$OUT_DIR/.temp.tmp.$$" && mv -f "$OUT_DIR/.temp.tmp.$$" "$OUT_DIR/.temp"
   if [ "$t" = "sem-sensor" ]; then
     echo "$(date +%T) sem-sensor pausado=$pausado ativo=$ATIVO" >> "$LOG"; sync "$LOG" 2>/dev/null

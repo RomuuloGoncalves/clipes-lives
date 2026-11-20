@@ -388,3 +388,50 @@ def test_vigia_invalido_usa_padroes(tmp_path, conteudo):
         _wait_until(lambda: "88C pausado=1 ativo=1" in _lido(Path(env["LOG"])))
     finally:
         _parar(proc)
+
+
+def _win_env(tmp_path, versao, saida):
+    bin_dir, _ = _setup_fake_bin(tmp_path)
+    sysfs = tmp_path / "sys"
+    sysfs.mkdir(exist_ok=True)
+    proc_root = tmp_path / "proc"
+    _write_file(proc_root / "version", versao)
+    contagem = tmp_path / "ps_calls"
+    _write_file(bin_dir / "powershell.exe", f'#!/bin/sh\necho x >> "{contagem}"\necho "{saida}"\n', mode=0o755)
+    env = _base_env(tmp_path, sysfs, bin_dir)
+    env["PROC_ROOT"] = str(proc_root)
+    return env, contagem
+
+
+WSL = "Linux version 5.15 microsoft-standard-WSL2\n"
+
+
+def test_wsl_le_temperatura_via_powershell(tmp_path):
+    env, _ = _win_env(tmp_path, WSL, "71.5")
+    res = subprocess.run([str(VIGIA_PATH), "--check"], env=env, capture_output=True, text=True, timeout=10)
+    assert res.stdout.strip() == "71"
+
+
+def test_wsl_powershell_vazio_e_sem_sensor(tmp_path):
+    env, _ = _win_env(tmp_path, WSL, "")
+    res = subprocess.run([str(VIGIA_PATH), "--check"], env=env, capture_output=True, text=True, timeout=10)
+    assert res.stdout.strip() == "sem-sensor"
+
+
+def test_sem_microsoft_nao_chama_powershell(tmp_path):
+    env, contagem = _win_env(tmp_path, "Linux version 6.1 generic\n", "71.5")
+    res = subprocess.run([str(VIGIA_PATH), "--check"], env=env, capture_output=True, text=True, timeout=10)
+    assert res.stdout.strip() == "sem-sensor"
+    assert not contagem.exists()
+
+
+def test_wsl_cache_de_15s_evita_chamadas_repetidas(tmp_path):
+    env, contagem = _win_env(tmp_path, WSL, "71.5")
+    proc = subprocess.Popen([str(VIGIA_PATH)], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        log = Path(env["LOG"])
+        _wait_until(lambda: log.exists() and len(log.read_text().splitlines()) >= 6)
+    finally:
+        _parar(proc)
+    assert "71C" in log.read_text()
+    assert len(contagem.read_text().splitlines()) == 1
