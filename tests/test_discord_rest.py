@@ -16,9 +16,9 @@ from clipes.discord_rest import DiscordRest, DiscordRestError
 
 
 class _FakeResponse:
-    def __init__(self, status: int, body: dict | bytes, headers: dict[str, str] | None = None):
+    def __init__(self, status: int, body: dict | list | bytes, headers: dict[str, str] | None = None):
         self.status = status
-        self._raw = json.dumps(body).encode("utf-8") if isinstance(body, dict) else body
+        self._raw = json.dumps(body).encode("utf-8") if isinstance(body, (dict, list)) else body
         self.headers = headers or {}
 
     def read(self) -> bytes:
@@ -450,3 +450,19 @@ def test_edit_404_raises_with_status_code_and_masks_token():
     err_text = str(exc_info.value)
     assert "404" in err_text
     assert token not in err_text
+
+
+def test_list_guild_channels_e_create_text_channel():
+    calls = []
+
+    def fake_urlopen(req, timeout=None):
+        calls.append((req.get_method(), req.full_url, req.data))
+        if req.get_method() == "GET":
+            return _FakeResponse(200, [{"id": "1", "name": "bot-log"}])
+        return _FakeResponse(200, {"id": "2"})
+
+    rest = DiscordRest("tok", urlopen=fake_urlopen, sleep=lambda _: None)
+    assert rest.list_guild_channels("g")[0]["name"] == "bot-log"
+    assert rest.create_text_channel("g", "bot-log")["id"] == "2"
+    assert calls[0][:2] == ("GET", "https://discord.com/api/v10/guilds/g/channels")
+    assert json.loads(calls[1][2]) == {"name": "bot-log", "type": 0}

@@ -968,28 +968,69 @@ def encerrar_cartao_live(
         return False
 
 
+_AVISO_JANELA_S = 60.0
+_aviso_recente: dict[str, list[float]] = {}  # texto -> [ultimo envio, suprimidos]
+
+
+def _canal_log(client: Any) -> str | None:
+    """Canal de avisos: env -> cache `<OUT_DIR>/.discord_log_channel` -> `bot-log` existente -> cria."""
+    env = os.environ.get("DISCORD_LOG_CHANNEL_ID", "").strip()
+    if env:
+        return env
+    cache = config.resolve_out_dir() / ".discord_log_channel"
+    try:
+        cached = cache.read_text(encoding="utf-8").strip()
+    except OSError:
+        cached = ""
+    if cached:
+        return cached
+    guild = os.environ.get("DISCORD_GUILD_ID", "").strip()
+    if not guild:
+        return None
+    try:
+        canal = next((c for c in client.list_guild_channels(guild) if c.get("name") == "bot-log"), None)
+        if canal is None:
+            canal = client.create_text_channel(guild, "bot-log")  # 403 sem Manage Channels
+        cid = str(canal["id"])
+    except Exception:
+        return None
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(cid, encoding="utf-8")
+    except OSError:
+        pass
+    return cid
+
+
 def post_aviso(
     texto: str,
     *,
     discord_client: Any | None = None,
     discord_channel_id: str | None = None,
 ) -> None:
-    """Post a short operational notice to DISCORD_LOG_CHANNEL_ID (fallback DISCORD_CHANNEL_ID)."""
+    """Post an operational notice only to the log channel; falls back to stdout (never DISCORD_CHANNEL_ID)."""
+    now = time.monotonic()
+    rec = _aviso_recente.get(texto)
+    if rec and now - rec[0] <= _AVISO_JANELA_S:
+        rec[1] += 1
+        return
+    suprimidos = int(rec[1]) if rec else 0
+    _aviso_recente[texto] = [now, 0]
+    if suprimidos:
+        texto = f"{texto} (+{suprimidos} repetidos)"
     token = os.environ.get("DISCORD_BOT_TOKEN", "").strip()
     if not token:
-        return
-    target_channel = (
-        (discord_channel_id or "").strip()
-        or os.environ.get("DISCORD_LOG_CHANNEL_ID", "").strip()
-        or os.environ.get("DISCORD_CHANNEL_ID", "").strip()
-    )
-    if not target_channel:
+        print(f"[aviso] {texto}", flush=True)
         return
     client = discord_client
     if client is None:
         from .discord_rest import DiscordRest
 
         client = DiscordRest(token)
+    target_channel = (discord_channel_id or "").strip() or _canal_log(client)
+    if not target_channel:
+        print(f"[aviso] {texto}", flush=True)
+        return
     try:
         client.post(target_channel, texto[:2000])
     except Exception as exc:

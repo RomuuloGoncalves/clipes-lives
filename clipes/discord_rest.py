@@ -315,6 +315,18 @@ class DiscordRest:
             raw, ctype = _encode_multipart(payload, Path(file))
         return self._request(f"/channels/{channel_id}/messages", raw, ctype)
 
+    def list_guild_channels(self, guild_id: str | int) -> list[dict[str, Any]]:
+        """List the channels of a guild."""
+        return self._request(f"/guilds/{guild_id}/channels", method="GET")  # type: ignore[return-value]
+
+    def create_text_channel(self, guild_id: str | int, name: str) -> dict[str, Any]:
+        """Create a text channel (type 0) in a guild."""
+        return self._request(
+            f"/guilds/{guild_id}/channels",
+            json.dumps({"name": name, "type": 0}).encode("utf-8"),
+            "application/json",
+        )
+
     def edit(
         self,
         channel_id: str | int,

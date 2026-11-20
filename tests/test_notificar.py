@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+
+import pytest
 from pathlib import Path
 from typing import Any
 
@@ -235,25 +237,82 @@ def test_notify_falha_mascara_token_no_log_e_nao_levanta(tmp_path, monkeypatch, 
     assert "***" in out
 
 
-def test_post_aviso_com_e_sem_env_e_erro_mascarado(monkeypatch, capsys):
-    client = FakeDiscordClient()
-    monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
-    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
-    post_aviso("sem token", discord_client=client)
-    assert client.posts == []
+class _GuildClient(FakeDiscordClient):
+    def __init__(self, canais=None, create_error=None):
+        super().__init__()
+        self.canais = canais or []
+        self.create_error = create_error
+        self.created: list[str] = []
 
+    def list_guild_channels(self, guild_id):
+        return self.canais
+
+    def create_text_channel(self, guild_id, name):
+        if self.create_error:
+            raise self.create_error
+        self.created.append(name)
+        return {"id": "novo-1", "name": name}
+
+
+@pytest.fixture
+def aviso_env(monkeypatch, tmp_path):
+    import clipes.notificar as n
+
+    n._aviso_recente.clear()
+    for k in ("DISCORD_LOG_CHANNEL_ID", "DISCORD_CHANNEL_ID", "DISCORD_GUILD_ID"):
+        monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
-    post_aviso("aviso teste", discord_client=client)
-    assert len(client.posts) == 1
-    assert client.posts[0]["channel_id"] == FAKE_CHANNEL
-    assert client.posts[0]["content"] == "aviso teste"
+    monkeypatch.setenv("OUT_DIR", str(tmp_path))
+    return tmp_path
 
+
+def test_post_aviso_erro_mascarado(aviso_env, monkeypatch, capsys):
+    monkeypatch.setenv("DISCORD_LOG_CHANNEL_ID", "log-1")
     failing = FakeDiscordClient(fail_on_call=1)
     post_aviso("aviso falha", discord_client=failing)
     out = capsys.readouterr().out
     assert "[discord] falha ao enviar aviso" in out
-    assert FAKE_TOKEN not in out
-    assert "***" in out
+    assert FAKE_TOKEN not in out and "***" in out
+
+
+def test_post_aviso_so_channel_id_nao_posta(aviso_env, monkeypatch, capsys):
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    client = FakeDiscordClient()
+    post_aviso("x", discord_client=client)
+    assert client.posts == []
+    assert "x" in capsys.readouterr().out
+
+
+def test_post_aviso_guild_com_bot_log_posta_e_grava_cache(aviso_env, monkeypatch):
+    monkeypatch.setenv("DISCORD_GUILD_ID", "g1")
+    client = _GuildClient([{"id": "42", "name": "bot-log"}])
+    post_aviso("oi", discord_client=client)
+    assert client.posts[0]["channel_id"] == "42"
+    assert (aviso_env / ".discord_log_channel").read_text().strip() == "42"
+    assert client.created == []
+
+
+def test_post_aviso_403_na_criacao_so_stdout(aviso_env, monkeypatch, capsys):
+    monkeypatch.setenv("DISCORD_GUILD_ID", "g1")
+    client = _GuildClient([], create_error=RuntimeError("HTTP 403"))
+    post_aviso("oi", discord_client=client)
+    assert client.posts == []
+    assert "oi" in capsys.readouterr().out
+
+
+def test_post_aviso_antispam_60s_e_contador(aviso_env, monkeypatch):
+    monkeypatch.setenv("DISCORD_LOG_CHANNEL_ID", "log-1")
+    t = [1000.0]
+    monkeypatch.setattr("clipes.notificar.time.monotonic", lambda: t[0])
+    client = FakeDiscordClient()
+    for dt in (0, 5, 10):
+        t[0] = 1000.0 + dt
+        post_aviso("igual", discord_client=client)
+    assert len(client.posts) == 1
+    t[0] = 1071.0
+    post_aviso("igual", discord_client=client)
+    assert len(client.posts) == 2
+    assert client.posts[1]["content"].endswith("(+2 repetidos)")
 
 
 def test_notify_sem_env_discord_registra_local(tmp_path, monkeypatch):
@@ -996,19 +1055,12 @@ def test_live_id_thread_unica_edita_cartao_404_e_encerra_no_release(tmp_path, mo
     assert "Clipes: 5" in client.edits[-1]["content"]
 
 
-def test_post_aviso_usa_discord_log_channel_id_com_fallback(monkeypatch):
+def test_post_aviso_usa_discord_log_channel_id(aviso_env, monkeypatch):
     client = FakeDiscordClient()
-    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
     monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
     monkeypatch.setenv("DISCORD_LOG_CHANNEL_ID", "777777777")
-
     post_aviso("aviso no log", discord_client=client)
     assert client.posts[-1]["channel_id"] == "777777777"
-
-    # Sem DISCORD_LOG_CHANNEL_ID (ou vazia) cai para DISCORD_CHANNEL_ID
-    monkeypatch.setenv("DISCORD_LOG_CHANNEL_ID", "   ")
-    post_aviso("aviso fallback", discord_client=client)
-    assert client.posts[-1]["channel_id"] == FAKE_CHANNEL
 
 
 def _clip_grande(tmp_path):
