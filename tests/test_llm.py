@@ -686,12 +686,12 @@ def test_schema_and_prompt_ask_for_hook_top_and_long_description(tmp_path: Path)
 def test_pick_hook_top_valid_and_fallbacks():
     from clipes.llm import pick_hook_top
 
-    tr = "ele perdeu tudo no jogo"
+    tr = "no final do jogo ele acabou perdendo tudo"
     assert pick_hook_top("Ele perdeu tudo?", "Titulo qualquer!", tr) == "Ele perdeu tudo?"
     # emoji, > 35 e entidade inventada caem no título (cortado na palavra ou inteiro)
-    assert pick_hook_top("Ele perdeu tudo? 😱", "Perdeu tudo?", tr) == "Perdeu tudo?"
-    assert pick_hook_top("x" * 36, "Perdeu tudo?", tr) == "Perdeu tudo?"
-    assert pick_hook_top("O Gaules perdeu?", "Perdeu tudo?", tr) == "Perdeu tudo?"
+    assert pick_hook_top("Ele perdeu tudo? 😱", "Perdeu tudo naquele round?", tr) == "Perdeu tudo naquele round?"
+    assert pick_hook_top("x" * 36, "Perdeu tudo naquele round?", tr) == "Perdeu tudo naquele round?"
+    assert pick_hook_top("O Gaules perdeu?", "Perdeu tudo naquele round?", tr) == "Perdeu tudo naquele round?"
     long_title = "Ele perdeu absolutamente tudo na live hoje?"
     assert pick_hook_top("", long_title, tr) == "Ele perdeu absolutamente tudo na"
     # título longo sem fronteira útil -> vazio
@@ -821,3 +821,24 @@ def test_empty_transcript_does_not_mark_description_source_fallback(tmp_path: Pa
     llm.enrich_clips_with_llm([empty_clip], [], ing, enabled=True)
     assert empty_clip.description_long == ""
     assert empty_clip.description_source == ""
+
+
+def test_pick_hook_top_rejects_garbage_and_speech_echo():
+    from clipes.llm import pick_hook_top, validate_title
+
+    tr = "no final do jogo ele acabou perdendo tudo que tinha ali"
+    ok = "Perdeu tudo naquele round?"
+    assert pick_hook_top("Vai usar outro carro para evitar a臂", ok, tr) == ok
+    assert pick_hook_top("Gancho quebrado \ufffd?", ok, tr) == ok
+    assert pick_hook_top("ele acabou perdendo tudo", ok, tr) == ok  # início da fala
+    assert pick_hook_top("you you you you", ok, "ola mundo") == ok
+    assert pick_hook_top("Ele perdeu tudo?", ok, tr) == "Ele perdeu tudo?"
+    # fallback (título) passa pelas mesmas regras
+    assert pick_hook_top("", "you you you you?", "ola mundo") == ""
+    assert pick_hook_top("", "Vai usar o carro 臂?", tr) == ""
+    # título ruído
+    assert not validate_title("Sim sim sim sim?", tr)
+    assert not validate_title("Que isso ?", tr)
+    assert not validate_title("Oi?", tr)
+    assert not validate_title("Que isso!?", tr)
+    assert validate_title("Perdeu tudo no jogo?", tr)

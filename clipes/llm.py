@@ -426,6 +426,36 @@ def validate_no_hallucinated_entities(
     return True
 
 
+_CORRUPT_RE = re.compile("[\ufffd\u1100-\u11ff\u2e80-\u9fff\uac00-\ud7af\uf900-\ufaff\uff66-\uff9f]")
+
+
+def _has_corrupt_chars(text: str) -> bool:
+    """U+FFFD ou CJK/Hangul/Kana: lixo de ASR/LLM em texto de idioma latino."""
+    return bool(_CORRUPT_RE.search(text))
+
+
+def _is_noise_title(title: str) -> bool:
+    """Título ruído do ASR: < 3 palavras distintas, palavra 3+ vezes seguidas, ` ?` ou `!?` colado."""
+    toks = re.findall(r"\w+", title.casefold())
+    return len(set(toks)) < 3 or bool(re.search(r" \?|!\?", title)) or _has_word_run(title)
+
+
+def _has_word_run(text: str) -> bool:
+    toks = re.findall(r"\w+", text.casefold())
+    return any(toks[i] == toks[i + 1] == toks[i + 2] for i in range(len(toks) - 2))
+
+
+def _repeats_speech(text: str, transcript: str) -> bool:
+    """Texto contido nas 25 primeiras palavras da fala ou com >= 80% dos tokens nelas."""
+    first = re.findall(r"\w+", _fold(transcript))[:25]
+    toks = re.findall(r"\w+", _fold(text))
+    if not toks or not first:
+        return False
+    if " ".join(toks) in " ".join(first):
+        return True
+    return sum(t in set(first) for t in toks) / len(toks) >= 0.8
+
+
 def validate_title(
     title: str,
     transcript: str,
@@ -434,6 +464,8 @@ def validate_title(
     """Enforce <= 60 chars, ? or !, <= 1 emoji, and no hallucinated proper nouns."""
     clean = " ".join(title.split())
     if not clean or len(clean) > 60:
+        return False
+    if _has_corrupt_chars(clean) or _is_noise_title(clean):
         return False
     if "?" not in clean and "!" not in clean:
         return False
@@ -458,6 +490,8 @@ def validate_hook(
     """Enforce <= 140 chars, no URLs/@mentions, and no hallucinated entities/values."""
     clean = " ".join(hook.split())
     if not clean or len(clean) > 140:
+        return False
+    if _has_corrupt_chars(clean):
         return False
     if _URL_OR_MENTION_RE.search(clean):
         return False
@@ -540,6 +574,9 @@ def pick_hook_top(raw: str, title: str, transcript: str, reference_text: str = "
     if (
         clean
         and len(clean) <= limit
+        and not _has_corrupt_chars(clean)
+        and not _has_word_run(clean)
+        and not _repeats_speech(clean, transcript)
         and not _EMOJI_RE.search(clean)
         and not _URL_OR_MENTION_RE.search(clean)
         and validate_no_hallucinated_entities(clean, transcript, reference_text)
@@ -552,7 +589,9 @@ def pick_hook_top(raw: str, title: str, transcript: str, reference_text: str = "
             return ""
         t = cut.rsplit(" ", 1)[0]
     t = t.rstrip(" ,;:-")
-    return "" if _EMOJI_RE.search(t) else t
+    if _EMOJI_RE.search(t) or _has_corrupt_chars(t) or _is_noise_title(t) or _repeats_speech(t, transcript):
+        return ""
+    return t
 
 
 def long_paragraph_fallback(clip: SnappedClip, limit: int = 320) -> str:
