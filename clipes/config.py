@@ -711,6 +711,21 @@ def apply_remote_config(
         cache_file.write_text(json.dumps(applied, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     except OSError:
         pass
+
+    # VIG-03: o worker grava os valores efetivos para o vigia-temp reler (tmp + os.replace).
+    def _efetivo(key: str) -> str:
+        return os.environ.get(key, "").strip() or CONFIG_SCHEMA[key]["default"]
+
+    vigia_file = resolve_out_dir(out_root) / ".vigia"
+    try:
+        tmp_file = vigia_file.with_name(".vigia.tmp")
+        tmp_file.write_text(
+            f"{_efetivo('CLIPES_VIGIA')} {_efetivo('CLIPES_TEMP_MAX')} {_efetivo('CLIPES_TEMP_MIN')}\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp_file, vigia_file)
+    except OSError:
+        pass
     return applied
 
 

@@ -273,3 +273,41 @@ def test_validate_faixas_de_temperatura():
     assert config.validate_config_payload({"CLIPES_TEMP_MIN": "39"})[1] is not None
     assert config.validate_config_payload({"CLIPES_TEMP_MIN": "96"})[1] is not None
     assert config.validate_config_payload({"CLIPES_VIGIA": "0"}) == ({"CLIPES_VIGIA": "0"}, None)
+
+
+# ---- ajustes-nov20 T19: worker grava <OUT_DIR>/.vigia com valores efetivos (VIG-03)
+
+def _isolar_config_remota(monkeypatch):
+    monkeypatch.setattr(config, "_BOOT_ENV", {})
+    monkeypatch.setattr(config, "_APPLIED_REMOTE_KEYS", set())
+    for k in ("CLIPES_VIGIA", "CLIPES_TEMP_MAX", "CLIPES_TEMP_MIN"):
+        monkeypatch.delenv(k, raising=False)
+
+
+def test_vigia_grava_valores_efetivos_do_remoto(monkeypatch, tmp_path):
+    _isolar_config_remota(monkeypatch)
+    config.apply_remote_config({"CLIPES_TEMP_MAX": "90", "CLIPES_VIGIA": "0"}, out_root=tmp_path, alias="PC-1")
+    assert (tmp_path / ".vigia").read_text(encoding="utf-8") == "0 90 75\n"
+    assert not (tmp_path / ".vigia.tmp").exists()
+
+
+def test_vigia_sem_remoto_usa_padroes(monkeypatch, tmp_path):
+    _isolar_config_remota(monkeypatch)
+    config.apply_remote_config(None, out_root=tmp_path, alias="PC-1")
+    assert (tmp_path / ".vigia").read_text(encoding="utf-8") == "1 85 75\n"
+
+
+def test_vigia_remover_chave_remota_volta_ao_padrao(monkeypatch, tmp_path):
+    _isolar_config_remota(monkeypatch)
+    config.apply_remote_config({"CLIPES_TEMP_MAX": "90", "CLIPES_VIGIA": "0"}, out_root=tmp_path, alias="PC-1")
+    assert (tmp_path / ".vigia").read_text(encoding="utf-8") == "0 90 75\n"
+    config.apply_remote_config({}, out_root=tmp_path, alias="PC-1")
+    assert (tmp_path / ".vigia").read_text(encoding="utf-8") == "1 85 75\n"
+
+
+def test_vigia_erro_de_disco_e_ignorado(monkeypatch, tmp_path):
+    _isolar_config_remota(monkeypatch)
+    arquivo = tmp_path / "nao_e_pasta"
+    arquivo.write_text("x", encoding="utf-8")
+    applied = config.apply_remote_config({"CLIPES_VIGIA": "0"}, out_root=arquivo, alias="PC-1")
+    assert applied == {"CLIPES_VIGIA": "0"}
