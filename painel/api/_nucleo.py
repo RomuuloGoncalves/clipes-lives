@@ -355,7 +355,9 @@ def _parse_alvo(raw: Any) -> dict[str, str] | None:
 # ---- VOD parsing ----
 
 _TWITCH_VOD_RE = re.compile(r"(?:www\.|m\.)?twitch\.tv/(?:videos?/|[^/]+/videos?/|clips?/|[^/]+/clip/)([a-zA-Z0-9_-]+)")
-_KICK_VOD_RE = re.compile(r"(?:www\.|m\.)?kick\.com/(?:video/|[^/]+/videos?/)([a-zA-Z0-9_-]+)")
+_KICK_VOD_RE = re.compile(r"(?:www\.|m\.)?kick\.com/([^/?#]+)/videos?/([a-zA-Z0-9_-]+)")
+_KICK_VOD_SEM_CANAL_RE = re.compile(r"(?:www\.|m\.)?kick\.com/videos?/[a-zA-Z0-9_-]+")
+ERRO_KICK_SEM_CANAL = "Link da Kick sem o canal: use https://kick.com/<canal>/videos/<id>"
 _KICK_CLIP_RE = re.compile(r"(?:www\.|m\.)?kick\.com/([^/?#]+)/clips/([A-Za-z0-9_-]+)")
 _YT_SHORTS_RE = re.compile(r"(?:www\.|m\.)?youtube\.com/shorts/([A-Za-z0-9_-]{4,32})")
 
@@ -440,14 +442,16 @@ def _parse_vod_alvo(raw: str) -> dict[str, str] | None:
 
     # Kick VOD
     m = _KICK_VOD_RE.search(clean)
-    if m and host in _KICK_HOSTS:
-        vod_id = m.group(1)
-        canonical = f"https://kick.com/video/{vod_id}"
+    slug = m.group(1).lower() if m else ""
+    if m and host in _KICK_HOSTS and slug not in _KICK_RESERVED and _KICK_SLUG_RE.fullmatch(slug):
+        # yt-dlp so casa kick:vod com /<canal>/videos/<id>; /video/<id> cai no generic (404)
+        canonical = f"https://kick.com/{slug}/videos/{m.group(2)}"
         return {
             "plataforma": "kick",
             "chave": _vod_hash(canonical),
             "entrada": canonical,
             "url": canonical,
+            "canal": slug,
         }
 
     # YouTube Shorts
@@ -528,6 +532,8 @@ def criar_alvo(db: Any, alvo: Any, pc: Any, now: datetime, tipo: str = "auto") -
     """Adiciona alvo (live ou VOD) com suporte a tipo auto/live/vod e pc_fixo."""
     parsed = _parse_alvo_painel(alvo, tipo)
     if parsed is None:
+        if isinstance(alvo, str) and tipo in ("auto", "vod") and _KICK_VOD_SEM_CANAL_RE.search(alvo.strip()):
+            return 400, {"erro": ERRO_KICK_SEM_CANAL}
         return 400, {"erro": "alvo invalido"}
     if parsed.get("tipo") == "vod":
         # VOD: usa chave hash, verifica limite de VODs
@@ -541,6 +547,7 @@ def criar_alvo(db: Any, alvo: Any, pc: Any, now: datetime, tipo: str = "auto") -
         doc = {
             "_id": chave, "tipo": "vod", "plataforma": parsed["plataforma"],
             "entrada": parsed["entrada"], "url": parsed["url"], "estado": "ativo",
+            **({"canal": parsed["canal"]} if parsed.get("canal") else {}),
             "pc_fixo": pc_fixo or None, "owner": None, "lease_until": None, "fase": "na fila",
             "criado_por": "painel", "criado_em": now, "erro": None, "auto_vod": False,
         }
