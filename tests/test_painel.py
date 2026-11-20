@@ -731,3 +731,16 @@ def test_status_visibilidade_efetiva_padrao_e_global(db):
     assert _nucleo.status(db, NOW)["visibilidade_efetiva"] == "padrao"
     _nucleo.salvar_config_global(db, {"config": {"CLIPES_VISIBILIDADE": "private"}}, NOW)
     assert _nucleo.status(db, NOW)["visibilidade_efetiva"] == "private"
+
+
+# ---- T19: config global, clipes e aviso de privado
+def test_index_html_clipes_aviso_e_config_global_por_escopo():
+    from pathlib import Path
+
+    txt = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
+    assert 'id="clipes"' in txt
+    assert 'id="aviso-privado"' in txt
+    assert "visibilidade_efetiva" in txt and '!== "public"' in txt
+    assert "/api/config_global" in txt and "clips_recentes" in txt
+    assert 'escopo === "global"' in txt and 'escopo !== "global"' in txt
+    assert "CLIPES_LAYOUT" not in txt

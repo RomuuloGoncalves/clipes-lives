@@ -886,17 +886,12 @@
       </div>
     </section>
 
-    <section class="kpis" aria-label="Layout global dos clipes" style="align-items:center;gap:10px">
-      <label for="layout-global-sel"><strong>Layout dos clipes (global)</strong></label>
-      <select id="layout-global-sel">
-        <option value="">Padrao do sistema (split-starcuts)</option>
-        <option value="split-starcuts">split-starcuts: barra + webcam + jogo, estilo StarCuts (padrao)</option>
-        <option value="split-barra">split-barra: barra de marca fixa, webcam e jogo</option>
-        <option value="split-cheio">split-cheio: webcam e jogo ocupam a tela toda, sem barra</option>
-        <option value="split-fina">split-fina: barra fina, mais area para a webcam e o jogo</option>
-        <option value="full">full: recorte unico tradicional, sem webcam</option>
-      </select>
-      <button id="layout-global-btn" class="btn-primary" type="button">Salvar</button>
+    <div id="aviso-privado" class="msg erro" hidden></div>
+
+    <section id="config-global" aria-label="Config global">
+      <div class="sec-head"><h2>Config global</h2></div>
+      <div id="cfg-global-fields"></div>
+      <button id="cfg-global-btn" class="btn-primary" type="button">Salvar config global</button>
       <span class="sec-sub">Vale para todos os PCs, so para clipes novos. Sobrepoe o .env e o modal por PC.</span>
     </section>
 
@@ -972,6 +967,14 @@
       </div>
     </section>
 
+    <div class="sec-head"><h2>Clipes</h2></div>
+    <section id="clipes" aria-label="Clipes recentes">
+      <table>
+        <thead><tr><th>Titulo</th><th>Gate</th><th>Plataforma</th><th>Privacidade</th><th>Views</th><th>Tempo medio</th><th>% completo</th></tr></thead>
+        <tbody id="clipes-body"></tbody>
+      </table>
+    </section>
+
     <div class="sec-head">
       <h2>Jobs (24 h)</h2>
     </div>
@@ -1036,6 +1039,7 @@
       var cfgCancelBtn = document.getElementById("cfg-cancel-btn");
       var cfgSaveBtn = document.getElementById("cfg-save-btn");
       var ultimoSchema = {};
+      var ultimoSchemaGlobal = {};
       var cfgAtivoAlias = "";
       var cfgNovoPc = false;
       var cfgGrupoAtivo = "lives";
@@ -1585,22 +1589,100 @@
           });
       });
 
-      document.getElementById("layout-global-btn").addEventListener("click", function () {
-        var v = document.getElementById("layout-global-sel").value;
+      var cfgGlobalEl = document.getElementById("cfg-global-fields");
+      var cfgGlobalVals = Object.create(null);
+
+      function renderCfgGlobal(schema, vals) {
+        var items = Object.keys(schema).filter(function (k) {
+          return schema[k].escopo === "global";
+        }).map(function (k) {
+          var meta = schema[k];
+          var box = el("div", "cfg-field");
+          var lbl = el("label", null, k);
+          lbl.setAttribute("for", "cfg-g-" + k);
+          box.appendChild(lbl);
+          if (meta.descricao) box.appendChild(el("div", "cfg-field-desc", meta.descricao));
+          var ctrl;
+          if (Array.isArray(meta.opcoes)) {
+            ctrl = el("select");
+            var d = el("option", null, "Padrao: " + (meta.default !== "" ? meta.default : "automatico"));
+            d.value = "";
+            ctrl.appendChild(d);
+            meta.opcoes.forEach(function (op) {
+              var o = el("option", null, op);
+              o.value = op;
+              ctrl.appendChild(o);
+            });
+          } else {
+            ctrl = el("input");
+            ctrl.type = "text";
+            ctrl.placeholder = "Padrao: " + (meta.default !== "" ? meta.default : "vazio");
+            ctrl.setAttribute("autocomplete", "off");
+          }
+          ctrl.id = "cfg-g-" + k;
+          ctrl.value = vals[k] || "";
+          ctrl.addEventListener("input", function () { cfgGlobalVals[k] = ctrl.value; });
+          ctrl.addEventListener("change", function () { cfgGlobalVals[k] = ctrl.value; });
+          box.appendChild(ctrl);
+          return box;
+        });
+        cfgGlobalEl.replaceChildren.apply(cfgGlobalEl, items);
+      }
+
+      document.getElementById("cfg-global-btn").addEventListener("click", function () {
+        var cfg = {};
+        Object.keys(ultimoSchemaGlobal).forEach(function (k) {
+          if (ultimoSchemaGlobal[k].escopo !== "global") return;
+          var c = document.getElementById("cfg-g-" + k);
+          if (c) cfg[k] = c.value;
+        });
         fetch("/api/config_global", {
           method: "POST",
           credentials: "same-origin",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ config: { CLIPES_LAYOUT: v } })
+          body: JSON.stringify({ config: cfg })
         })
           .then(function (r) {
             return r.json().catch(function () { return {}; }).then(function (b) {
-              if (r.ok) mostrarMsg("Layout global salvo (vale para clipes novos).", "ok");
-              else mostrarMsg("Falha ao salvar layout: " + ((b && b.erro) || ("HTTP " + r.status)), "erro");
+              if (r.ok) mostrarMsg("Config global salva (vale para clipes novos).", "ok");
+              else mostrarMsg("Falha ao salvar config global: " + ((b && b.erro) || ("HTTP " + r.status)), "erro");
             });
           })
-          .catch(function () { mostrarMsg("Erro de rede ao salvar layout.", "erro"); });
+          .catch(function () { mostrarMsg("Erro de rede ao salvar config global.", "erro"); });
       });
+
+      function renderClipes(clips) {
+        var body = document.getElementById("clipes-body");
+        if (!clips.length) {
+          var tr0 = el("tr");
+          var td0 = el("td", "meta", "Nenhum clipe ainda.");
+          td0.colSpan = 7;
+          tr0.appendChild(td0);
+          body.replaceChildren(tr0);
+          return;
+        }
+        var rows = [];
+        clips.forEach(function (c) {
+          var g = c.gate || {};
+          var gtxt = g.ok === undefined ? "-" : (g.ok ? "ok" : "bloqueado: " + (g.motivos || []).join(", "));
+          var pubs = c.publicacoes || {};
+          var plats = Object.keys(pubs);
+          if (!plats.length) plats = [""];
+          plats.forEach(function (pl) {
+            var m = (c.metricas || {})[pl] || {};
+            var tr = el("tr");
+            tr.appendChild(tdLabel("Titulo", null, c.titulo || c._id));
+            tr.appendChild(tdLabel("Gate", null, gtxt));
+            tr.appendChild(tdLabel("Plataforma", null, pl || "-"));
+            tr.appendChild(tdLabel("Privacidade", null, fmtNum((pubs[pl] || {}).privacidade)));
+            tr.appendChild(tdLabel("Views", null, fmtNum(m.views)));
+            tr.appendChild(tdLabel("Tempo medio", null, fmtNum(m.tempo_medio_s, " s")));
+            tr.appendChild(tdLabel("% completo", null, fmtNum(m.completo_pct, "%")));
+            rows.push(tr);
+          });
+        });
+        body.replaceChildren.apply(body, rows);
+      }
 
       function atualizar() {
         if (carregando) return;
@@ -1619,13 +1701,24 @@
           })
           .then(function (dados) {
             if (dados.config_schema) {
-              ultimoSchema = Object.assign({}, dados.config_schema);
-              delete ultimoSchema.CLIPES_LAYOUT; // global: fora do modal por PC
+              ultimoSchemaGlobal = dados.config_schema;
+              ultimoSchema = {};
+              Object.keys(dados.config_schema).forEach(function (k) {
+                if (dados.config_schema[k].escopo !== "global") ultimoSchema[k] = dados.config_schema[k]; // globais: fora do modal por PC
+              });
             }
-            var selLg = document.getElementById("layout-global-sel");
-            if (dados.config_global && document.activeElement !== selLg) {
-              selLg.value = dados.config_global.CLIPES_LAYOUT || "";
+            if (!cfgGlobalEl.contains(document.activeElement)) {
+              renderCfgGlobal(ultimoSchemaGlobal, dados.config_global || {});
             }
+            var av = document.getElementById("aviso-privado");
+            var vis = dados.visibilidade_efetiva;
+            if (vis && vis !== "public") {
+              av.textContent = "Atencao: visibilidade efetiva = " + vis + ". Os clipes NAO sao publicados como publicos.";
+              av.hidden = false;
+            } else {
+              av.hidden = true;
+            }
+            renderClipes(dados.clips_recentes || []);
             renderWorkers(dados.workers || []);
             renderLives(dados.lives || [], dados.workers || []);
             renderAlvos(dados.alvos || [], dados.workers || []);
