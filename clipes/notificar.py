@@ -71,6 +71,14 @@ def set_clip_status_line(
     return f"{new_first}{sep}{rest}"[:2000]
 
 
+def _gate_bloqueio(clip: dict[str, Any]) -> list[str] | None:
+    """Motivos do gate quando reprovado (ok=false); None quando aprovado ou sem gate."""
+    gate = clip.get("gate")
+    if not isinstance(gate, dict) or gate.get("ok") is not False:
+        return None
+    return [str(m) for m in (gate.get("motivos") or [])] or ["gate reprovado"]
+
+
 def _format_clip_discord_message(
     clip: dict[str, Any],
     clip_id: str,
@@ -93,6 +101,9 @@ def _format_clip_discord_message(
         f"Nota: {score_txt} ({ai_src})\n"
     )
     tail_lines: list[str] = []
+    bloqueio = _gate_bloqueio(clip)
+    if bloqueio is not None:
+        tail_lines.append(f"Bloqueado: {', '.join(bloqueio)}")
     if too_large_path is not None:
         tail_lines.append(f"arquivo grande demais para o Discord: `{too_large_path}`")
     if policy_status and policy_status != "liberado":
@@ -736,7 +747,9 @@ def notify_discord(
                             too_large_path = mp4_path
 
                     post_kw: dict[str, Any] = (
-                        {"components": _approve_components(clip_id)} if supports_components else {}
+                        {"components": _approve_components(clip_id)}
+                        if supports_components and _gate_bloqueio(clip) is None
+                        else {}
                     )
                     msg_text = _format_clip_discord_message(clip, clip_id, policy_status, too_large_path=too_large_path)
 

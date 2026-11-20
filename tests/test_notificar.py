@@ -1116,3 +1116,47 @@ def test_anexo_recusado_posta_aviso(tmp_path, monkeypatch):
         preview_fn=lambda s, d, c: s, out_root=tmp_path / "run",
     )
     assert len(avisos) == 1 and "big_c01" in avisos[0]
+
+
+def _post_clip_gate(tmp_path, monkeypatch, gate: dict[str, Any] | None) -> FakeDiscordClient:
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", FAKE_TOKEN)
+    monkeypatch.setenv("DISCORD_CHANNEL_ID", FAKE_CHANNEL)
+    clip: dict[str, Any] = {"index": 1, "clip_id": "vid1_c01", "file": "c1.mp4", "title": "Clip 1", "score": 0.9, "duration": 30.0}
+    if gate is not None:
+        clip["gate"] = gate
+    out_dir = _make_out_dir(tmp_path, [clip])
+    client = FakeDiscordClient()
+    notify_discord(
+        out_dir,
+        policy=ChannelPolicy(),
+        discord_client=client,
+        preview_fn=lambda src, dur, cache_dir: src,
+    )
+    return client
+
+
+def test_gate_reprovado_mostra_motivos_e_sem_botoes(tmp_path, monkeypatch):
+    gate = {"ok": False, "motivos": ["duracao_fora", "caption_url"], "versao": 1}
+    client = _post_clip_gate(tmp_path, monkeypatch, gate)
+
+    clip_post = client.posts[1]
+    assert "Bloqueado: duracao_fora, caption_url" in clip_post["content"]
+    assert clip_post["components"] is None
+
+
+def test_gate_aprovado_mantem_botoes_sem_linha_bloqueado(tmp_path, monkeypatch):
+    gate = {"ok": True, "motivos": [], "versao": 1}
+    client = _post_clip_gate(tmp_path, monkeypatch, gate)
+
+    clip_post = client.posts[1]
+    assert "Bloqueado" not in clip_post["content"]
+    assert clip_post["components"] is not None
+    assert len(clip_post["components"]) == 2
+
+
+def test_sem_gate_igual_a_hoje(tmp_path, monkeypatch):
+    client = _post_clip_gate(tmp_path, monkeypatch, None)
+
+    clip_post = client.posts[1]
+    assert "Bloqueado" not in clip_post["content"]
+    assert clip_post["components"] is not None
