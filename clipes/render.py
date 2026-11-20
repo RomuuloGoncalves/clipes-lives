@@ -942,6 +942,7 @@ def build_video_filter(
     variante: str | None = None,
     has_hook: bool = False,
     starcuts_overlay: bool = True,
+    recorte: bool = False,
 ) -> tuple[str, str]:
     """Build ffmpeg -filter_complex string and mapped video pad label."""
     if blur_bg is None:
@@ -956,6 +957,8 @@ def build_video_filter(
         if crop is not None:
             cx, cy, cw, ch = crop
             vf_parts = [f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:1920,setsar=1[v_base]"]
+        elif recorte:
+            vf_parts = ["[0:v]crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920,setsar=1[v_base]"]
         elif blur_bg:
             # Fast 1080x1920 vertical layout: centered gameplay over downscale-blurred copy of itself.
             vf_parts = [
@@ -977,6 +980,11 @@ def build_video_filter(
             cx, cy, cw, ch = crop
             vf_parts = [
                 f"[0:v]crop={cw}:{ch}:{cx}:{cy},scale=1080:{content_h},"
+                f"pad=1080:1920:0:{bar.h}:black,setsar=1,{drawbox}[v_base]",
+            ]
+        elif recorte:
+            vf_parts = [
+                f"[0:v]crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:{content_h},"
                 f"pad=1080:1920:0:{bar.h}:black,setsar=1,{drawbox}[v_base]",
             ]
         elif blur_bg:
@@ -1261,7 +1269,20 @@ def render_clip(
                 crop = detect_speaker_crop(src_path, start=probe_start, duration=clip.duration)
 
         blur_bg = is_blur_bg_enabled()
-        full_layout_name = "reframed_face" if crop is not None else ("blurred_16x9" if blur_bg else "black_bars_16x9")
+        # LAY-01: sem barras pretas, salvo pedido explicito (CLIPES_LAYOUT=full + CLIPES_BLUR_BG=0).
+        explicit_bars = layout_mode == "full" and not blur_bg
+        recorte = (
+            crop is None and not explicit_bars
+            and os.environ.get("CLIPES_LAYOUT_FALLBACK", "blur").strip().lower() == "recorte"
+        )
+        if crop is None and not explicit_bars:
+            blur_bg = True
+        if crop is not None:
+            full_layout_name = "reframed_face"
+        elif recorte:
+            full_layout_name = "reframed_center"
+        else:
+            full_layout_name = "blurred_16x9" if blur_bg else "black_bars_16x9"
         clip.layout = "split_webcam" if split_obj is not None else full_layout_name  # type: ignore[attr-defined]
 
         has_hook = bool(clip.hook_top.strip() and clip.duration > 0 and is_hook_top_enabled())
@@ -1340,6 +1361,7 @@ def render_clip(
                 variante=active_var,
                 has_hook=active_hook,
                 starcuts_overlay=has_starcuts_overlay,
+                recorte=recorte,
             )
             cmd = _build_render_cmd(
                 pre_args=pre_args,

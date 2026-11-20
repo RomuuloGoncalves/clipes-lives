@@ -917,3 +917,51 @@ def test_t9_master_livre_teto_6000k_sem_retry_nem_downscale(tmp_path: Path, monk
     assert "scale=720" not in cmd[cmd.index("-filter_complex") + 1]
     assert "scale=720" not in joined
     assert clip.cabe_discord is False
+
+
+def _render_sem_webcam(tmp_path: Path, monkeypatch, env: dict[str, str]):
+    _clear_layout_and_bar_env(monkeypatch)
+    monkeypatch.setenv("CLIPES_MASTER_MODE", "livre")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"src")
+    out_dir = tmp_path / "out" / "vod1"
+    cache_dir = tmp_path / "cache"
+    out_dir.mkdir(parents=True)
+    cache_dir.mkdir()
+    _install_fake_layout_and_facecam(
+        monkeypatch, SimpleNamespace(tipo="nenhuma", rect=None, metodo="yunet"),
+    )
+    cmds: list[list[str]] = []
+    monkeypatch.setattr(
+        render_mod.subprocess,
+        "run",
+        lambda cmd, **kw: (
+            cmds.append(cmd),
+            Path(cmd[-1]).write_bytes(b"mp4"),
+            SimpleNamespace(returncode=0, stderr="", stdout=""),
+        )[-1],
+    )
+    clip = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Sem cam", hook_top="")
+    render_mod.render_clip(clip, 1, [], "", out_dir, cache_dir, live_video_path=src)
+    cmd = next(c for c in cmds if "-filter_complex" in c)
+    return clip, cmd[cmd.index("-filter_complex") + 1]
+
+
+def test_lay01_sem_webcam_blur_bg_off_nao_usa_barras_pretas(tmp_path: Path, monkeypatch):
+    clip, fc = _render_sem_webcam(tmp_path, monkeypatch, {"CLIPES_BLUR_BG": "0"})
+    assert clip.layout == "blurred_16x9"
+    assert "boxblur" in fc
+
+
+def test_lay01_fallback_recorte_usa_crop_central(tmp_path: Path, monkeypatch):
+    clip, fc = _render_sem_webcam(tmp_path, monkeypatch, {"CLIPES_LAYOUT_FALLBACK": "recorte"})
+    assert clip.layout == "reframed_center"
+    assert "crop=ih*9/16:ih:(iw-ih*9/16)/2:0,scale=1080:1920" in fc
+
+
+def test_lay01_barras_pretas_so_com_full_e_blur_off_explicitos(tmp_path: Path, monkeypatch):
+    clip, fc = _render_sem_webcam(tmp_path, monkeypatch, {"CLIPES_LAYOUT": "full", "CLIPES_BLUR_BG": "0"})
+    assert clip.layout == "black_bars_16x9"
+    assert "pad=1080:1920" in fc
