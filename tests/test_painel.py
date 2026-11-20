@@ -596,3 +596,50 @@ def test_salvar_config_global(db):
     # vazio = remove o global (volta ao .env/padrao)
     assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_LAYOUT": ""}}, NOW)[1]["config"] == {}
     assert _nucleo.status(db, NOW)["config_global"] == {}
+
+
+# ---- ajustes-nov20 US-R: alvos VOD (AC 1-5)
+@pytest.mark.parametrize("entrada", ["youtube.com/watch?v=abcd1234", "youtu.be/abcd1234", "youtube.com/live/abcd1234"])
+def test_vod_forcado_aceita_video_youtube(db, entrada):
+    code, body = _nucleo.criar_alvo(db, entrada, "", NOW, "vod")
+    assert code == 201 and body["tipo"] == "vod"
+    doc = db.alvos.find_one({"_id": body["_id"]})
+    assert doc["tipo"] == "vod" and doc["url"] == "https://www.youtube.com/watch?v=abcd1234" and doc["fase"] == "na fila"
+
+
+@pytest.mark.parametrize("entrada", ["gaules", "twitch.tv/x", "kick.com/x", "youtube.com/@x"])
+def test_vod_forcado_rejeita_login_e_canal(db, entrada):
+    assert _nucleo.criar_alvo(db, entrada, "", NOW, "vod")[0] == 400
+    assert db.alvos.count_documents({}) == 0
+
+
+def test_auto_vod_so_para_id_de_video(db):
+    for entrada in ("youtube.com/@handle", "youtube.com/@handle/live"):
+        assert _nucleo._parse_alvo_painel(entrada)["auto_vod"] is False
+    assert _nucleo._parse_alvo_painel("youtube.com/watch?v=abcd1234")["auto_vod"] is True
+
+
+@pytest.mark.parametrize("estado", ["feito", "falhou", "removido"])
+def test_vod_finalizado_reativa(db, estado):
+    url = "https://www.youtube.com/watch?v=abcd1234"
+    _, b = _nucleo.criar_alvo(db, url, "", NOW, "vod")
+    db.alvos.update_one({"_id": b["_id"]}, {"$set": {"estado": estado, "fase": "x", "erro": "boom"}})
+    later = NOW + timedelta(hours=1)
+    assert _nucleo.criar_alvo(db, url, "", later, "vod")[0] == 201
+    d = db.alvos.find_one({"_id": b["_id"]})
+    assert (d["estado"], d["fase"], d["erro"], d["criado_em"]) == ("ativo", "na fila", None, later)
+
+
+def test_vod_ativo_duplicado_409(db):
+    url = "https://www.youtube.com/watch?v=abcd1234"
+    assert _nucleo.criar_alvo(db, url, "", NOW, "vod")[0] == 201
+    assert _nucleo.criar_alvo(db, url, "", NOW, "vod")[0] == 409
+
+
+def test_canonicalizacao_kick_clip_twitch_clip_e_plataforma_generica():
+    p = _nucleo._parse_alvo_painel("https://www.kick.com/canal/clips/clip_01AB")
+    assert p["url"] == "https://kick.com/canal/clips/clip_01AB" and p["plataforma"] == "kick"
+    p = _nucleo._parse_alvo_painel("https://clips.twitch.tv/SlugBonito")
+    assert p["plataforma"] == "twitch" and p["tipo"] == "vod"
+    assert _nucleo._parse_alvo_painel("https://www.mywww.example.com/v/1")["plataforma"] == "mywww.example.com"
+    assert _nucleo._parse_alvo_painel("https://m.vimeo.com/123")["plataforma"] == "vimeo.com"

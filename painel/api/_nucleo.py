@@ -7,6 +7,7 @@ Sem imports de `clipes` (a Vercel so instala pymongo): o parser de alvos espelha
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -334,10 +335,10 @@ def _parse_alvo(raw: Any) -> dict[str, str] | None:
 # ---- VOD parsing ----
 
 _TWITCH_VOD_RE = re.compile(r"(?:www\.|m\.)?twitch\.tv/(?:videos?/|[^/]+/videos?/|clips?/|[^/]+/clip/)(\d+|[a-zA-Z0-9_-]+)")
-_KICK_VOD_RE = re.compile(r"(?:www\.|m\.)?kick\.com/(?:video/|[^/]+/videos?/|[^/]+/clips/)(\d+|[a-zA-Z0-9_-]+)")
+_KICK_VOD_RE = re.compile(r"(?:www\.|m\.)?kick\.com/(?:video/|[^/]+/videos?/)(\d+|[a-zA-Z0-9_-]+)")
+_KICK_CLIP_RE = re.compile(r"(?:www\.|m\.)?kick\.com/([^/?#]+)/clips/([A-Za-z0-9_-]+)")
 _YT_SHORTS_RE = re.compile(r"(?:www\.|m\.)?youtube\.com/shorts/([A-Za-z0-9_-]{4,32})")
 
-import ipaddress
 
 def _is_ssrf_host(host: str) -> bool:
     """Verifica se o host e perigoso (SSRF): localhost, IPs literais, .local, .internal."""
@@ -406,7 +407,18 @@ def _parse_vod_alvo(raw: str) -> dict[str, str] | None:
             "url": canonical,
         }
 
-    # Kick VOD/Clip
+    # Twitch clip em clips.twitch.tv/<slug>
+    if host == "clips.twitch.tv" and path and "/" not in path and _YT_ID_RE.fullmatch(path):
+        canonical = f"https://clips.twitch.tv/{path}"
+        return {"plataforma": "twitch", "chave": _vod_hash(canonical), "entrada": canonical, "url": canonical}
+
+    # Kick clip: mantem o caminho original /<canal>/clips/<id>
+    m = _KICK_CLIP_RE.search(clean)
+    if m and host in _KICK_HOSTS:
+        canonical = f"https://kick.com/{m.group(1)}/clips/{m.group(2)}"
+        return {"plataforma": "kick", "chave": _vod_hash(canonical), "entrada": canonical, "url": canonical}
+
+    # Kick VOD
     m = _KICK_VOD_RE.search(clean)
     if m and host in _KICK_HOSTS:
         vod_id = m.group(1)
@@ -445,7 +457,7 @@ def _parse_vod_alvo(raw: str) -> dict[str, str] | None:
     ):
         canonical = _canonicalize_vod_url(clean)
         # Extrai host limpo para plataforma
-        plat_host = host.replace("www.", "").replace("m.", "")[:32]
+        plat_host = re.sub(r"^(?:www\.|m\.)", "", host)[:32]
         return {
             "plataforma": plat_host,
             "chave": _vod_hash(canonical),
@@ -454,6 +466,10 @@ def _parse_vod_alvo(raw: str) -> dict[str, str] | None:
         }
 
     return None
+
+
+def _yt_video_url(live: dict[str, str]) -> bool:
+    return live["plataforma"] == "youtube" and live["url"].startswith("https://www.youtube.com/watch?v=")
 
 
 def _parse_alvo_painel(raw: Any, tipo: str = "auto") -> dict[str, Any] | None:
@@ -469,20 +485,21 @@ def _parse_alvo_painel(raw: Any, tipo: str = "auto") -> dict[str, Any] | None:
     if tipo in ("auto", "vod"):
         vod_parsed = _parse_vod_alvo(clean)
         if vod_parsed:
-            if tipo == "vod":
-                return {**vod_parsed, "tipo": "vod", "auto_vod": False}
-            # tipo == "auto": VOD explicito -> vod
             return {**vod_parsed, "tipo": "vod", "auto_vod": False}
+        if tipo == "vod":
+            # video do YouTube (watch/youtu.be/live) vira VOD canonico; login/canal/@handle nao
+            live = _parse_alvo(clean)
+            if live and _yt_video_url(live):
+                return {"plataforma": "youtube", "chave": _vod_hash(live["url"]), "entrada": live["url"],
+                        "url": live["url"], "tipo": "vod", "auto_vod": False}
+            return None
 
     # Tenta parsear como live
     live_parsed = _parse_alvo(clean)
     if live_parsed:
         if tipo == "live":
             return {**live_parsed, "tipo": "live", "auto_vod": False}
-        # tipo == "auto": verifica se e YouTube watch?v= / youtu.be / /live/<id> (ambiguo)
-        if live_parsed["plataforma"] == "youtube" and live_parsed.get("chave", "").startswith("yt_"):
-            return {**live_parsed, "tipo": "live", "auto_vod": True}
-        return {**live_parsed, "tipo": "live", "auto_vod": False}
+        return {**live_parsed, "tipo": "live", "auto_vod": _yt_video_url(live_parsed)}
 
     return None
 
@@ -496,7 +513,7 @@ def criar_alvo(db: Any, alvo: Any, pc: Any, now: datetime, tipo: str = "auto") -
         # VOD: usa chave hash, verifica limite de VODs
         chave = parsed["chave"]
         # Duplicata: por _id OU por url
-        if db.alvos.find_one({"$or": [{"_id": chave}, {"tipo": "vod", "url": parsed["url"], "estado": "ativo"}]}) is not None:
+        if db.alvos.find_one({"$or": [{"_id": chave}, {"tipo": "vod", "url": parsed["url"]}], "estado": "ativo"}) is not None:
             return 409, {"erro": "alvo ja acompanhado"}
         if db.alvos.count_documents({"tipo": "vod", "estado": "ativo"}) >= MAX_VODS_ATIVOS:
             return 409, {"erro": f"limite de {MAX_VODS_ATIVOS} VODs ativos atingido"}
