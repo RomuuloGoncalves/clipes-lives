@@ -298,6 +298,12 @@ class Vigia:
         t = temp_sysfs(self.sysfs)
         if t is None:
             t = self.lhm.ler()
+        if t is None:
+            self.aviso(
+                "sem-sensor",
+                f"sem sensor de temperatura: sem hwmon e o LibreHardwareMonitor em {self.lhm.url} nao respondeu "
+                "(abra-o como administrador, Options > Remote Web Server > Run na porta 8085, e libere a porta no firewall)",
+            )
         return SEM_SENSOR if t is None else str(t)
 
     def cfg(self) -> tuple[int, int, int]:

@@ -541,3 +541,14 @@ def test_recursos_asterisco_com_conteiner_ja_sem_limite_nao_chama_update(ambient
     v.ciclo()
     v.ciclo()
     assert not f.posts("/update")
+
+
+def test_sem_sensor_avisa_uma_vez_com_o_motivo(tmp_path, capsys):
+    v = Vigia({"OUT_DIR": str(tmp_path / "out"), "SYSFS_ROOT": str(tmp_path / "sys"),
+               "DOCKER_SOCK": str(tmp_path / "nao"), "CLIPES_LHM_URL": "http://127.0.0.1:9/data.json"})
+    assert v.ler_temp() == "sem-sensor"
+    v.lhm.ts = 0.0  # ignora o cache de 15 s
+    assert v.ler_temp() == "sem-sensor"
+    out = capsys.readouterr().out
+    assert out.count("sem sensor de temperatura") == 1
+    assert "127.0.0.1:9/data.json" in out and "Remote Web Server" in out and "firewall" in out
