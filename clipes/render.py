@@ -404,8 +404,12 @@ def wrap_top_hook(
     *,
     uppercase: bool = True,
     colored: bool = True,
-) -> str:
-    """ASS-escape and wrap hook into up to max_lines of <= max_chars (optionally uppercased and colored)."""
+    truncar: bool = True,
+) -> str | None:
+    """ASS-escape and wrap hook into up to max_lines of <= max_chars (optionally uppercased and colored).
+
+    With truncar=False it never truncates: returns None when the text does not fit.
+    """
     clean = _ass_escape(" ".join(text.split()))
     if uppercase:
         clean = clean.upper()
@@ -416,6 +420,8 @@ def wrap_top_hook(
     truncated = False
     for word in clean.split():
         if len(word) > max_chars:
+            if not truncar:
+                return None
             if cur:
                 lines.append(cur)
                 cur = ""
@@ -432,12 +438,16 @@ def wrap_top_hook(
         else:
             lines.append(cur)
             if len(lines) >= max_lines:
+                if not truncar:
+                    return None
                 cur = ""
                 truncated = True
                 break
             cur = word
     if cur and len(lines) < max_lines:
         lines.append(cur)
+    elif cur and not truncar:
+        return None
     if truncated and lines and not lines[-1].endswith("…"):
         base = lines[-1].rstrip(" ,;:-")
         lines[-1] = (base + "…") if len(base) < max_chars else _truncate_ellipsis(lines[-1], max_chars)
@@ -445,6 +455,23 @@ def wrap_top_hook(
         return r"\N".join(lines)
     colors = ("&H00FFFFFF&", "&H0000FFFF&")
     return r"\N".join(f"{{\\c{colors[i % 2]}}}{line}" for i, line in enumerate(lines))
+
+
+def _hook_ou_titulo(hook: str, title: str, max_chars: int, max_lines: int, **estilo: bool) -> tuple[str, bool]:
+    """Hook if it fits; else the longest word-prefix of title that fits; else "".
+
+    Returns (texto, hook_cabe). hook_cabe is False only when nothing was shown for a non-empty hook.
+    """
+    if hook.strip():
+        wrapped = wrap_top_hook(hook, max_chars, max_lines, truncar=False, **estilo)
+        if wrapped:
+            return wrapped, True
+    palavras = title.split()
+    for n in range(len(palavras), 0, -1):
+        wrapped = wrap_top_hook(" ".join(palavras[:n]), max_chars, max_lines, truncar=False, **estilo)
+        if wrapped:
+            return wrapped, True
+    return "", not hook.strip()
 
 
 def build_ass(
@@ -466,8 +493,12 @@ def build_ass(
     variante: str | None = None,
     translated_cues: list[Any] | None = None,
     bilingual: bool | None = None,
+    clip: Any | None = None,
 ) -> int:
-    """Write word-highlighted ASS subtitles, channel credit, and end card. Returns dialogue count."""
+    """Write word-highlighted ASS subtitles, channel credit, and end card. Returns dialogue count.
+
+    When `clip` is given, sets clip.hook_cabe=False if the hook/title got no room.
+    """
     content_dur = max(0.0, clip_end - clip_start)
     total_dur = content_dur + max(0.0, outro_duration)
     selected = [
@@ -488,10 +519,10 @@ def build_ass(
 
     if split is not None and split_style is not None:
         is_starcuts = resolved_split_var == "split-starcuts"
-        wrapped_hook = (
-            wrap_top_hook(hook_top, max_chars=14, max_lines=3)
+        wrapped_hook, hook_cabe = (
+            _hook_ou_titulo(hook_top, title, 14, 3)
             if (not is_starcuts and split_style.hook_on_cam and hook_top.strip() and content_dur > 0 and is_hook_top_enabled())
-            else ""
+            else ("", True)
         )
         hook_dur = min(5.4, content_dur)
         hook_y = split.bar_h + split.cam_h // 2
@@ -512,10 +543,10 @@ def build_ass(
         )
         cap_prefix = f"{{\\an5\\pos({width // 2},1380)}}"
     else:
-        wrapped_hook = (
-            wrap_top_hook(hook_top)
+        wrapped_hook, hook_cabe = (
+            _hook_ou_titulo(hook_top, title, 18, 2)
             if (bar is None and hook_top and content_dur > 0 and is_hook_top_enabled())
-            else ""
+            else ("", True)
         )
         hook_dur = min(5.0, content_dur)
         hook_y = 365
@@ -611,12 +642,8 @@ def build_ass(
         bar_end = _ass_time(total_dur)
         if split is not None and split_style is not None:
             if resolved_split_var == "split-starcuts":
-                bar_title_src = hook_top.strip() or title.strip()
-                wrapped_title = (
-                    wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
-                    if bar_title_src
-                    else ""
-                )
+                wrapped_title, cabe = _hook_ou_titulo(hook_top, title, 26, 2, uppercase=False, colored=False)
+                hook_cabe = hook_cabe and cabe
                 if wrapped_title:
                     events.append(
                         f"Dialogue: 3,0:00:00.00,{bar_end},BarTitle,,0,0,0,,"
@@ -639,12 +666,8 @@ def build_ass(
                             f"{{\\an7\\pos({text_x},{handle_y})}}{safe_handle}"
                         )
                 if split_style.title_in_bar and split.bar_h >= MIN_BAR_H:
-                    bar_title_src = hook_top.strip() or title.strip()
-                    wrapped_title = (
-                        wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
-                        if bar_title_src
-                        else ""
-                    )
+                    wrapped_title, cabe = _hook_ou_titulo(hook_top, title, 26, 2, uppercase=False, colored=False)
+                    hook_cabe = hook_cabe and cabe
                     if wrapped_title:
                         title_y = (195 + max(220, split.bar_h - 15)) // 2
                         events.append(
@@ -666,12 +689,8 @@ def build_ass(
                     f"Dialogue: 3,0:00:00.00,{bar_end},BarHandle,,0,0,0,,"
                     f"{{\\an7\\pos({text_x},{handle_y})}}{safe_handle}"
                 )
-            bar_title_src = hook_top.strip() or title.strip()
-            wrapped_title = (
-                wrap_top_hook(bar_title_src, max_chars=26, max_lines=2, uppercase=False, colored=False)
-                if bar_title_src
-                else ""
-            )
+            wrapped_title, cabe = _hook_ou_titulo(hook_top, title, 26, 2, uppercase=False, colored=False)
+            hook_cabe = hook_cabe and cabe
             if wrapped_title:
                 title_y = (210 + (bar.h - 20)) // 2
                 events.append(
@@ -781,6 +800,8 @@ def build_ass(
                 )
 
     ass_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
+    if clip is not None:
+        clip.hook_cabe = hook_cabe
     return len(events)
 
 
@@ -1289,6 +1310,7 @@ def render_clip(
                 split=active_split,
                 variante=active_var,
                 translated_cues=getattr(clip, "translated_cues", None),
+                clip=clip,
             )
 
         def _run_encode(

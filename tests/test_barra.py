@@ -170,7 +170,8 @@ def test_build_ass_bar_text_positions_escape_and_disabled_parity(tmp_path: Path,
     title_lines = title_payload.split(r"\N")
     assert 1 <= len(title_lines) <= 2
     assert all(len(line) <= 26 for line in title_lines)
-    assert title_lines[-1].endswith("…")
+    # hook longo nao cabe em 2 linhas -> usa o titulo inteiro, sem reticencias
+    assert title_payload == "Fallback title"
 
     # Without logo: name & handle start at x=60; hook_top empty -> falls back to clip.title
     bar_no_logo = render_mod.BarConfig(
@@ -191,6 +192,56 @@ def test_build_ass_bar_text_positions_escape_and_disabled_parity(tmp_path: Path,
     ass_no_title = tmp_path / "bar_no_title.ass"
     render_mod.build_ass(words, 0.0, 10.0, ass_no_title, hook_top="", title="", bar=bar_no_logo)
     assert ",BarTitle," not in ass_no_title.read_text(encoding="utf-8")
+
+
+def _dialogue_texts(path: Path) -> list[str]:
+    return [l for l in path.read_text(encoding="utf-8").splitlines() if l.startswith("Dialogue:")]
+
+
+def test_hook_longo_nunca_termina_com_reticencias(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CLIPES_HOOK_TOP", raising=False)
+    words = [Word(1.0, 1.4, " Olha")]
+    bar = render_mod.BarConfig(
+        h=420, bg="#FFFFFF", fg="#000000", handle_fg="#606060",
+        display="CortesLR", handle="@cortes_lr1", logo=None,
+    )
+    hook_longo = "Ele perdeu tudo na hora quando o time inteiro morreu no mapa final"
+    for bar_arg in (None, bar):
+        out = tmp_path / f"hook_{bar_arg is None}.ass"
+        render_mod.build_ass(
+            words, 0.0, 10.0, out, hook_top=hook_longo, title="Titulo curto", bar=bar_arg,
+        )
+        for line in _dialogue_texts(out):
+            payload = line.split("}", 1)[-1]
+            assert "…" not in payload and "..." not in payload, line
+
+
+def test_hook_nao_cabe_usa_titulo_e_nada_cabe_deixa_vazio(tmp_path: Path):
+    words = [Word(1.0, 1.4, " Olha")]
+    bar = render_mod.BarConfig(
+        h=420, bg="#FFFFFF", fg="#000000", handle_fg="#606060",
+        display="", handle="", logo=None,
+    )
+
+    # Hook sem caber, titulo cabe -> titulo aparece e hook_cabe continua True
+    clip_ok = SimpleNamespace()
+    out = tmp_path / "titulo.ass"
+    render_mod.build_ass(
+        words, 0.0, 10.0, out, hook_top="A" * 30 + " B", title="Titulo do clipe",
+        bar=bar, clip=clip_ok,
+    )
+    assert "Titulo do clipe" in next(l for l in _dialogue_texts(out) if ",BarTitle," in l)
+    assert clip_ok.hook_cabe is True
+
+    # Nada cabe (hook e titulo com palavra maior que a linha) -> sem BarTitle e hook_cabe False
+    clip_vazio = SimpleNamespace()
+    out_vazio = tmp_path / "vazio.ass"
+    render_mod.build_ass(
+        words, 0.0, 10.0, out_vazio, hook_top="A" * 30, title="B" * 30,
+        bar=bar, clip=clip_vazio,
+    )
+    assert not any(",BarTitle," in l for l in _dialogue_texts(out_vazio))
+    assert clip_vazio.hook_cabe is False
 
 
 def test_build_ass_existing_elements_shifted_below_bar(tmp_path: Path):
