@@ -29,13 +29,6 @@ def basic(senha: str, user: str = "painel") -> str:
     return "Basic " + base64.b64encode(f"{user}:{senha}".encode()).decode()
 
 
-@pytest.fixture(autouse=True)
-def _limpar_falhas_auth():
-    _nucleo._FALHAS_AUTH.clear()
-    yield
-    _nucleo._FALHAS_AUTH.clear()
-
-
 def _chamar_client(mod, client, metodo: str, auth: str | None = None, corpo=None, headers=None):
     h = type("H", (mod.handler,), {"client": client})
     srv = HTTPServer(("127.0.0.1", 0), h)
@@ -62,7 +55,7 @@ def _chamar_client(mod, client, metodo: str, auth: str | None = None, corpo=None
 
 
 def test_m17_banco_da_uri_tem_prioridade_sobre_env(monkeypatch):
-    monkeypatch.setenv("PAINEL_SENHA", "s3")
+    monkeypatch.delenv("PAINEL_SENHA", raising=False)
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid/banco_da_uri")
     monkeypatch.setenv("PAINEL_MONGO_DB", "banco_do_env")
 
@@ -71,19 +64,19 @@ def test_m17_banco_da_uri_tem_prioridade_sobre_env(monkeypatch):
     client["banco_da_uri"].workers.insert_one({"_id": "w-uri", "alias": "PC-URI", "heartbeat_at": agora})
     client["banco_do_env"].workers.insert_one({"_id": "w-env", "alias": "PC-ENV", "heartbeat_at": agora})
 
-    code, _, corpo = _chamar_client(status_fn, client, "GET", basic("s3"))
+    code, _, corpo = _chamar_client(status_fn, client, "GET")
     assert code == 200
     ids = [w["id"] for w in json.loads(corpo)["workers"]]
     assert ids == ["w-uri"]
 
-    code_c, _, _ = _chamar_client(comando, client, "POST", basic("s3"), {"worker_id": "w-uri", "confirmar": "LIBERAR"})
+    code_c, _, _ = _chamar_client(comando, client, "POST", None, {"worker_id": "w-uri", "confirmar": "LIBERAR"})
     assert code_c == 202
     assert client["banco_da_uri"].commands.count_documents({"worker_id": "w-uri"}) == 1
     assert client["banco_do_env"].commands.count_documents({}) == 0
 
 
 def test_m17_sem_banco_na_uri_usa_env_ou_clipes_lives(monkeypatch):
-    monkeypatch.setenv("PAINEL_SENHA", "s3")
+    monkeypatch.delenv("PAINEL_SENHA", raising=False)
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
     agora = datetime.now(timezone.utc).replace(tzinfo=None)
 
@@ -92,17 +85,17 @@ def test_m17_sem_banco_na_uri_usa_env_ou_clipes_lives(monkeypatch):
     client["clipes_lives"].workers.insert_one({"_id": "w-def", "heartbeat_at": agora})
 
     monkeypatch.setenv("PAINEL_MONGO_DB", "meu_db")
-    code, _, corpo = _chamar_client(status_fn, client, "GET", basic("s3"))
+    code, _, corpo = _chamar_client(status_fn, client, "GET")
     assert code == 200
     assert [w["id"] for w in json.loads(corpo)["workers"]] == ["w-env"]
 
     monkeypatch.setenv("PAINEL_MONGO_DB", "")
-    code2, _, corpo2 = _chamar_client(status_fn, client, "GET", basic("s3"))
+    code2, _, corpo2 = _chamar_client(status_fn, client, "GET")
     assert code2 == 200
     assert [w["id"] for w in json.loads(corpo2)["workers"]] == ["w-def"]
 
     monkeypatch.delenv("PAINEL_MONGO_DB", raising=False)
-    code3, _, corpo3 = _chamar_client(status_fn, client, "GET", basic("s3"))
+    code3, _, corpo3 = _chamar_client(status_fn, client, "GET")
     assert code3 == 200
     assert [w["id"] for w in json.loads(corpo3)["workers"]] == ["w-def"]
 
@@ -131,55 +124,26 @@ def test_m17_chama_get_default_database_com_pymongo_real(monkeypatch):
     c_sem_uri.close()
 
 
-# ---- M-18: /api/status exige Basic Auth + rate limit e frontend envia Authorization
+# ---- Painel livre: /api/status e /api/comando funcionam sem Basic Auth nem PAINEL_SENHA
 
 
-def test_m18_status_sem_auth_401_e_com_auth_200(monkeypatch):
-    monkeypatch.setenv("PAINEL_SENHA", "segredo")
+def test_m18_status_e_comando_livres_sem_auth(monkeypatch):
+    monkeypatch.delenv("PAINEL_SENHA", raising=False)
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
     client = mongomock.MongoClient("mongodb://exemplo.invalid")
     client["clipes_lives"].workers.insert_one(
         {"_id": "w-1", "alias": "PC-1", "heartbeat_at": datetime.now(timezone.utc).replace(tzinfo=None)}
     )
 
-    code, hdr, corpo = _chamar_client(status_fn, client, "GET", headers={"X-Real-IP": "198.51.100.30"})
-    assert code == 401
-    assert 'Basic realm="painel"' in hdr.get("WWW-Authenticate", "")
-    assert json.loads(corpo) == {"erro": "nao autorizado"}
-
-    code_err, _, _ = _chamar_client(status_fn, client, "GET", basic("errada"), headers={"X-Real-IP": "198.51.100.30"})
-    assert code_err == 401
-
-    code_ok, _, corpo_ok = _chamar_client(status_fn, client, "GET", basic("segredo"), headers={"X-Real-IP": "198.51.100.30"})
+    code_ok, _, corpo_ok = _chamar_client(status_fn, client, "GET")
     assert code_ok == 200
     assert json.loads(corpo_ok)["workers"][0]["id"] == "w-1"
 
-
-def test_m18_status_rate_limit_compartilhado_com_comando(monkeypatch):
-    monkeypatch.setenv("PAINEL_SENHA", "segredo")
-    monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
-    t = [2000.0]
-    monkeypatch.setattr(_nucleo.time, "monotonic", lambda: t[0])
-
-    client = mongomock.MongoClient("mongodb://exemplo.invalid")
-    client["clipes_lives"].workers.insert_one(
-        {"_id": "w-1", "heartbeat_at": datetime.now(timezone.utc).replace(tzinfo=None)}
-    )
-    ip = {"X-Real-IP": "198.51.100.40"}
-
-    for _ in range(_nucleo.MAX_TENTATIVAS_SENHA):
-        assert _chamar_client(status_fn, client, "GET", basic("errada"), headers=ip)[0] == 401
-
-    code_s, hdr_s, _ = _chamar_client(status_fn, client, "GET", basic("segredo"), headers=ip)
-    assert code_s == 429 and int(hdr_s["Retry-After"]) > 0
-    # Mesmo bloqueio vale para /api/comando
-    code_c, _, _ = _chamar_client(
-        comando, client, "POST", basic("segredo"), {"worker_id": "w-1", "confirmar": "LIBERAR"}, headers=ip
-    )
-    assert code_c == 429
+    code_c, _, _ = _chamar_client(comando, client, "POST", None, {"worker_id": "w-1", "confirmar": "LIBERAR"})
+    assert code_c == 202
 
 
-def test_m18_html_status_envia_authorization_trata_401_sem_loop():
+def test_m18_html_status_acesso_livre_e_polling():
     txt = (PAINEL_DIR / "index.html").read_text(encoding="utf-8")
     m = re.search(r"<script>(.*?)</script>", txt, re.S)
     assert m, "bloco <script> nao encontrado"
@@ -187,12 +151,10 @@ def test_m18_html_status_envia_authorization_trata_401_sem_loop():
 
     atualizar_js = js.split("function atualizar()", 1)[1]
     assert 'fetch("/api/status"' in atualizar_js
-    assert '"Authorization": basicHeader(senha)' in atualizar_js
-    assert "pedirSenha(" in atualizar_js
-    assert "r.status === 401" in atualizar_js
-    assert "senhaCache = null" in atualizar_js
-    # Polling so dispara quando autenticado (senhaCache preenchida), evitando loop de 401
-    assert re.search(r"setInterval\s*\(\s*function\s*\(\)\s*\{\s*if\s*\(\s*senhaCache\s*\)\s*atualizar\(\);", atualizar_js)
+    assert "Authorization" not in js
+    assert "pedirSenha" not in js
+    assert "basicHeader" not in js
+    assert re.search(r"setInterval\s*\(\s*atualizar\s*,\s*10000\s*\)", atualizar_js)
 
 
 # ---- M-22: parse tolerante de CLIPES_BEAT_S e online/comando via beat_s do worker
@@ -254,7 +216,7 @@ def test_m22_online_e_comando_respeitam_beat_s_do_worker():
 
 
 def test_b15_funcoes_publicas_anotadas():
-    for fn in (_nucleo.autorizado, _nucleo.status, _nucleo.criar_comando, _nucleo.tratar):
+    for fn in (_nucleo.status, _nucleo.criar_comando, _nucleo.gerir_alvo, _nucleo.tratar):
         sig = inspect.signature(fn)
         hints = typing.get_type_hints(fn)
         assert "return" in hints, f"{fn.__name__} sem anotacao de retorno"
@@ -268,32 +230,27 @@ def test_painel_nao_importa_clipes():
         assert not re.search(r"^\s*(?:from|import)\s+clipes\b", txt, re.M), f"{arq.name} importa clipes"
 
 
-# ---- T17: /api/alvos segue o mesmo gate do /api/comando (Basic Auth, origem, rate limit compartilhado)
+# ---- T17: /api/alvos aceita POST direto sem Basic Auth, mantendo validacao de origem e metodo
 
 
-def test_t17_api_alvos_exige_auth_e_compartilha_rate_limit(monkeypatch):
+def test_t17_api_alvos_acesso_livre_sem_auth(monkeypatch):
     from painel.api import alvos as alvos_api
 
-    monkeypatch.setenv("PAINEL_SENHA", "segredo")
+    monkeypatch.delenv("PAINEL_SENHA", raising=False)
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
     client = mongomock.MongoClient("mongodb://exemplo.invalid")
     corpo = {"acao": "adicionar", "alvo": "twitch.tv/fulano", "pc": ""}
-    ip = {"X-Real-IP": "198.51.100.60"}
 
-    assert _chamar_client(alvos_api, client, "POST", None, corpo, headers=ip)[0] == 401  # 1a falha
-    for _ in range(_nucleo.MAX_TENTATIVAS_SENHA - 1):  # 5 falhas no total: IP bloqueado
-        assert _chamar_client(alvos_api, client, "POST", basic("errada"), corpo, headers=ip)[0] == 401
-    # o bloqueio vale para /api/alvos, /api/comando e /api/status (mesmo contador por IP)
-    assert _chamar_client(alvos_api, client, "POST", basic("segredo"), corpo, headers=ip)[0] == 429
-    assert _chamar_client(status_fn, client, "GET", basic("segredo"), headers=ip)[0] == 429
-    assert client["clipes_lives"].alvos.count_documents({}) == 0
+    code, _, body = _chamar_client(alvos_api, client, "POST", None, corpo)
+    assert code == 201 and json.loads(body) == {"ok": True, "_id": "fulano"}
+    assert client["clipes_lives"].alvos.count_documents({}) == 1
 
 
 def test_t17_api_alvos_so_aceita_post(monkeypatch):
     from painel.api import alvos as alvos_api
 
-    monkeypatch.setenv("PAINEL_SENHA", "segredo")
+    monkeypatch.delenv("PAINEL_SENHA", raising=False)
     monkeypatch.setenv("PAINEL_MONGO_URI", "mongodb://exemplo.invalid")
     client = mongomock.MongoClient("mongodb://exemplo.invalid")
-    code, hdr, _ = _chamar_client(alvos_api, client, "GET", basic("segredo"))
+    code, hdr, _ = _chamar_client(alvos_api, client, "GET")
     assert code == 405 and hdr.get("Allow") == "POST"
