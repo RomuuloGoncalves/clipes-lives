@@ -594,6 +594,7 @@ _SLOTS_DEFAULT = {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1}
 _SLOTS_INT_RE = re.compile(r"[0-9]+")
 _SCHEDULE_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 _INT_STR_RE = re.compile(r"^-?[0-9]+$")
+_MEM_RE = re.compile(r"^([0-9]{1,6})([mg])$")
 _PC_ALIAS_RE = re.compile(r"^[A-Za-z0-9_.-]{1,32}$")
 _FORBIDDEN_SUBSTRINGS = ("SECRET", "TOKEN", "KEY", "PASS", "URI")
 
@@ -975,6 +976,20 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "max": 95,
         "descricao": "Temperatura (C) em que o vigia retoma o processamento (menor que CLIPES_TEMP_MAX)",
     },
+    "CLIPES_MEM": {
+        "grupo": "recursos",
+        "tipo": "mem",
+        "default": "",
+        "descricao": "Limite de RAM do conteiner (ex.: 4g ou 4096m; 512m a 128g; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
+    },
+    "CLIPES_CPUS": {
+        "grupo": "recursos",
+        "tipo": "float",
+        "default": "",
+        "min": 0.5,
+        "max": 64.0,
+        "descricao": "Limite de CPUs do conteiner (ex.: 2 ou 1.5; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
+    },
     "CLIPES_VISIBILIDADE": {
         "grupo": "publicacao",
         "tipo": "enum",
@@ -1114,6 +1129,15 @@ def _validate_single(key: str, raw_val: Any) -> tuple[str | None, str | None]:
         if val_str not in meta["opcoes"]:
             return None, f"valor invalido para {key}: opcoes {', '.join(meta['opcoes'])}"
         return val_str, None
+
+    if tipo == "mem":
+        m = _MEM_RE.fullmatch(val_str.lower())
+        if m is None:
+            return None, f"valor invalido para {key}: formato 4g ou 4096m"
+        mb = int(m.group(1)) * (1024 if m.group(2) == "g" else 1)
+        if mb < 512 or mb > 131072:
+            return None, f"valor invalido para {key}: entre 512m e 128g"
+        return f"{m.group(1)}{m.group(2)}", None
 
     if tipo == "slots":
         seen: set[str] = set()

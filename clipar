@@ -32,36 +32,60 @@ if [ -r "$PROC_ROOT/meminfo" ]; then
 fi
 case "$mem_kb" in ''|*[!0-9]*) mem_kb="" ;; esac
 
-if [ -z "${CLIPES_CPUS:-}" ]; then
-  cpus_host=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
-  case "$cpus_host" in ''|*[!0-9]*) cpus_host=1 ;; esac
-  tem_bat=0
-  for b in "$SYSFS_ROOT"/class/power_supply/BAT*; do
-    [ -e "$b" ] && tem_bat=1 && break
-  done
-  if [ "$tem_bat" = 1 ] || { [ -n "$mem_kb" ] && [ "$mem_kb" -lt 4194304 ]; }; then
-    CLIPES_CPUS=$(( cpus_host / 4 ))
-  else
-    CLIPES_CPUS=$(( cpus_host / 2 ))
-  fi
-  [ "$CLIPES_CPUS" -lt 1 ] && CLIPES_CPUS=1
-fi
-export CLIPES_CPUS
+# Valores do ambiente/.env (o painel, via $OUT_DIR/.recursos, tem precedencia e e relido a cada reinicio).
+ENV_CPUS="${CLIPES_CPUS:-}"
+ENV_MEM="${CLIPES_MEM:-}"
+ENV_CPU_THREADS="${CLIPES_CPU_THREADS:-}"
+CLIPES_RECURSOS_GERIDO=1
+export CLIPES_RECURSOS_GERIDO
 
-if [ -z "${CLIPES_MEM:-}" ]; then
-  if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ]; then
-    mem_mb=$(( (mem_kb * 60) / 102400 ))
-    [ "$mem_mb" -gt 8192 ] && mem_mb=8192
-    [ "$mem_mb" -lt 1 ] && mem_mb=1
-    CLIPES_MEM="${mem_mb}m"
-  else
-    CLIPES_MEM="8192m"
+calc_recursos() {
+  CLIPES_CPUS="$ENV_CPUS"
+  CLIPES_MEM="$ENV_MEM"
+  painel_mem="-"
+  painel_cpus="-"
+  if [ -r "$OUT_DIR/.recursos" ]; then
+    read -r painel_mem painel_cpus < "$OUT_DIR/.recursos" 2>/dev/null || true
   fi
-fi
-export CLIPES_MEM
-
-CLIPES_CPU_THREADS="${CLIPES_CPU_THREADS:-$CLIPES_CPUS}"
-export CLIPES_CPU_THREADS
+  case "$painel_mem" in
+    [0-9]*[mg]) CLIPES_MEM="$painel_mem" ;;
+  esac
+  case "$painel_cpus" in
+    ''|-|*[!0-9.]*) ;;
+    *) CLIPES_CPUS="$painel_cpus" ;;
+  esac
+  if [ -z "${CLIPES_CPUS:-}" ]; then
+    cpus_host=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    case "$cpus_host" in ''|*[!0-9]*) cpus_host=1 ;; esac
+    tem_bat=0
+    for b in "$SYSFS_ROOT"/class/power_supply/BAT*; do
+      [ -e "$b" ] && tem_bat=1 && break
+    done
+    if [ "$tem_bat" = 1 ] || { [ -n "$mem_kb" ] && [ "$mem_kb" -lt 4194304 ]; }; then
+      CLIPES_CPUS=$(( cpus_host / 4 ))
+    else
+      CLIPES_CPUS=$(( cpus_host / 2 ))
+    fi
+    [ "$CLIPES_CPUS" -lt 1 ] && CLIPES_CPUS=1
+  fi
+  export CLIPES_CPUS
+  if [ -z "${CLIPES_MEM:-}" ]; then
+    if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ]; then
+      mem_mb=$(( (mem_kb * 60) / 102400 ))
+      [ "$mem_mb" -gt 8192 ] && mem_mb=8192
+      [ "$mem_mb" -lt 1 ] && mem_mb=1
+      CLIPES_MEM="${mem_mb}m"
+    else
+      CLIPES_MEM="8192m"
+    fi
+  fi
+  export CLIPES_MEM
+  threads_auto="${CLIPES_CPUS%%.*}"
+  case "$threads_auto" in ''|0|*[!0-9]*) threads_auto=1 ;; esac
+  CLIPES_CPU_THREADS="${ENV_CPU_THREADS:-$threads_auto}"
+  export CLIPES_CPU_THREADS
+}
+calc_recursos
 
 D="$(dirname "$0")"
 # Vigia ja vivo para este OUT_DIR (outro ./clipar ou servico): nao inicia outro e nao o mata.
@@ -99,6 +123,7 @@ for arg in "$@"; do
 done
 
 while :; do
+  calc_recursos
   # shellcheck disable=SC2086
   nice -n 19 docker compose run --rm $DASH_PORT_FLAG clipes "$@"
   rc=$?

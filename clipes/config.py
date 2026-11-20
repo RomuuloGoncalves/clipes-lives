@@ -515,6 +515,20 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "max": 95,
         "descricao": "Temperatura (C) em que o vigia retoma o processamento (menor que CLIPES_TEMP_MAX)",
     },
+    "CLIPES_MEM": {
+        "grupo": "recursos",
+        "tipo": "mem",
+        "default": "",
+        "descricao": "Limite de RAM do conteiner (ex.: 4g ou 4096m; 512m a 128g; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
+    },
+    "CLIPES_CPUS": {
+        "grupo": "recursos",
+        "tipo": "float",
+        "default": "",
+        "min": 0.5,
+        "max": 64.0,
+        "descricao": "Limite de CPUs do conteiner (ex.: 2 ou 1.5; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
+    },
     "CLIPES_VISIBILIDADE": {
         "grupo": "publicacao",
         "tipo": "enum",
@@ -589,6 +603,7 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
 
 _SCHEDULE_RE = re.compile(r"^([01][0-9]|2[0-3]):[0-5][0-9]$")
 _INT_STR_RE = re.compile(r"^-?[0-9]+$")
+_MEM_RE = re.compile(r"^([0-9]{1,6})([mg])$")
 _BOOT_ENV: dict[str, str] = {k: os.environ[k] for k in CONFIG_SCHEMA if k in os.environ}
 _APPLIED_REMOTE_KEYS: set[str] = set()
 
@@ -663,6 +678,15 @@ def _validate_single(key: str, raw_val: Any) -> tuple[str | None, str | None]:
         if val_str not in meta["opcoes"]:
             return None, f"valor invalido para {key}: opcoes {', '.join(meta['opcoes'])}"
         return val_str, None
+
+    if tipo == "mem":
+        m = _MEM_RE.fullmatch(val_str.lower())
+        if m is None:
+            return None, f"valor invalido para {key}: formato 4g ou 4096m"
+        mb = int(m.group(1)) * (1024 if m.group(2) == "g" else 1)
+        if mb < 512 or mb > 131072:
+            return None, f"valor invalido para {key}: entre 512m e 128g"
+        return f"{m.group(1)}{m.group(2)}", None
 
     if tipo == "slots":
         seen: set[str] = set()
@@ -830,7 +854,66 @@ def apply_remote_config(
         os.replace(tmp_file, vigia_file)
     except OSError:
         pass
+
+    # O limite de RAM/CPU e do Docker: o worker so grava o pedido do painel em `.recursos`
+    # ("mem cpus", "-" = automatico) para o ./clipar reler ao reiniciar o contêiner.
+    recursos_file = resolve_out_dir(out_root) / ".recursos"
+    try:
+        tmp_file = recursos_file.with_name(".recursos.tmp")
+        tmp_file.write_text(
+            f"{applied.get('CLIPES_MEM', '-')} {applied.get('CLIPES_CPUS', '-')}\n",
+            encoding="utf-8",
+        )
+        os.replace(tmp_file, recursos_file)
+    except OSError:
+        pass
     return applied
+
+
+def _cgroup_limites(cgroup_root: Path | str = "/sys/fs/cgroup") -> tuple[int | None, float | None]:
+    """Le (memoria em bytes, CPUs) do cgroup v2 do proprio contêiner; None = sem limite ou ilegivel."""
+    root = Path(cgroup_root)
+    mem: int | None = None
+    cpus: float | None = None
+    try:
+        raw = (root / "memory.max").read_text(encoding="utf-8").strip()
+        if raw.isdigit():
+            mem = int(raw)
+    except OSError:
+        pass
+    try:
+        quota, periodo = (root / "cpu.max").read_text(encoding="utf-8").split()[:2]
+        if quota.isdigit() and int(periodo) > 0:
+            cpus = int(quota) / int(periodo)
+    except (OSError, ValueError):
+        pass
+    return mem, cpus
+
+
+def recursos_pendentes(cgroup_root: Path | str = "/sys/fs/cgroup") -> bool:
+    """True se o painel pediu RAM/CPU diferentes do limite atual do contêiner.
+
+    So vale sob `./clipar`/compose (`CLIPES_RECURSOS_GERIDO=1`), que relê `.recursos` ao reiniciar;
+    sem isso reiniciar nao mudaria nada e o worker ficaria em laco.
+    """
+    if os.environ.get("CLIPES_RECURSOS_GERIDO") != "1":
+        return False
+    mem_atual, cpus_atual = _cgroup_limites(cgroup_root)
+    pedido_mem = os.environ.get("CLIPES_MEM", "").strip().lower() if "CLIPES_MEM" in _APPLIED_REMOTE_KEYS else ""
+    pedido_cpus = os.environ.get("CLIPES_CPUS", "").strip() if "CLIPES_CPUS" in _APPLIED_REMOTE_KEYS else ""
+    if pedido_mem and mem_atual is not None:
+        m = _MEM_RE.fullmatch(pedido_mem)
+        if m is not None:
+            alvo = int(m.group(1)) * (1024 if m.group(2) == "g" else 1) * 1024 * 1024
+            if abs(alvo - mem_atual) > alvo * 0.01:
+                return True
+    if pedido_cpus and cpus_atual is not None:
+        try:
+            if abs(float(pedido_cpus) - cpus_atual) > 0.05:
+                return True
+        except ValueError:
+            pass
+    return False
 
 
 def load_cached_remote_config(out_root: Path | str | None = None, alias: str | None = None) -> dict[str, str]:

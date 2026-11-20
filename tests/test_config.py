@@ -107,9 +107,9 @@ def test_slots_non_strict_cai_no_padrao(monkeypatch):
 
 
 def test_config_schema_tem_45_variaveis_e_zero_segredos():
-    assert len(config.CONFIG_SCHEMA) == 54
+    assert len(config.CONFIG_SCHEMA) == 56
     grupos = {meta["grupo"] for meta in config.CONFIG_SCHEMA.values()}
-    assert grupos == {"lives", "render", "ia", "publicacao", "temperatura", "antiflop"}
+    assert grupos == {"lives", "render", "ia", "publicacao", "temperatura", "antiflop", "recursos"}
     for key, meta in config.CONFIG_SCHEMA.items():
         assert not config._is_forbidden_key(key)
         assert "default" in meta
@@ -349,3 +349,43 @@ def test_config_global_le_so_chaves_globais_validas():
     assert config.config_global(db) == {"CLIPES_DUR_MAX": "60"}
     db.config_global.update_one({"_id": "global"}, {"$set": {"config": {"CLIPES_GATE": "invalido"}}})
     assert config.config_global(db) == {}
+
+
+def test_recursos_mem_e_cpus_validam_formato_e_faixa():
+    assert config.CONFIG_SCHEMA["CLIPES_MEM"]["grupo"] == "recursos"
+    assert config.validate_config_payload({"CLIPES_MEM": "4G"}) == ({"CLIPES_MEM": "4g"}, None)
+    assert config.validate_config_payload({"CLIPES_MEM": "4096m"}) == ({"CLIPES_MEM": "4096m"}, None)
+    for ruim in ("256m", "129g", "4", "4gb", "-1g", "abc"):
+        assert config.validate_config_payload({"CLIPES_MEM": ruim})[1] is not None, ruim
+    assert config.validate_config_payload({"CLIPES_CPUS": "1.5"}) == ({"CLIPES_CPUS": "1.5"}, None)
+    assert config.validate_config_payload({"CLIPES_CPUS": "0.1"})[1] is not None
+    assert config.validate_config_payload({"CLIPES_CPUS": "65"})[1] is not None
+
+
+def test_apply_remote_config_grava_recursos_para_o_clipar(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_MEM", raising=False)
+    monkeypatch.delenv("CLIPES_CPUS", raising=False)
+    config.apply_remote_config({"CLIPES_MEM": "4g"}, out_root=tmp_path, alias="PC-1")
+    assert (tmp_path / ".recursos").read_text(encoding="utf-8").split() == ["4g", "-"]
+    config.apply_remote_config({"CLIPES_MEM": "4g", "CLIPES_CPUS": "2"}, out_root=tmp_path, alias="PC-1")
+    assert (tmp_path / ".recursos").read_text(encoding="utf-8").split() == ["4g", "2"]
+    config.apply_remote_config({}, out_root=tmp_path, alias="PC-1")
+    assert (tmp_path / ".recursos").read_text(encoding="utf-8").split() == ["-", "-"]
+
+
+def test_recursos_pendentes_compara_pedido_com_cgroup(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_MEM", raising=False)
+    monkeypatch.delenv("CLIPES_CPUS", raising=False)
+    (tmp_path / "memory.max").write_text(str(8 * 1024**3), encoding="utf-8")
+    (tmp_path / "cpu.max").write_text("300000 100000\n", encoding="utf-8")
+    config.apply_remote_config({"CLIPES_MEM": "4g", "CLIPES_CPUS": "3"}, out_root=tmp_path, alias="PC-1")
+    monkeypatch.delenv("CLIPES_RECURSOS_GERIDO", raising=False)
+    assert config.recursos_pendentes(tmp_path) is False  # sem ./clipar nao reinicia (evita laco)
+    monkeypatch.setenv("CLIPES_RECURSOS_GERIDO", "1")
+    assert config.recursos_pendentes(tmp_path) is True  # 4g pedido, 8g atual
+    (tmp_path / "memory.max").write_text(str(4 * 1024**3), encoding="utf-8")
+    assert config.recursos_pendentes(tmp_path) is False  # cpus 3 == 3
+    (tmp_path / "cpu.max").write_text("200000 100000\n", encoding="utf-8")
+    assert config.recursos_pendentes(tmp_path) is True
+    config.apply_remote_config({}, out_root=tmp_path, alias="PC-1")
+    assert config.recursos_pendentes(tmp_path) is False

@@ -442,7 +442,7 @@ def test_index_html_slots_fila_e_alvos():
 def test_config_schema_paridade_com_clipes():
     from clipes import config as clipes_config
 
-    assert len(_nucleo.CONFIG_SCHEMA) == 54
+    assert len(_nucleo.CONFIG_SCHEMA) == 56
     assert _nucleo.CONFIG_SCHEMA == clipes_config.CONFIG_SCHEMA
     assert _nucleo.FORBIDDEN_ENV_KEYS == clipes_config.FORBIDDEN_ENV_KEYS
 

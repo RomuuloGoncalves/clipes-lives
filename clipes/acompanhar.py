@@ -1451,6 +1451,9 @@ class Supervisor:
     ) -> dict[str, str]:
         """Aplica overrides do MongoDB em runtime e atualiza slots, lease e sessoes ativas."""
         applied = config.apply_remote_config(remote_cfg, out_root=self.out_root, alias=alias)
+        if config.recursos_pendentes():
+            print("[config] novo limite de RAM/CPU do painel; reiniciando para aplicar", flush=True)
+            raise SystemExit(75)
         new_slots = config.slots(strict=False)
         with self._lock:
             self.slots = new_slots
