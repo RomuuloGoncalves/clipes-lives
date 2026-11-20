@@ -15,7 +15,7 @@ from typing import Any
 
 import numpy as np
 
-from . import cloud_llm, config
+from . import cloud_llm, config, traducao
 from .asr import transcribe_candidates, transcribe_fast_blocks
 from .candidates import pick_candidate_peaks, pick_quota_candidates
 from .eval import count_speech_words, evaluate_clips, speech_gate
@@ -460,8 +460,15 @@ def run_pipeline(args: argparse.Namespace) -> int:
         _write_run_readme(ing.out_dir, ing.video_id, ing.title, ing.url, [], timings)
         return 0
 
-    t_llm = time.perf_counter()
     cloud_llm.reset_round()
+    t_trad = time.perf_counter()
+    try:
+        traducao.traduzir_clipes(clips, words, lang, enabled=not getattr(args, "no_llm", False))
+    except Exception as exc:
+        print(f"[traducao] Falha inesperada ({exc}); mantendo legenda original.", flush=True)
+    timings["traducao_s"] = round(time.perf_counter() - t_trad, 2)
+
+    t_llm = time.perf_counter()
     try:
         enrich_clips_with_llm(clips, words, ing, enabled=not getattr(args, "no_llm", False))
     except Exception as exc:
@@ -598,6 +605,9 @@ def run_pipeline(args: argparse.Namespace) -> int:
             "wps": float(getattr(clip, "wps", 0.0)),
             "palavras": int(getattr(clip, "palavras", 0)),
             "cabe_discord": bool(getattr(clip, "cabe_discord", True)),
+            "legenda_traduzida": bool(getattr(clip, "legenda_traduzida", False)),
+            "legenda_idioma": str(getattr(clip, "legenda_idioma", "") or (lang or "pt")),
+            "legenda_fonte": str(getattr(clip, "legenda_fonte", "") or "original"),
         }
         clips_payload.append(clip_entry)
     timings["render_s"] = round(time.perf_counter() - t5, 2)
