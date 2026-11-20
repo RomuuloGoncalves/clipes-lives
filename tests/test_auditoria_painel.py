@@ -216,7 +216,14 @@ def test_m22_online_e_comando_respeitam_beat_s_do_worker():
 
 
 def test_b15_funcoes_publicas_anotadas():
-    for fn in (_nucleo.status, _nucleo.criar_comando, _nucleo.gerir_alvo, _nucleo.tratar):
+    for fn in (
+        _nucleo.status,
+        _nucleo.criar_comando,
+        _nucleo.gerir_alvo,
+        _nucleo.validate_config_payload,
+        _nucleo.salvar_config,
+        _nucleo.tratar,
+    ):
         sig = inspect.signature(fn)
         hints = typing.get_type_hints(fn)
         assert "return" in hints, f"{fn.__name__} sem anotacao de retorno"
