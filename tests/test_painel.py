@@ -658,23 +658,6 @@ def test_canonicalizacao_kick_clip_twitch_clip_e_plataforma_generica():
 # ---- Ajustes nov20 (T4): secao #vods-recentes escondida e em bloco
 
 def test_index_html_vods_recentes_hidden_e_em_bloco():
-
-
-def test_salvar_config_global(db):
-    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_LAYOUT": "inexistente"}}, NOW)[0] == 400
-    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_BAR_H": "400"}}, NOW)[0] == 400
-    assert _nucleo.salvar_config_global(db, {"config": {"PAINEL_SENHA": "x"}}, NOW)[0] == 400
-    code, body = _nucleo.salvar_config_global(db, {"config": {"CLIPES_LAYOUT": "split-cheio"}}, NOW)
-    assert code == 200 and body["config"] == {"CLIPES_LAYOUT": "split-cheio"}
-    assert db.config_global.find_one({"_id": "global"})["config"] == {"CLIPES_LAYOUT": "split-cheio"}
-    assert _nucleo.status(db, NOW)["config_global"] == {"CLIPES_LAYOUT": "split-cheio"}
-    # vazio = remove o global (volta ao .env/padrao)
-    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_LAYOUT": ""}}, NOW)[1]["config"] == {}
-    assert _nucleo.status(db, NOW)["config_global"] == {}
-
-
-# ---- ajustes-nov20 T16: aba Temperatura e cor pelo limite do PC (VIG-08)
-def test_index_html_aba_temperatura_e_cor_pelo_limite_do_pc():
     import re
     from pathlib import Path
 
@@ -689,6 +672,12 @@ def test_index_html_aba_temperatura_e_cor_pelo_limite_do_pc():
     assert re.search(r"#vods-recentes\[hidden\]\{display:none;?\}", compacto), "falta regra CSS [hidden]"
 
 
+# ---- ajustes-nov20 T16: aba Temperatura e cor pelo limite do PC (VIG-08)
+def test_index_html_aba_temperatura_e_cor_pelo_limite_do_pc():
+    import re
+    from pathlib import Path
+
+    raw = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
     assert re.search(r'\{\s*id:\s*"temperatura",\s*label:\s*"Temperatura"\s*\}', raw), "falta aba Temperatura em GRUPOS_CFG"
     m = re.search(r"var tempCls =(.*?);", raw, flags=re.S)
     assert m, "regra de cor da temperatura nao encontrada"
