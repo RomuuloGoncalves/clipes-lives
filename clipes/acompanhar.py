@@ -474,7 +474,7 @@ class LiveSession:
                     extract_wav(job_dir / "source.mkv", job_dir / "audio.wav")
                     job["pre_score"] = float(sinais.pre_score(job_dir / "audio.wav"))
                 except Exception as exc:
-                    print(f"[live] pre_score falhou: {exc}", flush=True)
+                    print(f"[live] pre_score falhou {job_dir.name}: {exc}", flush=True)
                     job["pre_score"] = 0.0
             (job_dir / "meta.json").write_text(
                 json.dumps(
@@ -1718,10 +1718,11 @@ class Supervisor:
     ) -> bool:
         def dispatch_pipeline(job_dir: Path, root: Path) -> dict[str, Any]:
             t0 = time.monotonic()
-            res = _dispatch(job_dir, root)
-            if not self._cancel.is_set():
-                self._worker_s.append(time.monotonic() - t0)
-            return res
+            try:
+                return _dispatch(job_dir, root)
+            finally:
+                if not self._cancel.is_set():
+                    self._worker_s.append(time.monotonic() - t0)
 
         def _dispatch(job_dir: Path, root: Path) -> dict[str, Any]:
             job = monitor._read_job(job_dir)

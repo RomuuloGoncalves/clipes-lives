@@ -299,6 +299,8 @@ def test_live_session_backlog_lost_avisa_discord(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
     monkeypatch.setenv("CLIPES_MAX_LIVES", "1")
     monkeypatch.setenv("CLIPES_MAX_BACKLOG", "2")  # limite antigo: força a perda com poucas janelas
+    monkeypatch.setattr(acompanhar, "extract_wav", lambda src, wav: wav)
+    monkeypatch.setattr(acompanhar.sinais, "pre_score", lambda wav: 1.0)
     avisos: list[str] = []
     pool = FakeMultiPool(clock, {"gaules": B + 2500})
     calls: list[str] = []
@@ -321,7 +323,7 @@ def test_live_session_backlog_lost_avisa_discord(tmp_path, monkeypatch, capsys):
         aviso_fn=avisos.append,
     )
     sup.run()
-    assert any(a.startswith("janela perdida gaules (fila cheia, score ") for a in avisos)
+    assert "janela perdida gaules (fila cheia, score 1.0)" in avisos
 
 
 # ---- T7: Limite, aguardando, recusa visível, offline, policy, recorder error ----------------------
@@ -1353,11 +1355,24 @@ def test_empate_de_score_descarta_a_mais_antiga(tmp_path, monkeypatch):
     assert _contagem(queue)[1] == ["gaules_1300"]
 
 
-def test_extract_wav_falha_enfileira_com_pre_score_zero(tmp_path, monkeypatch):
+def test_extract_wav_falha_enfileira_com_pre_score_zero(tmp_path, monkeypatch, capsys):
     sess, queue, _ = _sessao_scores(tmp_path, monkeypatch, [None], max_backlog="6")
     _fechar_n_janelas(sess, 1)
     (job_dir,) = (queue.root / "pending").iterdir()
     assert monitor._read_job(job_dir)["pre_score"] == 0.0
+    assert f"[live] pre_score falhou {job_dir.name}: ffmpeg falhou" in capsys.readouterr().out
+
+
+def test_caminho_feliz_grava_audio_wav_no_job_e_pontua_esse_arquivo(tmp_path, monkeypatch):
+    sess, queue, _ = _sessao_scores(tmp_path, monkeypatch, [3.0], max_backlog="6")
+    wavs: list[Path] = []
+    pontuados: list[Path] = []
+    monkeypatch.setattr(acompanhar, "extract_wav", lambda src, wav: wavs.append(wav))
+    monkeypatch.setattr(acompanhar.sinais, "pre_score", lambda wav: pontuados.append(wav) or 3.0)
+    _fechar_n_janelas(sess, 1)
+    (job_dir,) = (queue.root / "pending").iterdir()
+    assert wavs == pontuados
+    assert [(w.parent.name, w.name) for w in wavs] == [(job_dir.name, "audio.wav")]  # staging, depois movido p/ pending
 
 
 def test_claim_next_janelas_por_pre_score_e_busca_por_z_score(tmp_path):
@@ -1457,6 +1472,37 @@ def test_claim_next_duas_views_um_job_so_um_recebe(tmp_path):
     for i in range(50):
         queue = monitor.DiskQueue(tmp_path / f"q{i}")
         _add_janela(queue, "j", "gaules", 1.0)
+        ocup: set[str] = set()
+        lock = threading.Lock()
+        views = [acompanhar._SessionQueueView(queue, lambda: {"gaules"}, ocup, lock) for _ in range(2)]
+        res: list = []
+        barrier = threading.Barrier(2)
+
+        def run(v):
+            barrier.wait()
+            res.append(v.claim_next())
+
+        ts = [threading.Thread(target=run, args=(v,)) for v in views]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert sum(r is not None for r in res) == 1
+
+
+def test_claim_next_mesma_live_dois_consumidores_so_um_pega(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    orig = monitor._read_job
+
+    def lento(d):
+        time.sleep(0.01)  # alarga a janela entre "live ocupada?" e "marcar ocupada"
+        return orig(d)
+
+    monkeypatch.setattr(monitor, "_read_job", lento)
+    for i in range(10):
+        queue = monitor.DiskQueue(tmp_path / f"q{i}")
+        _add_janela(queue, "j1", "gaules", 2.0)
+        _add_janela(queue, "j2", "gaules", 1.0)
         ocup: set[str] = set()
         lock = threading.Lock()
         views = [acompanhar._SessionQueueView(queue, lambda: {"gaules"}, ocup, lock) for _ in range(2)]
@@ -1786,6 +1832,15 @@ def test_pool_log_de_corte_aparece_uma_vez_por_mudanca(tmp_path, monkeypatch, ca
     assert out.count("[jobs] CLIPES_JOBS=4 limitado a 3 ") == 1
 
 
+def test_pool_log_de_corte_traz_cpus_e_ram_gb(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv("CLIPES_JOBS", "4")
+    monkeypatch.setattr(acompanhar.config, "_cgroup_limites", lambda: (5 * 1024**3, 2.0))
+    sup = acompanhar.Supervisor([], tmp_path / "out", now=lambda: 0.0)
+    monkeypatch.setattr(acompanhar.capacidade, "jobs_efetivos", lambda: 1)  # <2: sem threads
+    sup._sync_consumidores(None, None, "w", None, False)
+    assert "[jobs] CLIPES_JOBS=4 limitado a 1 (cpus=2, ram_gb=5.0)" in capsys.readouterr().out
+
+
 def _beat_kwargs(monkeypatch, tmp_path, coord_beat, amostras=(), jobs_em_andamento=None, efetivos=2):
     monkeypatch.setattr(acompanhar.capacidade, "jobs_efetivos", lambda: efetivos)
     sup = acompanhar.Supervisor([], tmp_path / "out", now=lambda: 0.0)
@@ -1954,3 +2009,94 @@ def test_claim_next_falha_no_move_nao_deixa_pending_marcado_processing(tmp_path,
     view = acompanhar._SessionQueueView(queue, lambda: {"A"}, set())
     assert view.claim_next() is None
     assert monitor._read_job(queue.root / "pending" / "a1")["status"] == "pending"
+
+
+def _add_busca(queue, name):
+    d = queue.root / "pending" / name
+    d.mkdir(parents=True)
+    monitor._write_job(d, {
+        "job_id": name, "channel": "c", "origem": "busca", "status": "pending", "z_score": 3.0, "created_at": 1.0,
+    })
+
+
+def test_process_one_amostra_worker_s_em_ok_rejeitado_e_erro(tmp_path, monkeypatch):
+    sup = acompanhar.Supervisor([], tmp_path / "out", now=lambda: B)
+    queue = monitor.DiskQueue(tmp_path / "out" / "queue")
+    relogio = iter(range(0, 1000, 5))
+    monkeypatch.setattr(acompanhar.time, "monotonic", lambda: next(relogio))
+    resultados = [{"clips": [{"file": "c.mp4", "score": 1.0, "start": 0, "end": 10}]}, {"clips": []}, RuntimeError("boom")]
+
+    def pipe(d, o):
+        r = resultados.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    for i in range(3):
+        _add_busca(queue, f"b{i}")
+        sup._process_one(queue, pipe, skip_lost=True, idx=0)
+    assert len(sup._worker_s) == 3 and all(v > 0 for v in sup._worker_s)
+
+
+def test_process_one_cancelado_nao_amostra_worker_s(tmp_path):
+    sup = acompanhar.Supervisor([], tmp_path / "out", now=lambda: B)
+    queue = monitor.DiskQueue(tmp_path / "out" / "queue")
+    _add_busca(queue, "b0")
+    sup._cancel.set()
+
+    def pipe(d, o):
+        raise RuntimeError("cancelado")
+
+    sup._process_one(queue, pipe, skip_lost=True, idx=0)
+    assert len(sup._worker_s) == 0
+
+
+def test_consumidor_so_pega_vod_sem_janela_pendente(tmp_path):
+    import threading
+    import time
+
+    estado = {"fins": [], "feitas": 0, "vod_com_pendente": False}
+    fila = [{"_id": "v1", "url": "https://x.test/1"}]
+
+    class C(_CoordStub):
+        def start_job(self, *a, **kw):
+            return True
+
+        def finish_job(self, *a, **kw):
+            pass
+
+        def add_job(self, *a, **kw):
+            pass
+
+        def pegar_vod(self, alias):
+            if estado["feitas"] < 2:
+                estado["vod_com_pendente"] = True
+            return fila.pop(0) if fila else None
+
+        def fim_vod(self, vod_id, *a, **kw):
+            estado["fins"].append(vod_id)
+
+    def pipe(d, o):
+        time.sleep(0.05)
+        estado["feitas"] += 1
+        return {"clips": []}
+
+    sup = acompanhar.Supervisor(
+        [], tmp_path / "out", pipeline=pipe, coord=C(), now=lambda: B, sleep=lambda _s: None,
+        vod_pipeline=lambda url, out: 0,
+    )
+    sup._check_vod_policy = lambda vod, url, probe: None
+    queue = monitor.DiskQueue(tmp_path / "out" / "queue")
+    _add_busca(queue, "b0")  # 2 jobs pendentes: o VOD so entra depois de ambos
+    _add_busca(queue, "b1")
+    sup._jobs_alvo = 1
+    t = threading.Thread(target=sup._consumidor, args=(0, queue, pipe, "w", lambda u: {}, True))
+    t.start()
+    for _ in range(300):
+        if estado["fins"]:
+            break
+        time.sleep(0.01)
+    sup._parar_consumidores.set()
+    t.join(5)
+    assert estado["fins"] == ["v1"]
+    assert estado["feitas"] == 2 and not estado["vod_com_pendente"]
