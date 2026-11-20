@@ -234,3 +234,55 @@ def test_publish_tiktok_refreshes_once_on_401_and_returns_erro_auth_on_failure(t
     assert res_fail["status"] == "erro_auth"
     assert "refaca clipes auth tiktok" in res_fail["erro"]
     assert fresh_token not in json.dumps(res_fail)
+
+
+def test_publish_tiktok_privacy_env_and_fallback_to_self_only(tmp_path: Path, monkeypatch):
+    mp4 = tmp_path / "clip.mp4"
+    mp4.write_bytes(b"MP4")
+    upload_url = "https://open-upload.tiktokapis.com/upload/priv"
+
+    def _run_with(opts: list[str], *, fail_public_unaudited: bool = False):
+        init_levels: list[str] = []
+
+        def fake_urlopen(req: urllib.request.Request, timeout: float = 30) -> FakeResponse:
+            if req.full_url.endswith("/creator_info/query/"):
+                return FakeResponse(200, {"data": {"privacy_level_options": opts}, "error": {"code": "ok"}})
+            if req.full_url.endswith("/video/init/"):
+                body = json.loads(req.data.decode("utf-8"))
+                lvl = body["post_info"]["privacy_level"]
+                init_levels.append(lvl)
+                if fail_public_unaudited and lvl == "PUBLIC_TO_EVERYONE":
+                    return FakeResponse(200, {"error": {"code": "unaudited_client_can_only_post_to_private_accounts"}})
+                return FakeResponse(200, {"data": {"publish_id": "v_priv", "upload_url": upload_url}, "error": {"code": "ok"}})
+            if req.full_url == upload_url:
+                return FakeResponse(200)
+            return FakeResponse(200, {"data": {"status": "PUBLISH_COMPLETE"}, "error": {"code": "ok"}})
+
+        res = publish(mp4, "Legenda", "tok", fake_urlopen, lambda _: None)
+        return res, init_levels
+
+    # 1) Valid env in creator options -> uses PUBLIC_TO_EVERYONE
+    monkeypatch.setenv("CLIPES_TIKTOK_PRIVACY", "PUBLIC_TO_EVERYONE")
+    res_pub, lvls_pub = _run_with(["SELF_ONLY", "PUBLIC_TO_EVERYONE"])
+    assert res_pub["status"] == "ok"
+    assert res_pub["privacidade"] == "PUBLIC_TO_EVERYONE"
+    assert lvls_pub == ["PUBLIC_TO_EVERYONE"]
+
+    # 2) Requested level absent from creator options -> falls back to SELF_ONLY
+    res_fb, lvls_fb = _run_with(["SELF_ONLY"])
+    assert res_fb["status"] == "ok"
+    assert res_fb["privacidade"] == "SELF_ONLY"
+    assert lvls_fb == ["SELF_ONLY"]
+
+    # 3) video/init returns unaudited_client_can_only_post_to_private_accounts -> retries as SELF_ONLY
+    res_un, lvls_un = _run_with(["SELF_ONLY", "PUBLIC_TO_EVERYONE"], fail_public_unaudited=True)
+    assert res_un["status"] == "ok"
+    assert res_un["privacidade"] == "SELF_ONLY"
+    assert lvls_un == ["PUBLIC_TO_EVERYONE", "SELF_ONLY"]
+
+    # 4) Invalid env -> defaults to SELF_ONLY
+    monkeypatch.setenv("CLIPES_TIKTOK_PRIVACY", "INVALID_LEVEL")
+    res_inv, lvls_inv = _run_with(["SELF_ONLY", "PUBLIC_TO_EVERYONE"])
+    assert res_inv["status"] == "ok"
+    assert res_inv["privacidade"] == "SELF_ONLY"
+    assert lvls_inv == ["SELF_ONLY"]

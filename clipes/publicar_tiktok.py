@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import random
 import time
 import urllib.error
@@ -18,6 +19,12 @@ VIDEO_INIT_URL = f"{TIKTOK_API_BASE}/video/init/"
 STATUS_FETCH_URL = f"{TIKTOK_API_BASE}/status/fetch/"
 
 PRIVACY_LEVEL = "SELF_ONLY"
+_VALID_PRIVACY = frozenset({
+    "SELF_ONLY",
+    "MUTUAL_FOLLOW_FRIENDS",
+    "FOLLOWER_OF_CREATOR",
+    "PUBLIC_TO_EVERYONE",
+})
 UNAUDITED_CODE = "unaudited_client_can_only_post_to_private_accounts"
 MAX_STATUS_POLLS = 60
 POLL_INTERVAL_S = 5
@@ -38,6 +45,16 @@ _NETWORK_ERRORS = (urllib.error.URLError, OSError, TimeoutError, http.client.HTT
 
 def _resolve_token(token: str | Callable[[], str]) -> str:
     return str(token() if callable(token) else token)
+
+
+def _resolve_privacy(privacy_opts: list[str]) -> str | None:
+    raw = os.environ.get("CLIPES_TIKTOK_PRIVACY", "").strip().upper()
+    requested = raw if raw in _VALID_PRIVACY else PRIVACY_LEVEL
+    if requested in privacy_opts:
+        return requested
+    if PRIVACY_LEVEL in privacy_opts:
+        return PRIVACY_LEVEL
+    return None
 
 
 def _extract_error_code(raw: bytes) -> str:
@@ -169,13 +186,14 @@ def publish(
     if err is not None:
         return err
     privacy_opts = (info_resp or {}).get("data", {}).get("privacy_level_options", [])
-    if PRIVACY_LEVEL not in privacy_opts:
+    privacy_level = _resolve_privacy(privacy_opts)
+    if privacy_level is None:
         return _account_error()
 
     init_payload = {
         "post_info": {
             "title": (caption or "")[:2200],
-            "privacy_level": PRIVACY_LEVEL,
+            "privacy_level": privacy_level,
             "disable_duet": False,
             "disable_comment": False,
             "disable_stitch": False,
@@ -188,6 +206,10 @@ def publish(
         },
     }
     init_resp, err = post_json(VIDEO_INIT_URL, init_payload)
+    if err is not None and err.get("status") == "erro_conta" and privacy_level != PRIVACY_LEVEL and PRIVACY_LEVEL in privacy_opts:
+        privacy_level = PRIVACY_LEVEL
+        init_payload["post_info"]["privacy_level"] = privacy_level
+        init_resp, err = post_json(VIDEO_INIT_URL, init_payload)
     if err is not None:
         return err
 
@@ -261,7 +283,7 @@ def publish(
             return {
                 "status": "ok",
                 "publish_id": publish_id,
-                "privacidade": PRIVACY_LEVEL,
+                "privacidade": privacy_level,
             }
         if st_value == "FAILED":
             fail_reason = str(st_data.get("fail_reason") or "FAILED")
