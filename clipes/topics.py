@@ -12,7 +12,7 @@ from pathlib import Path
 import numpy as np
 from scipy.stats import rankdata
 
-from . import capacidade
+from . import capacidade, config
 from .models import SignalBundle, TopicSegment, Word
 from .render import TITLE_KEYWORDS
 from .signals import signal_prosody
@@ -325,7 +325,7 @@ def _best_k_split(
     target = (end - start) / float(n_parts)
 
     def _penalty(durs: list[float]) -> float:
-        return sum((d - target) ** 2 + (max(0.0, 45.0 - d) * 2.0) ** 2 for d in durs)
+        return sum((d - target) ** 2 + (max(0.0, max_dur - d) * 2.0) ** 2 for d in durs)
 
     if n_parts == 2:
         best_pair: list[tuple[float, float]] | None = None
@@ -369,11 +369,20 @@ def _best_k_split(
 def split_topic_into_parts(
     topic: TopicSegment,
     words: list[Word],
-    min_dur: float = 25.0,
-    single_max_dur: float = 65.0,
-    part_max_dur: float = 58.0,
+    min_dur: float | None = None,
+    single_max_dur: float | None = None,
+    part_max_dur: float | None = None,
 ) -> list[tuple[float, float, int, int]]:
-    """Split topic into 1 part (<= 65s) or 2-3 parts (<= 58s each) at sentence/pause borders."""
+    """Split topic into 1 part (<= single_max_dur) or 2-3 parts (<= part_max_dur each).
+
+    Padrões (quando não passados): CLIPES_DUR_MIN / CLIPES_DUR_MAX; single = part_max.
+    """
+    if min_dur is None:
+        min_dur = config.env_float("CLIPES_DUR_MIN", 15.0)
+    if part_max_dur is None:
+        part_max_dur = config.env_float("CLIPES_DUR_MAX", 45.0)
+    if single_max_dur is None:
+        single_max_dur = part_max_dur
     dur = topic.end - topic.start
     if dur < min_dur - 1e-6:
         return []

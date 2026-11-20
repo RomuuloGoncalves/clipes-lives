@@ -134,19 +134,22 @@ def test_segment_topics_few_words_and_180s_trim():
     assert topic.start <= 110.0 <= topic.end
 
 
+ANTIGO_58 = dict(min_dur=25.0, single_max_dur=65.0, part_max_dur=58.0)
+
+
 def test_split_topic_into_parts_single_two_three_and_invalid():
     # Single clip <= 65s
     specs_short = [(i * 10.0, i * 10.0 + 9.5, f"Frase curta {i}.") for i in range(5)]
     words_short = _make_words_from_sentences(specs_short)
     t_short = TopicSegment(start=0.0, end=49.5, peak=35.0, sentences=words_to_sentences(words_short))
-    parts_short = split_topic_into_parts(t_short, words_short)
+    parts_short = split_topic_into_parts(t_short, words_short, **ANTIGO_58)
     assert parts_short == [(0.0, 49.5, 1, 1)]
 
     # 95s -> 2 parts <= 58s
     specs_2 = [(i * 9.5, i * 9.5 + 9.1, f"Parte da história {i}.") for i in range(10)]
     words_2 = _make_words_from_sentences(specs_2)
     t_2 = TopicSegment(start=0.0, end=94.6, peak=70.0, sentences=words_to_sentences(words_2))
-    parts_2 = split_topic_into_parts(t_2, words_2)
+    parts_2 = split_topic_into_parts(t_2, words_2, **ANTIGO_58)
     assert len(parts_2) == 2
     for a, b, idx, total in parts_2:
         assert total == 2
@@ -158,7 +161,7 @@ def test_split_topic_into_parts_single_two_three_and_invalid():
     specs_3 = [(i * 9.0, i * 9.0 + 8.6, f"Trecho longo {i}.") for i in range(15)]
     words_3 = _make_words_from_sentences(specs_3)
     t_3 = TopicSegment(start=0.0, end=134.6, peak=100.0, sentences=words_to_sentences(words_3))
-    parts_3 = split_topic_into_parts(t_3, words_3)
+    parts_3 = split_topic_into_parts(t_3, words_3, **ANTIGO_58)
     assert [(p[2], p[3]) for p in parts_3] == [(1, 3), (2, 3), (3, 3)]
     for a, b, _, _ in parts_3:
         assert 25.0 <= (b - a) <= 58.0
@@ -168,7 +171,37 @@ def test_split_topic_into_parts_single_two_three_and_invalid():
     # Unbreakable 100s monologue with no punctuation and <0.5s gaps -> []
     words_mono = [Word(i * 1.0, i * 1.0 + 0.85, f"palavra{i}") for i in range(100)]
     t_mono = TopicSegment(start=0.0, end=99.85, peak=50.0, sentences=[(0.0, 99.85, "monologo")])
-    assert split_topic_into_parts(t_mono, words_mono) == []
+    assert split_topic_into_parts(t_mono, words_mono, **ANTIGO_58) == []
+
+
+def test_split_topic_into_parts_respeita_max_dur_45(monkeypatch):
+    monkeypatch.delenv("CLIPES_DUR_MIN", raising=False)
+    monkeypatch.delenv("CLIPES_DUR_MAX", raising=False)
+
+    # 94.6s com max 45 -> 3 partes, todas <= 45
+    specs_2 = [(i * 9.5, i * 9.5 + 9.1, f"Parte da história {i}.") for i in range(10)]
+    words_2 = _make_words_from_sentences(specs_2)
+    t_2 = TopicSegment(start=0.0, end=94.6, peak=70.0, sentences=words_to_sentences(words_2))
+    parts_2 = split_topic_into_parts(t_2, words_2, part_max_dur=45.0)
+    assert len(parts_2) == 3
+    for a, b, _, _ in parts_2:
+        assert b - a <= 45.0 + 1e-6
+
+    # 66.1s sem max explícito -> padrão CLIPES_DUR_MAX=45 -> 2 partes <= 45
+    specs_66 = [(i * 9.5, i * 9.5 + 9.1, f"Trecho {i}.") for i in range(7)]
+    words_66 = _make_words_from_sentences(specs_66)
+    t_66 = TopicSegment(start=0.0, end=66.1, peak=30.0, sentences=words_to_sentences(words_66))
+    parts_66 = split_topic_into_parts(t_66, words_66)
+    assert len(parts_66) == 2
+    for a, b, _, _ in parts_66:
+        assert b - a <= 45.0 + 1e-6
+
+    # Mesmo tópico com CLIPES_DUR_MAX=30 vindo da config -> 3 partes <= 30
+    monkeypatch.setenv("CLIPES_DUR_MAX", "30")
+    parts_30 = split_topic_into_parts(t_66, words_66)
+    assert len(parts_30) == 3
+    for a, b, _, _ in parts_30:
+        assert b - a <= 30.0 + 1e-6
 
 
 def test_long_transcript_real_segment_topics_split_and_snap_integration():
@@ -206,7 +239,7 @@ def test_long_transcript_real_segment_topics_split_and_snap_integration():
     topic = segment_topics(words, peak=140.0)
     assert topic is not None
     assert 65.0 < topic.duration <= 180.0
-    raw_parts = split_topic_into_parts(topic, words)
+    raw_parts = split_topic_into_parts(topic, words, **ANTIGO_58)
     assert len(raw_parts) in (2, 3)
 
     cand = CandidatePeak(
