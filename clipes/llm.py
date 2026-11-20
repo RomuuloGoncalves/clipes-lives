@@ -295,12 +295,20 @@ def complete(
     server_url: str | None = None,
     timeout: float | None = None,
     system_prompt: str | None = None,
+    max_tokens: int = 600,
 ) -> dict[str, Any]:
     """Run one deterministic ChatML completion against llama-server enforcing JSON Schema."""
     eff_timeout = _resolve_timeout(timeout)
     if server_url is None:
         with llama_server_session() as url:
-            return complete(prompt, schema=schema, server_url=url, timeout=eff_timeout, system_prompt=system_prompt)
+            return complete(
+                prompt,
+                schema=schema,
+                server_url=url,
+                timeout=eff_timeout,
+                system_prompt=system_prompt,
+                max_tokens=max_tokens,
+            )
 
     sys_msg = system_prompt or DEFAULT_SYSTEM_PROMPT
     if "/no_think" not in sys_msg:
@@ -313,7 +321,7 @@ def complete(
         ],
         "temperature": 0,
         "seed": 42,
-        "max_tokens": 600,
+        "max_tokens": int(max_tokens),
         "response_format": {
             "type": "json_object",
             "schema": schema,
@@ -549,7 +557,8 @@ def pick_hook_top(raw: str, title: str, transcript: str, reference_text: str = "
 
 def long_paragraph_fallback(clip: SnappedClip, limit: int = 320) -> str:
     """Primeiras frases completas da transcrição do clipe, até `limit` caracteres."""
-    text = " ".join(clip.text.split())
+    raw_text = str(getattr(clip, "translated_text", "") or "").strip() or clip.text
+    text = " ".join(raw_text.split())
     out = ""
     for sent in re.split(r"(?<=[.!?…])\s+", text):
         nxt = f"{out} {sent}".strip()
@@ -651,13 +660,32 @@ def _build_clip_prompt(clip_text: str, ing: IngestResult, channel: str) -> str:
     )
 
 
+def _fallback_title(clip: SnappedClip, words: list[Word]) -> str:
+    translated = str(getattr(clip, "translated_text", "") or "").strip()
+    if not translated:
+        return generate_title(clip, words)
+    cues = getattr(clip, "translated_cues", None) or []
+    if cues:
+        pt_words = [
+            Word(start=float(c.start), end=float(c.end), text=f" {tok}")
+            for c in cues
+            for tok in str(getattr(c, "translated", "") or "").split()
+        ]
+    else:
+        pt_words = [Word(start=clip.start, end=clip.end, text=f" {tok}") for tok in translated.split()]
+    return generate_title(clip, pt_words)
+
+
 def _apply_fallback(
     clip: SnappedClip,
     words: list[Word],
     ing: IngestResult,
     channel: str,
 ) -> None:
-    clip.title = generate_title(clip, words)
+    translated = str(getattr(clip, "translated_text", "") or "").strip()
+    clip_source_text = translated or clip.text
+    clip_ref_text = f"{ing.title} {channel} {translated}".strip()
+    clip.title = _fallback_title(clip, words)
     clip.title_source = "heuristic_fallback"
     clip.hashtags = sanitize_hashtags([], channel=channel, title=f"{ing.title} {clip.title}")
     clip.llm_score = None
@@ -668,7 +696,7 @@ def _apply_fallback(
         clip.title, channel, ing.url, clip.hashtags,
         part_index=part_index, part_total=part_total,
     )
-    clip.hook_top = pick_hook_top("", clip.title, clip.text)
+    clip.hook_top = pick_hook_top("", clip.title, clip_source_text, clip_ref_text)
     paragraph = long_paragraph_fallback(clip)
     if paragraph:
         clip.description_source = "fallback"
@@ -740,23 +768,25 @@ def enrich_clips_with_llm(
     channel = _infer_channel(ing)
     reference_text = f"{ing.title} {channel}".strip()
 
-    if not enabled or not any(c.text.strip() for c in clips):
+    if not enabled or not any((str(getattr(c, "translated_text", "") or "").strip() or c.text.strip()) for c in clips):
         for clip in clips:
             _apply_fallback(clip, words, ing, channel)
         return
 
     from . import cloud_llm  # import tardio: cloud_llm importa _THINK_RE deste módulo
 
-    cloud_llm.reset_round()
     stack = ExitStack()
     server_url: str | None = None
     server_failed = False
     try:
         for clip in clips:
-            if not clip.text.strip():
+            translated_text = str(getattr(clip, "translated_text", "") or "").strip()
+            clip_source_text = translated_text or clip.text
+            if not clip_source_text.strip():
                 _apply_fallback(clip, words, ing, channel)
                 continue
-            prompt = _build_clip_prompt(clip.text, ing, channel)
+            clip_ref_text = f"{reference_text} {translated_text}".strip() if translated_text else reference_text
+            prompt = _build_clip_prompt(clip_source_text, ing, channel)
             res: dict[str, Any] | None = None
             source = "llm"
             cloud = cloud_llm.complete_cloud(prompt, CLIP_JSON_SCHEMA, DEFAULT_SYSTEM_PROMPT)
@@ -780,11 +810,11 @@ def enrich_clips_with_llm(
                 continue
 
             raw_title = " ".join(str(res.get("titulo", "")).split())
-            if validate_title(raw_title, clip.text, reference_text) and not is_title_echo(raw_title, ing.title):
+            if validate_title(raw_title, clip.text, clip_ref_text) and not is_title_echo(raw_title, ing.title):
                 clip.title = raw_title
                 clip.title_source = source
             else:
-                clip.title = generate_title(clip, words)
+                clip.title = _fallback_title(clip, words)
                 clip.title_source = "heuristic_fallback"
 
             raw_tags = res.get("hashtags", [])
@@ -804,16 +834,16 @@ def enrich_clips_with_llm(
             clip.llm_reason = " ".join(str(res.get("motivo", "")).split())[:120]
 
             raw_hook = " ".join(str(res.get("gancho", "")).split())
-            hook = raw_hook if validate_hook(raw_hook, clip.text, reference_text) else clip.title
+            hook = raw_hook if validate_hook(raw_hook, clip.text, clip_ref_text) else clip.title
             part_index = int(getattr(clip, "part_index", 1) or 1)
             part_total = int(getattr(clip, "part_total", 1) or 1)
             clip.caption = format_three_line_caption(
                 hook, channel, ing.url, clip.hashtags,
                 part_index=part_index, part_total=part_total,
             )
-            clip.hook_top = pick_hook_top(str(res.get("gancho_topo", "")), clip.title, clip.text, reference_text)
+            clip.hook_top = pick_hook_top(str(res.get("gancho_topo", "")), clip.title, clip.text, clip_ref_text)
             paragraph, clip.description_source = pick_long_description(
-                str(res.get("descricao_longa", "")), clip, reference_text
+                str(res.get("descricao_longa", "")), clip, clip_ref_text
             )
             clip.description_long = (
                 format_long_description(

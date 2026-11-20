@@ -206,3 +206,104 @@ def test_traduzir_clipes_skips_pt_or_disabled_or_empty_words(monkeypatch):
     assert called is False
     assert clip_empty.legenda_traduzida is False
     assert clip_empty.legenda_fonte == "original"
+
+
+def test_llm_complete_respects_custom_max_tokens():
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    captured: list[dict] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            captured.append(body)
+            resp = json.dumps({"choices": [{"message": {"content": json.dumps({"blocos": []})}}]}).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(resp)))
+            self.end_headers()
+            self.wfile.write(resp)
+
+        def log_message(self, *args):
+            return
+
+    server = HTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}"
+        res = llm.complete("traduzir", schema=traducao.TRADUCAO_JSON_SCHEMA, server_url=url, max_tokens=1200)
+        assert res == {"blocos": []}
+        assert captured[0]["max_tokens"] == 1200
+    finally:
+        server.shutdown()
+        server.server_close()
+
+
+def test_enrich_clips_with_llm_accepts_pt_terms_from_translated_text(tmp_path, monkeypatch):
+    from clipes.models import IngestResult
+
+    ing = IngestResult(
+        video_id="vid1",
+        title="Live stream",
+        url="https://twitch.tv/streamer",
+        extractor="twitch",
+        is_live=True,
+        duration=120.0,
+        audio_path=tmp_path / "audio.wav",
+        video_path=None,
+        heatmap=None,
+        chat_messages=None,
+        out_dir=tmp_path,
+        cache_dir=tmp_path,
+        channel="streamer",
+    )
+    clip = SnappedClip(
+        peak=5.0,
+        start=0.0,
+        end=10.0,
+        score=0.9,
+        text="We arrived in Tokyo and won five hundred dollars!",
+        translated_text="Chegamos em Tóquio e ganhamos quinhentos dólares!",
+    )
+    words = [_w(1.0, 1.5, "We"), _w(1.6, 2.0, "arrived")]
+
+    # Confirm without translated_text, "Tóquio" would be flagged as ungrounded in English transcript
+    assert llm.validate_title("Vitória épica em Tóquio!", clip.text, "Live stream streamer") is False
+
+    monkeypatch.setattr(
+        cloud_llm,
+        "complete_cloud",
+        lambda *a, **kw: (
+            {
+                "titulo": "Vitória épica em Tóquio!",
+                "gancho": "Chegamos em Tóquio com tudo!",
+                "gancho_topo": "Chegamos em Tóquio!",
+                "descricao_longa": "Um momento incrível da live quando chegamos em Tóquio e comemoramos muito com o chat ao vivo.",
+                "hashtags": ["#cortes", "#livesbr", "#streamer"],
+                "nota": 8.5,
+                "motivo": "Clímax forte.",
+            },
+            "cloud:gemini:gemini-2.5-flash",
+        ),
+    )
+
+    llm.enrich_clips_with_llm([clip], words, ing, enabled=True)
+    assert clip.title == "Vitória épica em Tóquio!"
+    assert clip.title_source == "cloud:gemini:gemini-2.5-flash"
+
+    # Fallback mode also uses translated_text when enabled=False
+    clip_fb = SnappedClip(
+        peak=5.0,
+        start=0.0,
+        end=10.0,
+        score=0.9,
+        text="We arrived in Tokyo!",
+        translated_text="Chegamos em Tóquio agora!",
+    )
+    llm.enrich_clips_with_llm([clip_fb], words, ing, enabled=False)
+    assert clip_fb.title_source == "heuristic_fallback"
+    assert "Tóquio" in clip_fb.title
+    assert "Tóquio" in clip_fb.description_long
