@@ -442,7 +442,7 @@ def test_index_html_slots_fila_e_alvos():
 def test_config_schema_paridade_com_clipes():
     from clipes import config as clipes_config
 
-    assert len(_nucleo.CONFIG_SCHEMA) == 45
+    assert len(_nucleo.CONFIG_SCHEMA) == 54
     assert _nucleo.CONFIG_SCHEMA == clipes_config.CONFIG_SCHEMA
     assert _nucleo.FORBIDDEN_ENV_KEYS == clipes_config.FORBIDDEN_ENV_KEYS
 
@@ -688,3 +688,12 @@ def test_index_html_aba_temperatura_e_cor_pelo_limite_do_pc():
     assert re.search(r'CLIPES_TEMP_MAX\s*\|\|\s*85', raw) and re.search(r'CLIPES_TEMP_MIN\s*\|\|\s*75', raw), "padrao 85/75 ausente"
     assert '"temp-off"' in raw and re.search(r'CLIPES_VIGIA\)\s*===\s*"0"', raw), "cinza com CLIPES_VIGIA=0 ausente"
     assert re.search(r"\.temp-off\s*\{[^}]*color", raw), "classe .temp-off sem cor"
+
+
+def test_salvar_config_global_aceita_chaves_globais_antiflop_e_recusa_nao_globais(db):
+    code, body = _nucleo.salvar_config_global(db, {"config": {"CLIPES_DUR_MAX": "60"}}, NOW)
+    assert code == 200 and body["config"] == {"CLIPES_DUR_MAX": "60"}
+    assert db.config_global.find_one({"_id": "global"})["config"] == {"CLIPES_DUR_MAX": "60"}
+    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_CPU_THREADS": "4"}}, NOW)[0] == 400
+    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_DUR_MAX": "12"}}, NOW)[0] == 400
+    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_DUR_MIN": "30", "CLIPES_DUR_MAX": "30"}}, NOW)[0] == 400

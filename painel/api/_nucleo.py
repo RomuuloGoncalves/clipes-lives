@@ -661,6 +661,7 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
     # --- render (12) ---
     "CLIPES_LAYOUT": {
         "grupo": "render",
+        "escopo": "global",
         "tipo": "enum",
         "default": "split-starcuts",
         "opcoes": ["split-starcuts", "split-barra", "split-cheio", "split-fina", "full"],
@@ -749,6 +750,14 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "min": 300,
         "max": 600,
         "descricao": "Altura (px) da barra de marca",
+    },
+    "CLIPES_LAYOUT_FALLBACK": {
+        "grupo": "render",
+        "tipo": "enum",
+        "default": "blur",
+        "opcoes": ["blur", "recorte"],
+        "escopo": "global",
+        "descricao": "Fundo quando a facecam nao e detectada (blur ou recorte)",
     },
     # --- ia (11) ---
     "CLIPES_WHISPER_MODEL": {
@@ -946,6 +955,76 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "max": 95,
         "descricao": "Temperatura (C) em que o vigia retoma o processamento (menor que CLIPES_TEMP_MAX)",
     },
+    "CLIPES_VISIBILIDADE": {
+        "grupo": "publicacao",
+        "tipo": "enum",
+        "default": "padrao",
+        "opcoes": ["padrao", "private", "public"],
+        "escopo": "global",
+        "descricao": "Visibilidade da publicacao (padrao = a de cada plataforma)",
+    },
+    # --- antiflop (7) ---
+    "CLIPES_GATE": {
+        "grupo": "antiflop",
+        "tipo": "enum",
+        "default": "bloquear",
+        "opcoes": ["bloquear", "avisar", "off"],
+        "escopo": "global",
+        "descricao": "Gate de qualidade antes de publicar (bloquear, avisar ou off)",
+    },
+    "CLIPES_HOOK_MAX_ATRASO": {
+        "grupo": "antiflop",
+        "tipo": "float",
+        "default": "1.0",
+        "min": 0.3,
+        "max": 3.0,
+        "escopo": "global",
+        "descricao": "Atraso maximo (s) do gancho no inicio do clipe",
+    },
+    "CLIPES_DUR_MIN": {
+        "grupo": "antiflop",
+        "tipo": "int",
+        "default": "15",
+        "min": 8,
+        "max": 60,
+        "escopo": "global",
+        "descricao": "Duracao minima (s) do clipe",
+    },
+    "CLIPES_DUR_MAX": {
+        "grupo": "antiflop",
+        "tipo": "int",
+        "default": "45",
+        "min": 15,
+        "max": 120,
+        "escopo": "global",
+        "descricao": "Duracao maxima (s) do clipe",
+    },
+    "CLIPES_CARTAO_FINAL": {
+        "grupo": "antiflop",
+        "tipo": "bool",
+        "default": "0",
+        "opcoes": ["1", "0"],
+        "escopo": "global",
+        "descricao": "Cartao final no clipe (1=sim, 0=nao)",
+    },
+    "CLIPES_HASHTAGS": {
+        "grupo": "antiflop",
+        "tipo": "int",
+        "default": "3",
+        "min": 1,
+        "max": 5,
+        "escopo": "global",
+        "descricao": "Quantidade de hashtags por publicacao",
+    },
+    "CLIPES_DEDUP_PHASH": {
+        "grupo": "antiflop",
+        "tipo": "int",
+        "default": "6",
+        "min": 0,
+        "max": 32,
+        "escopo": "global",
+        "descricao": "Distancia pHash maxima para considerar clipe duplicado (0 desliga)",
+    },
 }
 
 
@@ -1073,6 +1152,10 @@ def validate_config_payload(raw_cfg: Mapping[str, Any]) -> tuple[dict[str, str],
     temp_max = int(clean.get("CLIPES_TEMP_MAX", CONFIG_SCHEMA["CLIPES_TEMP_MAX"]["default"]))
     if temp_min >= temp_max:
         return {}, "CLIPES_TEMP_MIN deve ser menor que CLIPES_TEMP_MAX"
+    lo = int(clean.get("CLIPES_DUR_MIN") or CONFIG_SCHEMA["CLIPES_DUR_MIN"]["default"])
+    hi = int(clean.get("CLIPES_DUR_MAX") or CONFIG_SCHEMA["CLIPES_DUR_MAX"]["default"])
+    if lo >= hi:
+        return {}, f"CLIPES_DUR_MIN ({lo}) deve ser menor que CLIPES_DUR_MAX ({hi})"
     return clean, None
 
 
@@ -1109,14 +1192,20 @@ def salvar_config(db: Any, corpo: Mapping[str, Any], now: datetime) -> tuple[int
 
 
 def salvar_config_global(db: Any, corpo: Mapping[str, Any], now: datetime) -> tuple[int, dict[str, Any]]:
-    """Persiste a config global (hoje so CLIPES_LAYOUT) em `config_global/_id=global`; vazio = remove."""
+    """Persiste a config global em `db.config_global` (_id=global); so chaves de `chaves_globais()`."""
     raw_cfg = corpo.get("config")
-    if not isinstance(raw_cfg, Mapping) or set(raw_cfg) - {"CLIPES_LAYOUT"}:
-        return 400, {"erro": "config global aceita apenas CLIPES_LAYOUT"}
+    if not isinstance(raw_cfg, Mapping):
+        return 400, {"erro": "config deve ser um objeto"}
+    globais = {k for k, m in CONFIG_SCHEMA.items() if m.get("escopo") == "global"}
+    for raw_key in raw_cfg:
+        if str(raw_key).strip() not in globais:
+            return 400, {"erro": f"chave nao global: {raw_key}"}
     clean_cfg, err = validate_config_payload(raw_cfg)
     if err is not None:
         return 400, {"erro": err}
-    db.config_global.update_one({"_id": "global"}, {"$set": {"config": clean_cfg, "updated_at": now}}, upsert=True)
+    db.config_global.update_one(
+        {"_id": "global"}, {"$set": {"config": clean_cfg, "updated_at": now}}, upsert=True
+    )
     return 200, {"ok": True, "config": clean_cfg}
 
 

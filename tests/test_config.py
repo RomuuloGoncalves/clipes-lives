@@ -107,9 +107,9 @@ def test_slots_non_strict_cai_no_padrao(monkeypatch):
 
 
 def test_config_schema_tem_45_variaveis_e_zero_segredos():
-    assert len(config.CONFIG_SCHEMA) == 45
+    assert len(config.CONFIG_SCHEMA) == 54
     grupos = {meta["grupo"] for meta in config.CONFIG_SCHEMA.values()}
-    assert grupos == {"lives", "render", "ia", "publicacao", "temperatura"}
+    assert grupos == {"lives", "render", "ia", "publicacao", "temperatura", "antiflop"}
     for key, meta in config.CONFIG_SCHEMA.items():
         assert not config._is_forbidden_key(key)
         assert "default" in meta
@@ -312,3 +312,40 @@ def test_vigia_erro_de_disco_e_ignorado(monkeypatch, tmp_path):
     arquivo.write_text("x", encoding="utf-8")
     applied = config.apply_remote_config({"CLIPES_VIGIA": "0"}, out_root=arquivo, alias="PC-1")
     assert applied == {"CLIPES_VIGIA": "0"}
+
+
+# ---- antiflop-v2 T1: chaves globais, DUR_MIN < DUR_MAX, config_global (DUR-01, MET-03, MET-06)
+
+def test_antiflop_chaves_globais_e_faixas():
+    g = config.chaves_globais()
+    esperadas = {
+        "CLIPES_GATE", "CLIPES_HOOK_MAX_ATRASO", "CLIPES_DUR_MIN", "CLIPES_DUR_MAX", "CLIPES_CARTAO_FINAL",
+        "CLIPES_HASHTAGS", "CLIPES_DEDUP_PHASH", "CLIPES_LAYOUT_FALLBACK", "CLIPES_VISIBILIDADE", "CLIPES_LAYOUT",
+    }
+    assert g == esperadas
+    s = config.CONFIG_SCHEMA
+    assert (s["CLIPES_GATE"]["opcoes"], s["CLIPES_GATE"]["default"]) == (["bloquear", "avisar", "off"], "bloquear")
+    assert (s["CLIPES_DUR_MIN"]["min"], s["CLIPES_DUR_MIN"]["max"], s["CLIPES_DUR_MIN"]["default"]) == (8, 60, "15")
+    assert (s["CLIPES_DUR_MAX"]["min"], s["CLIPES_DUR_MAX"]["max"], s["CLIPES_DUR_MAX"]["default"]) == (15, 120, "45")
+    assert s["CLIPES_VISIBILIDADE"]["grupo"] == "publicacao" and s["CLIPES_LAYOUT_FALLBACK"]["grupo"] == "render"
+    assert "CLIPES_CPU_THREADS" not in g
+
+
+def test_dur_min_deve_ser_menor_que_dur_max():
+    assert config.validate_config_payload({"CLIPES_DUR_MIN": "30", "CLIPES_DUR_MAX": "30"})[1] is not None
+    assert config.validate_config_payload({"CLIPES_DUR_MAX": "15"})[1] is not None  # MIN efetivo 15
+    assert config.validate_config_payload({"CLIPES_DUR_MIN": "20", "CLIPES_DUR_MAX": "40"})[1] is None
+    assert config.validate_config_payload({"CLIPES_DUR_MIN": "50"})[1] is not None  # MAX efetivo 45
+    assert config.validate_config_payload({"CLIPES_GATE": "talvez"})[1] is not None
+
+
+def test_config_global_le_so_chaves_globais_validas():
+    import mongomock
+
+    db = mongomock.MongoClient()["t"]
+    assert config.config_global(None) == {}
+    assert config.config_global(db) == {}
+    db.config_global.insert_one({"_id": "global", "config": {"CLIPES_DUR_MAX": "60", "CLIPES_CPU_THREADS": "4"}})
+    assert config.config_global(db) == {"CLIPES_DUR_MAX": "60"}
+    db.config_global.update_one({"_id": "global"}, {"$set": {"config": {"CLIPES_GATE": "invalido"}}})
+    assert config.config_global(db) == {}
