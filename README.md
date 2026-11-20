@@ -262,6 +262,84 @@ db.commands.deleteMany({ status: { $in: ["feito", "rejeitado"] }, criado_em: { $
 db.alvos.deleteMany({ estado: { $in: ["feito", "falhou", "removido"] }, criado_em: { $lt: new Date(Date.now() - 30 * 86400000) } });
 ```
 
+## Gate de qualidade, duração e métricas (anti-flop)
+
+Cada clipe passa por um **gate** ao fim do render (`clips.json` e `registro` ganham `gate = {"ok": bool, "motivos": [...], "versao": 1}`). O gate reprova o que a síntese chama de eliminatório para retenção.
+
+| Motivo | Reprova quando |
+| ------ | -------------- |
+| `hook_ausente` | o hook da tela está vazio |
+| `hook_truncado` | o hook termina em `…`/`...` ou não coube em 2 linhas |
+| `hook_invalido` | `U+FFFD` ou letra CJK/Hangul/Kana em clipe de idioma latino |
+| `fala_tardia` | a 1ª palavra vem depois de `start + CLIPES_HOOK_MAX_ATRASO` |
+| `duracao_fora` | duração fora de `[CLIPES_DUR_MIN, CLIPES_DUR_MAX]` |
+| `barras_pretas` | layout `black_bars_16x9` |
+| `resolucao` | master diferente de 1080x1920 |
+| `caption_url` | URL na caption |
+| `caption_hashtags` | 0 hashtags, mais que `CLIPES_HASHTAGS` ou alguma banida |
+| `caption_repete_hook` | 1ª linha da caption igual ao hook |
+
+Modos (`CLIPES_GATE`):
+
+- `bloquear` (padrão): `publicacao` recusa o clipe com `gate.ok=false`, listando os motivos, sem reservar cota nem agendar. No Discord o cartão mostra `Bloqueado: <motivos>` e sem botões de publicação.
+- `avisar`: publica, mas anexa os motivos ao status. Use para calibrar antes de travar.
+- `off`: o gate não é avaliado.
+
+Também no gate: clipe do mesmo canal com trecho sobreposto em ≥ 50%, mesmo texto inicial ou imagem parecida com um clipe já publicado ou pendente é recusado como `duplicado de <clip_id>`. `CLIPES_DEDUP_PHASH=0` desliga só o critério de imagem.
+
+### Chaves globais novas
+
+São chaves de escopo **global**: valem para todos os PCs (o painel as edita na área de config global, não por PC; quando `CLIPES_MONGO_URI` está ativo, a publicação do bot lê as mesmas chaves do Mongo a cada ciclo). Global vence o valor por PC.
+
+| Chave | Padrão | Efeito |
+| ----- | ------ | ------ |
+| `CLIPES_GATE` | `bloquear` | `bloquear`, `avisar` ou `off` (ver acima) |
+| `CLIPES_HOOK_MAX_ATRASO` | `1.0` | segundos entre o início do clipe e a 1ª fala; acima disso o início é cortado (`primeira_palavra - 0,2 s`) se o clipe continuar com duração válida |
+| `CLIPES_DUR_MIN` / `CLIPES_DUR_MAX` | `15` / `45` | duração do clipe em segundos (faixas 8-60 e 15-120; `MIN` precisa ser menor que `MAX`, senão a validação recusa). `cli` usa esses valores sem `--min-dur`/`--max-dur`; a live usa `MAX` como teto dos jobs; partes de narrativa longa respeitam o mesmo teto |
+| `CLIPES_LAYOUT_FALLBACK` | `blur` | `blur` (fundo desfocado) ou `recorte` (9:16 centrado no jogo) quando não há webcam ou o split falha. `black_bars_16x9` não é mais fallback |
+| `CLIPES_CARTAO_FINAL` | `0` | `0`: sem trecho congelado e sem cartão "Live completa"/"Parte k+1"; `1`: comportamento anterior |
+| `CLIPES_HASHTAGS` | `3` | 1 a 5 hashtags, só específicas (sem `#cortes`, `#livesbr`, `#clipsbr`, `#twitchtv*`, `#live`, `#conflito`, `#reacao`) |
+| `CLIPES_DEDUP_PHASH` | `6` | distância máxima do dHash para considerar duplicata; `0` desliga o critério de imagem |
+| `CLIPES_VISIBILIDADE` | `padrao` | ver abaixo |
+
+Duração: a faixa 15-45 s é o passo conservador da síntese (não há número oficial). Para testar uma variável por vez, mude `CLIPES_DUR_MIN`/`CLIPES_DUR_MAX` e compare com a sua própria mediana.
+
+### Visibilidade
+
+- `CLIPES_VISIBILIDADE=padrao` (padrão): exatamente o comportamento de hoje (`private` no YouTube, `SELF_ONLY` no TikTok).
+- `private`: força `private` / `SELF_ONLY`.
+- `public`: YouTube publica `public`; TikTok publica `PUBLIC_TO_EVERYONE`, sujeito às opções que a conta permite. **No TikTok, público exige app auditado** (ver §6); sem auditoria o post é recusado com `unaudited_client_can_only_post_to_private_accounts`.
+
+A privacidade usada fica em `publicacoes.<plataforma>.privacidade`. O painel mostra um aviso quando a visibilidade efetiva não é `public`: posts privados não medem flop.
+
+### Métricas (manual)
+
+Não há coleta automática (exige escopos de API e app auditado). As métricas entram no registro por `metricas.<plataforma>` com `fonte` (`manual` ou `csv`) e `atualizado_em`.
+
+Registrar um clipe à mão:
+
+```sh
+docker compose run --rm clipes metricas registrar <clip_id> --plataforma tiktok --views 1200 --tempo-medio 8.5 --completo 42 --curtidas 30 --compartilhamentos 4
+```
+
+Importar o CSV exportado do Studio:
+
+```sh
+docker compose run --rm clipes metricas importar /caminho/export.csv --plataforma youtube
+```
+
+- Exporte do **YouTube Studio** em Analytics → Conteúdo (lista de Shorts) → exportar como CSV; do **TikTok Studio** em Analytics → Vídeos → exportar dados. Os menus mudam com frequência; confira na sua tela.
+- O CSV aceita cabeçalhos em PT e EN (UTF-8 com BOM, `,` ou `;`; números com `.` ou `,` e `%`). Se uma coluna não for reconhecida, sobrescreva com `--col-id`, `--col-views` etc.
+- A linha casa com o clipe pelo id ou URL do vídeo gravado em `publicacoes.<plataforma>`. O comando imprime quantas casaram e quais não. No TikTok o export pode trazer só o `publish_id`, que não casa: use `registrar`.
+
+### Checklist manual [RENDER]
+
+Rode antes de liberar uma mudança de render (não é coberto pelo gate automático):
+
+- [ ] 1 clipe por layout no app (webcam/split, `blur` e `recorte`): nenhuma barra preta e o jogo centralizado.
+- [ ] Loop sem cartão: com `CLIPES_CARTAO_FINAL=0`, o último frame não é congelado nem há cartão "Live completa"; o áudio termina com fade curto dentro do conteúdo.
+- [ ] Hook na barra: o hook aparece completo nas 2 linhas, sem `…` e sem caractere estranho.
+
 ## Bot do Discord e Publicação Privada
 
 O `./clipar servico` envia cada live para o canal `#clipes` (`DISCORD_CHANNEL_ID`) como 1 cartão + 1 thread por `live_id`, editados no lugar, e os avisos (recusa, sem vaga, janela descartada por backlog, falha, serviço iniciado/parado, prévia que não coube) para `#bot-log`, nunca para o `#clipes`. O canal de avisos é resolvido nesta ordem: `DISCORD_LOG_CHANNEL_ID` (opcional); o cache `OUT_DIR/.discord_log_channel`; um canal de texto `bot-log` já existente na guilda; um `bot-log` criado pelo bot (exige permissão Manage Channels). Sem nada disso, os avisos vão só para o stdout. Avisos repetidos em até 60 s são suprimidos, e o próximo envio desse texto leva `(+N repetidos)`. O serviço `bot` aceita comandos para publicar como **privado** no YouTube Shorts (`privacyStatus="private"`) e no TikTok (`privacy_level="SELF_ONLY"`), usando as variáveis definidas em `.env` e os tokens gravados em `/config/tokens.json`.
@@ -371,7 +449,7 @@ Todo clipe processado por CLI ou worker é indexado em `OUT_DIR/registro.json` (
 
 ### 6. Auditoria para publicação pública (futuro)
 
-Nesta versão a privacidade é fixa no código (`private` / `SELF_ONLY`). Para liberar publicação pública após auditoria:
+Por padrão a privacidade é fixa no código (`private` / `SELF_ONLY`); `CLIPES_VISIBILIDADE=public` a libera (ver "Visibilidade" acima). Para liberar publicação pública após auditoria:
 
 - **YouTube**: preencher o formulário *YouTube API Services – Audit and Quota Extension Form* (*Complete a compliance audit*) com descrição arquitetural e screencast do fluxo de upload acionado pelo usuário.
 - **TikTok**: submeter revisão no portal com domínio verificado (Termos de Uso e Política de Privacidade), screencast completo do fluxo OAuth e da tela de publicação, e integração a `/v2/post/publish/creator_info/query/` exibindo opções de privacidade e consentimento conforme as diretrizes de UX da plataforma.
