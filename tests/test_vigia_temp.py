@@ -296,3 +296,95 @@ echo "$cmd $*" >> "{docker_calls}"
     assert "cid_bot" not in calls
     assert "pause cid_clipes" in calls
     assert "unpause cid_clipes" in calls
+
+
+def _sensor(tmp_path, milli):
+    sysfs = tmp_path / "sys"
+    _write_file(sysfs / "class/hwmon/hwmon0/name", "k10temp\n")
+    _write_file(sysfs / "class/hwmon/hwmon0/temp1_input", f"{milli}\n")
+    return sysfs
+
+
+def _rodar(tmp_path, milli, vigia=None, extra_env=None):
+    sysfs = _sensor(tmp_path, milli)
+    bin_dir, calls = _setup_fake_bin(tmp_path)
+    env = _base_env(tmp_path, sysfs, bin_dir)
+    env.update(extra_env or {})
+    if vigia is not None:
+        _write_file(Path(env["OUT_DIR"]) / ".vigia", vigia)
+    return env, calls, subprocess.Popen([str(VIGIA_PATH)], env=env)
+
+
+def _parar(proc):
+    proc.send_signal(signal.SIGTERM)
+    proc.wait(timeout=5)
+
+
+def _lido(p):
+    return p.read_text(encoding="utf-8") if p.exists() else ""
+
+
+def test_troca_de_vigia_entre_ciclos_muda_limite(tmp_path):
+    env, calls, proc = _rodar(tmp_path, 80000, vigia="1 90 80\n")
+    log = Path(env["LOG"])
+    try:
+        _wait_until(lambda: "80C pausado=0 ativo=1" in _lido(log))
+        assert "pause cid123" not in _lido(calls)
+        _write_file(Path(env["OUT_DIR"]) / ".vigia", "1 80 70\n")
+        _wait_until(lambda: "pause cid123" in _lido(calls).splitlines())
+    finally:
+        _parar(proc)
+
+
+def test_ativo_zero_despausa_e_nao_pausa(tmp_path):
+    env, calls, proc = _rodar(tmp_path, 90000, vigia="1 85 75\n")
+    log = Path(env["LOG"])
+    try:
+        _wait_until(lambda: "pause cid123" in _lido(calls).splitlines())
+        _write_file(Path(env["OUT_DIR"]) / ".vigia", "0 85 75\n")
+        _wait_until(lambda: "unpause cid123" in _lido(calls).splitlines())
+        _wait_until(lambda: "90C pausado=0 ativo=0" in _lido(log))
+        n = _lido(calls).splitlines().count("pause cid123")
+        time.sleep(0.4)
+        assert _lido(calls).splitlines().count("pause cid123") == n
+        assert (Path(env["OUT_DIR"]) / ".temp").read_text().strip() == "90"
+    finally:
+        _parar(proc)
+
+
+def test_segunda_instancia_sai_0_e_pidfile_some_no_fim(tmp_path):
+    env, _, proc = _rodar(tmp_path, 60000)
+    pidfile = Path(env["OUT_DIR"]) / ".vigia.pid"
+    try:
+        _wait_until(pidfile.exists)
+        assert pidfile.read_text().strip() == str(proc.pid)
+        res = subprocess.run([str(VIGIA_PATH)], env=env, timeout=5)
+        assert res.returncode == 0
+        assert pidfile.read_text().strip() == str(proc.pid)
+    finally:
+        _parar(proc)
+    assert not pidfile.exists()
+
+
+def test_pidfile_de_processo_morto_nao_bloqueia(tmp_path):
+    out = tmp_path / "out"
+    morto = subprocess.Popen(["true"])
+    morto.wait()
+    _write_file(out / ".vigia.pid", f"{morto.pid}\n")
+    env, _, proc = _rodar(tmp_path, 60000)
+    try:
+        _wait_until(lambda: (out / ".vigia.pid").read_text().strip() == str(proc.pid))
+    finally:
+        _parar(proc)
+
+
+@pytest.mark.parametrize("conteudo", ["lixo", "1 50 70", "1 101 75", "1 85", "x 85 75", "2 85 75", "1 85 39"])
+def test_vigia_invalido_usa_padroes(tmp_path, conteudo):
+    env, calls, proc = _rodar(
+        tmp_path, 88000, vigia=conteudo + "\n", extra_env={"CLIPES_TEMP_MAX": "85", "CLIPES_TEMP_MIN": "75"}
+    )
+    try:
+        _wait_until(lambda: "pause cid123" in _lido(calls).splitlines())
+        _wait_until(lambda: "88C pausado=1 ativo=1" in _lido(Path(env["LOG"])))
+    finally:
+        _parar(proc)

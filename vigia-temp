@@ -1,8 +1,6 @@
 #!/bin/sh
 # Vigia termico: pausa os containers do projeto acima de MAX C e retoma abaixo de MIN C.
 # Registra a temperatura em $LOG (padrao $OUT_DIR/.temp.log) e o valor atual em $OUT_DIR/.temp.
-MAX="${CLIPES_TEMP_MAX:-85}"
-MIN="${CLIPES_TEMP_MIN:-75}"
 SYSFS_ROOT="${SYSFS_ROOT:-/sys}"
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 OUT_DIR="${OUT_DIR:-$ROOT/out}"
@@ -42,23 +40,47 @@ if [ "${1:-}" = "--check" ]; then
 fi
 
 mkdir -p "$OUT_DIR" "$(dirname "$LOG")"
+PIDFILE="$OUT_DIR/.vigia.pid"
+if [ -r "$PIDFILE" ]; then
+  old=$(cat "$PIDFILE" 2>/dev/null)
+  case "$old" in ''|*[!0-9]*) ;; *) [ "$old" != "$$" ] && kill -0 "$old" 2>/dev/null && exit 0 ;; esac
+fi
+echo $$ > "$PIDFILE"
+
+# Le $OUT_DIR/.vigia ("ativo max min"); invalido -> env/padroes.
+ler_cfg() {
+  ATIVO="${CLIPES_VIGIA:-1}"; MAX="${CLIPES_TEMP_MAX:-85}"; MIN="${CLIPES_TEMP_MIN:-75}"
+  a=""; mx=""; mn=""
+  read a mx mn < "$OUT_DIR/.vigia" 2>/dev/null || true
+  case "$a$mx$mn" in *[!0-9]*|'') return ;; esac
+  [ -n "$a" ] && [ -n "$mx" ] && [ -n "$mn" ] || return
+  [ "$a" -le 1 ] && [ "$mx" -ge 60 ] && [ "$mx" -le 100 ] && [ "$mn" -ge 40 ] && [ "$mn" -le 95 ] && [ "$mn" -lt "$mx" ] || return
+  ATIVO=$a; MAX=$mx; MIN=$mn
+}
+
 pausado=0
-trap 'ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes); [ -n "$ids" ] && docker unpause $ids >/dev/null 2>&1; exit' INT TERM EXIT
+trap 'rm -f "$PIDFILE"; ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes); [ -n "$ids" ] && docker unpause $ids >/dev/null 2>&1; exit' INT TERM EXIT
 
 while :; do
+  ler_cfg
   t=$(ler_temp)
   printf '%s\n' "$t" > "$OUT_DIR/.temp.tmp.$$" && mv -f "$OUT_DIR/.temp.tmp.$$" "$OUT_DIR/.temp"
   if [ "$t" = "sem-sensor" ]; then
-    echo "$(date +%T) sem-sensor pausado=$pausado" >> "$LOG"; sync "$LOG" 2>/dev/null
+    echo "$(date +%T) sem-sensor pausado=$pausado ativo=$ATIVO" >> "$LOG"; sync "$LOG" 2>/dev/null
     if [ "$pausado" = 1 ]; then
       ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes)
       [ -n "$ids" ] && docker unpause $ids >/dev/null 2>&1
       pausado=0
     fi
   else
-    echo "$(date +%T) ${t}C pausado=$pausado" >> "$LOG"; sync "$LOG" 2>/dev/null
+    echo "$(date +%T) ${t}C pausado=$pausado ativo=$ATIVO" >> "$LOG"; sync "$LOG" 2>/dev/null
     ids=$(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes)
-    if [ "$pausado" = 0 ] && [ "$t" -ge "$MAX" ]; then
+    if [ "$ATIVO" = 0 ]; then
+      if [ "$pausado" = 1 ]; then
+        [ -n "$ids" ] && docker unpause $ids >/dev/null 2>&1
+        pausado=0
+      fi
+    elif [ "$pausado" = 0 ] && [ "$t" -ge "$MAX" ]; then
       [ -n "$ids" ] && docker pause $ids >/dev/null 2>&1
       pausado=1
     elif [ "$pausado" = 1 ] && [ "$t" -le "$MIN" ]; then
