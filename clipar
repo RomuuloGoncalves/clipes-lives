@@ -40,8 +40,11 @@ CLIPES_RECURSOS_GERIDO=1
 export CLIPES_RECURSOS_GERIDO
 
 calc_recursos() {
+  # "*" (sem limite) vira 0 para o docker compose.
   CLIPES_CPUS="$ENV_CPUS"
+  [ "$CLIPES_CPUS" = "*" ] && CLIPES_CPUS=0
   CLIPES_MEM="$ENV_MEM"
+  [ "$CLIPES_MEM" = "*" ] && CLIPES_MEM=0
   painel_mem="-"
   painel_cpus="-"
   if [ -r "$OUT_DIR/.recursos" ]; then
@@ -49,9 +52,12 @@ calc_recursos() {
   fi
   case "$painel_mem" in
     [0-9]*[mg]) CLIPES_MEM="$painel_mem" ;;
+    \*) CLIPES_MEM=0 ;;
   esac
   case "$painel_cpus" in
-    ''|-|*[!0-9.]*) ;;
+    ''|-) ;;
+    \*) CLIPES_CPUS=0 ;;
+    *[!0-9.]*) ;;
     *) CLIPES_CPUS="$painel_cpus" ;;
   esac
   if [ -z "${CLIPES_CPUS:-}" ]; then
@@ -80,8 +86,14 @@ calc_recursos() {
     fi
   fi
   export CLIPES_MEM
-  threads_auto="${CLIPES_CPUS%%.*}"
-  case "$threads_auto" in ''|0|*[!0-9]*) threads_auto=1 ;; esac
+  if [ "$CLIPES_CPUS" = 0 ]; then
+    # Sem limite de CPU: threads = nproc (mínimo 1).
+    threads_auto=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
+    case "$threads_auto" in ''|0|*[!0-9]*) threads_auto=1 ;; esac
+  else
+    threads_auto="${CLIPES_CPUS%%.*}"
+    case "$threads_auto" in ''|0|*[!0-9]*) threads_auto=1 ;; esac
+  fi
   CLIPES_CPU_THREADS="${ENV_CPU_THREADS:-$threads_auto}"
   export CLIPES_CPU_THREADS
 }

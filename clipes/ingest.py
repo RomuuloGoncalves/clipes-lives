@@ -517,7 +517,11 @@ def ingest_local(local_dir: Path, out_root: Path, enable_chat: bool = True) -> I
 
     wav_path = cache_dir / "audio.wav"
     if not (wav_path.is_file() and wav_path.stat().st_size > 1024):
-        extract_wav(source, wav_path)
+        pre_wav = local_dir / "audio.wav"
+        if pre_wav.is_file() and pre_wav.stat().st_size > 1024:
+            shutil.move(str(pre_wav), str(wav_path))
+        else:
+            extract_wav(source, wav_path)
 
     chat_messages: list[list[Any]] | None = None
     chat_path = local_dir / "chat.json"

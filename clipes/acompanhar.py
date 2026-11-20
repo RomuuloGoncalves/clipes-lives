@@ -23,9 +23,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config, monitor
+from . import config, monitor, signals as sinais
 from .executor_publicacao import PublishLoop
-from .ingest import sanitize_id
+from .ingest import extract_wav, sanitize_id
 from .janelas import filter_emitted, owns, window_end
 from .notificar import _write_json_atomic, post_aviso
 from .perfil import max_lives as perfil_max_lives
@@ -240,7 +240,7 @@ class _SessionQueueView(monitor.DiskQueue):
                 if not (_is_busca_job(job) or (skey in own and _is_window_job(job))):
                     continue
                 pending.append((
-                    -float(job.get("z_score") or 0.0),
+                    -float((job.get("pre_score") if _is_window_job(job) else job.get("z_score")) or 0.0),
                     float(job.get("created_at") or 0.0),
                     job_dir.name,
                     job_dir,
@@ -289,7 +289,7 @@ class LiveSession:
         pending_live_id: str | None = None,
         pending_stream_id: str | None = None,
         has_coord: bool = False,
-        on_backlog_lost: Callable[[Alvo, str], None] | None = None,
+        on_backlog_lost: Callable[[Alvo, str, float], None] | None = None,
         captura_morta_s: float | None = None,
     ) -> None:
         self.alvo = alvo
@@ -432,6 +432,13 @@ class LiveSession:
                     job.update(status="rejected", reject_reason="too_short")
             if job["status"] == "rejected":
                 (job_dir / "source.mkv").unlink(missing_ok=True)
+            else:
+                try:
+                    extract_wav(job_dir / "source.mkv", job_dir / "audio.wav")
+                    job["pre_score"] = float(sinais.pre_score(job_dir / "audio.wav"))
+                except Exception as exc:
+                    print(f"[live] pre_score falhou: {exc}", flush=True)
+                    job["pre_score"] = 0.0
             (job_dir / "meta.json").write_text(
                 json.dumps(
                     {
@@ -488,12 +495,20 @@ class LiveSession:
         backlog = self.pending()
         disco_baixo = self.disk_usage(self.out_root).free < self.min_free * 1e9
         if len(backlog) > self.max_backlog or (disco_baixo and len(backlog) > 1):
+            def _chave(d: Path) -> tuple[float, float, str]:
+                try:
+                    j = monitor._read_job(d)
+                except (OSError, ValueError):
+                    j = {}
+                return (float(j.get("pre_score") or 0.0), float(j.get("created_at") or 0.0), d.name)
+
+            lost_dir = min(backlog, key=_chave)
+            lost_score = _chave(lost_dir)[0]
             print(
                 f"[live] backlog {len(backlog)} (limite {self.max_backlog}, disco_baixo={disco_baixo}): "
-                f"{backlog[0].name} lost",
+                f"{lost_dir.name} lost (score {lost_score:.1f})",
                 flush=True,
             )
-            lost_dir = backlog[0]
             try:
                 lost_job = monitor._read_job(lost_dir)
             except (OSError, ValueError):
@@ -518,7 +533,7 @@ class LiveSession:
                         raise
                     self.on_mongo_error(exc)
             if self.on_backlog_lost is not None:
-                self.on_backlog_lost(self.alvo, lost_dir.name)
+                self.on_backlog_lost(self.alvo, lost_dir.name, lost_score)
 
     def tick(self, t: float) -> bool:
         """Advance session at clock `t`; returns False when live has ended."""
@@ -1380,7 +1395,9 @@ class Supervisor:
             pending_live_id=pending_live_id,
             pending_stream_id=pending_stream_id,
             has_coord=self.coord is not None,
-            on_backlog_lost=lambda a, _name: self.aviso_fn(f"janela perdida {self._label(a)} (fila cheia)"),
+            on_backlog_lost=lambda a, _name, score: self.aviso_fn(
+                f"janela perdida {self._label(a)} (fila cheia, score {score:.1f})"
+            ),
         )
         self._alvo_by_key[sess.key] = alvo
         try:

@@ -987,7 +987,8 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "grupo": "recursos",
         "tipo": "mem",
         "default": "",
-        "descricao": "Limite de RAM do conteiner (ex.: 4g ou 4096m; 512m a 128g; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
+        "sem_limite": "*",
+        "descricao": "Limite de RAM do conteiner (ex.: 4g ou 4096m; 512m a 128g; * = sem limite; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
     },
     "CLIPES_CPUS": {
         "grupo": "recursos",
@@ -995,7 +996,8 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "",
         "min": 0.5,
         "max": 64.0,
-        "descricao": "Limite de CPUs do conteiner (ex.: 2 ou 1.5; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
+        "sem_limite": "*",
+        "descricao": "Limite de CPUs do conteiner (ex.: 2 ou 1.5; * = sem limite; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
     },
     "CLIPES_VISIBILIDADE": {
         "grupo": "publicacao",
@@ -1098,6 +1100,9 @@ def _validate_single(key: str, raw_val: Any) -> tuple[str | None, str | None]:
 
     if val_str == "":
         return None, None
+
+    if val_str == meta.get("sem_limite"):
+        return val_str, None
 
     if tipo == "int":
         if not _INT_STR_RE.fullmatch(val_str):

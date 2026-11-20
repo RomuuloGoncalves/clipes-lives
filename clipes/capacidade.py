@@ -10,6 +10,8 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
+from clipes import config
+
 
 def cpu_threads(sysfs: str | Path = "/sys") -> int:
     """Return CLIPES_CPU_THREADS if set, else floor(quota/period) from cgroup cpu.max, else os.cpu_count()."""
@@ -36,21 +38,6 @@ def cpu_threads(sysfs: str | Path = "/sys") -> int:
             pass
 
     return os.cpu_count() or 1
-
-
-def _read_cgroup_memory_bytes(sysfs: Path) -> int | None:
-    mem_max = sysfs / "fs" / "cgroup" / "memory.max"
-    try:
-        raw = mem_max.read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-    if not raw or raw == "max":
-        return None
-    try:
-        val = int(raw)
-        return val if val >= 0 else None
-    except ValueError:
-        return None
 
 
 def _read_mem_available_bytes(proc: Path) -> int | None:
@@ -156,11 +143,20 @@ def capacity(
 
     cpus = cpu_threads(sysfs=sysfs_path)
     cpu_pct = _read_cpu_pct(proc_path, cpus)
-    mem_candidates = [
-        v for v in (_read_cgroup_memory_bytes(sysfs_path), _read_mem_available_bytes(proc_path))
-        if v is not None
-    ]
+    mem_limite, _cpus_limite = config._cgroup_limites(sysfs_path / "fs" / "cgroup")
+    mem_livre = _read_mem_available_bytes(proc_path)
+    mem_candidates = [v for v in (mem_limite or None, mem_livre) if v is not None]
     ram_gb = round(min(mem_candidates) / (1024**3), 2) if mem_candidates else 0.0
+    if mem_limite is None:
+        ram_limite_estado = "ilegivel"
+        ram_limite_gb = None
+    elif mem_limite == 0:
+        ram_limite_estado = "sem_limite"
+        ram_limite_gb = None
+    else:
+        ram_limite_estado = "limite"
+        ram_limite_gb = round(mem_limite / (1024**3), 2)
+    ram_livre_gb = round(mem_livre / (1024**3), 2) if mem_livre is not None else None
     disco_livre_gb = round(shutil.disk_usage(out_path).free / (1024**3), 2)
     temp_c = _read_temp_c(out_path)
     gpu = _probe_gpu(run)
@@ -170,6 +166,9 @@ def capacity(
         "cpus": cpus,
         "cpu_pct": cpu_pct,
         "ram_gb": ram_gb,
+        "ram_livre_gb": ram_livre_gb,
+        "ram_limite_gb": ram_limite_gb,
+        "ram_limite_estado": ram_limite_estado,
         "disco_livre_gb": disco_livre_gb,
         "temp_c": temp_c,
         "gpu": gpu,

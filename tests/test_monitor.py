@@ -534,3 +534,40 @@ def test_run_local_pipeline_usa_min_per_hour_zero_e_mantem_duracoes(tmp_path, mo
     assert seen_args[-1].min_per_hour == 0.0
     assert seen_args[-1].max_dur == 45.0
     assert seen_args[-1].min_dur == 15.0
+
+
+@pytest.fixture
+def fake_wav(monkeypatch):
+    """Replaces extract_wav/probe_duration with fakes; records extract_wav calls."""
+    calls = []
+
+    def fake_extract(src, wav):
+        calls.append((src, wav))
+        wav.write_bytes(b"x" * 2048)
+        return wav
+
+    monkeypatch.setattr(ingest_mod, "extract_wav", fake_extract)
+    monkeypatch.setattr(ingest_mod, "probe_duration", lambda p: 3.0)
+    return calls
+
+
+def test_ingest_local_reuses_job_audio_wav(job_dir, tmp_path, no_network, fake_wav):
+    (job_dir / "audio.wav").write_bytes(b"w" * 4096)
+    res = ingest_local(job_dir, tmp_path / "out")
+    assert fake_wav == []
+    assert res.audio_path.is_file()
+    assert res.audio_path.read_bytes() == b"w" * 4096
+    assert not (job_dir / "audio.wav").exists()
+
+
+def test_ingest_local_extracts_wav_when_job_has_none(job_dir, tmp_path, no_network, fake_wav):
+    res = ingest_local(job_dir, tmp_path / "out")
+    assert len(fake_wav) == 1
+    assert res.audio_path.is_file()
+
+
+def test_ingest_local_extracts_wav_when_job_audio_is_tiny(job_dir, tmp_path, no_network, fake_wav):
+    (job_dir / "audio.wav").write_bytes(b"w" * 512)
+    res = ingest_local(job_dir, tmp_path / "out")
+    assert len(fake_wav) == 1
+    assert res.audio_path.is_file()

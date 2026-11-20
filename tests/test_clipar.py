@@ -343,3 +343,43 @@ def test_entry_main_servico_auth_bot_url_e_comandos_removidos(monkeypatch, capsy
     assert seen_bot == [[]]
     assert entry.main(["https://www.twitch.tv/videos/123"]) == 0
     assert seen_cli == [["https://www.twitch.tv/videos/123"]]
+
+
+def test_clipar_recursos_asterisco_sem_limite_e_threads_com_nproc(tmp_path):
+    # REC-02 AC2-AC3: `*` em .recursos vira 0 e threads usam nproc.
+    clipar_bin, env, docker_log, _ = _prepare_clipar_env(tmp_path / "estrela", nproc_val=7)
+    (Path(env["OUT_DIR"])).mkdir(parents=True, exist_ok=True)
+    (Path(env["OUT_DIR"]) / ".recursos").write_text("* *\n", encoding="utf-8")
+    res = subprocess.run([str(clipar_bin), "https://twitch.tv/teste"], env=env, capture_output=True, text=True)
+    assert res.returncode == 0
+    line = docker_log.read_text(encoding="utf-8").strip().splitlines()[0]
+    assert "CPUS=0|MEM=0|THREADS=7" in line
+
+
+def test_clipar_env_mem_asterisco_sem_recursos_vira_zero(tmp_path):
+    # REC-02 AC2: CLIPES_MEM=* no .env, sem .recursos.
+    clipar_bin, env, docker_log, _ = _prepare_clipar_env(tmp_path / "env_estrela")
+    secrets = tmp_path / "env_estrela" / "segredos.env"
+    secrets.write_text("CLIPES_MEM=*\n", encoding="utf-8")
+    secrets.chmod(0o600)
+    env["CLIPES_SECRETS"] = str(secrets)
+    res = subprocess.run([str(clipar_bin), "https://twitch.tv/teste"], env=env, capture_output=True, text=True)
+    assert res.returncode == 0
+    line = docker_log.read_text(encoding="utf-8").strip().splitlines()[0]
+    assert "MEM=0" in line
+
+
+def test_clipar_recursos_mem_valor_continua_igual(tmp_path):
+    # Regressão REC-02: valor de RAM explícito é repassado sem mudança.
+    clipar_bin, env, docker_log, _ = _prepare_clipar_env(tmp_path / "regressao")
+    Path(env["OUT_DIR"]).mkdir(parents=True, exist_ok=True)
+    (Path(env["OUT_DIR"]) / ".recursos").write_text("10g -\n", encoding="utf-8")
+    res = subprocess.run([str(clipar_bin), "https://twitch.tv/teste"], env=env, capture_output=True, text=True)
+    assert res.returncode == 0
+    line = docker_log.read_text(encoding="utf-8").strip().splitlines()[0]
+    assert "MEM=10g" in line
+
+
+def test_clipar_sintaxe_sh_valida():
+    res = subprocess.run(["sh", "-n", str(CLIPAR_SRC)], capture_output=True, text=True)
+    assert res.returncode == 0, res.stderr

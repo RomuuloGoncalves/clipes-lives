@@ -532,6 +532,20 @@ def test_salvar_config_rejeita_valores_invalidos(db, cfg):
     assert body["erro"].startswith("valor invalido para ")
 
 
+@pytest.mark.parametrize("chave", ["CLIPES_MEM", "CLIPES_CPUS"])
+def test_config_http_aceita_asterisco_como_sem_limite_e_recusa_lixo(db, env, chave):
+    from painel.api import config as config_fn
+
+    code_ok, _, body_ok = chamar(config_fn, db, "POST", None, {"pc_alias": "PC-1", "config": {chave: "*"}})
+    assert code_ok == 200
+    assert json.loads(body_ok)["config"] == {chave: "*"}
+    assert db.workers.find_one({"_id": "w-1"})["config"] == {chave: "*"}
+
+    code_ruim, _, body_ruim = chamar(config_fn, db, "POST", None, {"pc_alias": "PC-1", "config": {chave: "*g"}})
+    assert code_ruim == 400
+    assert json.loads(body_ruim)["erro"].startswith(f"valor invalido para {chave}")
+
+
 def test_config_handler_http_codigos_e_csrf(db, env):
     from painel.api import config as config_fn
 

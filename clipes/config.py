@@ -519,7 +519,8 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "grupo": "recursos",
         "tipo": "mem",
         "default": "",
-        "descricao": "Limite de RAM do conteiner (ex.: 4g ou 4096m; 512m a 128g; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
+        "sem_limite": "*",
+        "descricao": "Limite de RAM do conteiner (ex.: 4g ou 4096m; 512m a 128g; * = sem limite; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
     },
     "CLIPES_CPUS": {
         "grupo": "recursos",
@@ -527,7 +528,8 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "default": "",
         "min": 0.5,
         "max": 64.0,
-        "descricao": "Limite de CPUs do conteiner (ex.: 2 ou 1.5; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
+        "sem_limite": "*",
+        "descricao": "Limite de CPUs do conteiner (ex.: 2 ou 1.5; * = sem limite; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
     },
     "CLIPES_VISIBILIDADE": {
         "grupo": "publicacao",
@@ -640,6 +642,9 @@ def _validate_single(key: str, raw_val: Any) -> tuple[str | None, str | None]:
 
     if val_str == "":
         return None, None
+
+    if val_str == meta.get("sem_limite"):
+        return val_str, None
 
     if tipo == "int":
         if not _INT_STR_RE.fullmatch(val_str):
@@ -870,24 +875,71 @@ def apply_remote_config(
     return applied
 
 
+def _ler(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
 def _cgroup_limites(cgroup_root: Path | str = "/sys/fs/cgroup") -> tuple[int | None, float | None]:
-    """Le (memoria em bytes, CPUs) do cgroup v2 do proprio contêiner; None = sem limite ou ilegivel."""
+    """Le (memoria em bytes, CPUs) do cgroup do proprio conteiner (v2, com fallback v1).
+
+    0 = sem limite; None = ilegivel.
+    """
     root = Path(cgroup_root)
     mem: int | None = None
     cpus: float | None = None
-    try:
-        raw = (root / "memory.max").read_text(encoding="utf-8").strip()
-        if raw.isdigit():
-            mem = int(raw)
-    except OSError:
-        pass
-    try:
-        quota, periodo = (root / "cpu.max").read_text(encoding="utf-8").split()[:2]
-        if quota.isdigit() and int(periodo) > 0:
-            cpus = int(quota) / int(periodo)
-    except (OSError, ValueError):
-        pass
+    raw = _ler(root / "memory.max")
+    if raw is None:
+        raw = _ler(root / "memory" / "memory.limit_in_bytes")
+        if raw is not None and raw.isdigit():
+            raw = "max" if int(raw) >= 2**60 else raw
+    if raw == "max":
+        mem = 0
+    elif raw is not None and raw.isdigit():
+        mem = int(raw)
+    cpu = _ler(root / "cpu.max")
+    if cpu is not None:
+        partes = cpu.split()
+        quota, periodo = (partes + ["", ""])[:2]
+    else:
+        quota = _ler(root / "cpu" / "cpu.cfs_quota_us") or ""
+        periodo = _ler(root / "cpu" / "cpu.cfs_period_us") or "100000"
+        quota = "max" if quota == "-1" else quota
+    if quota == "max":
+        cpus = 0.0
+    elif quota.isdigit() and periodo.isdigit() and int(periodo) > 0:
+        cpus = int(quota) / int(periodo)
     return mem, cpus
+
+
+def recursos_divergentes(cgroup_root: Path | str = "/sys/fs/cgroup") -> bool:
+    """True se o painel pediu RAM/CPU diferentes do limite atual do cgroup (`*` = sem limite)."""
+    mem_atual, cpus_atual = _cgroup_limites(cgroup_root)
+    pedido_mem = os.environ.get("CLIPES_MEM", "").strip().lower() if "CLIPES_MEM" in _APPLIED_REMOTE_KEYS else ""
+    pedido_cpus = os.environ.get("CLIPES_CPUS", "").strip() if "CLIPES_CPUS" in _APPLIED_REMOTE_KEYS else ""
+    if pedido_mem and mem_atual is not None:
+        if pedido_mem == "*":
+            if mem_atual != 0:
+                return True
+        else:
+            m = _MEM_RE.fullmatch(pedido_mem)
+            if m is not None:
+                alvo = int(m.group(1)) * (1024 if m.group(2) == "g" else 1) * 1024 * 1024
+                if mem_atual == 0 or abs(alvo - mem_atual) > alvo * 0.01:
+                    return True
+    if pedido_cpus and cpus_atual is not None:
+        if pedido_cpus == "*":
+            if cpus_atual != 0:
+                return True
+        else:
+            try:
+                if cpus_atual == 0 or abs(float(pedido_cpus) - cpus_atual) > 0.05:
+                    return True
+            except ValueError:
+                pass
+    return False
 
 
 def recursos_pendentes(cgroup_root: Path | str = "/sys/fs/cgroup") -> bool:
@@ -896,24 +948,7 @@ def recursos_pendentes(cgroup_root: Path | str = "/sys/fs/cgroup") -> bool:
     So vale sob `./clipar`/compose (`CLIPES_RECURSOS_GERIDO=1`), que relê `.recursos` ao reiniciar;
     sem isso reiniciar nao mudaria nada e o worker ficaria em laco.
     """
-    if os.environ.get("CLIPES_RECURSOS_GERIDO") != "1":
-        return False
-    mem_atual, cpus_atual = _cgroup_limites(cgroup_root)
-    pedido_mem = os.environ.get("CLIPES_MEM", "").strip().lower() if "CLIPES_MEM" in _APPLIED_REMOTE_KEYS else ""
-    pedido_cpus = os.environ.get("CLIPES_CPUS", "").strip() if "CLIPES_CPUS" in _APPLIED_REMOTE_KEYS else ""
-    if pedido_mem and mem_atual is not None:
-        m = _MEM_RE.fullmatch(pedido_mem)
-        if m is not None:
-            alvo = int(m.group(1)) * (1024 if m.group(2) == "g" else 1) * 1024 * 1024
-            if abs(alvo - mem_atual) > alvo * 0.01:
-                return True
-    if pedido_cpus and cpus_atual is not None:
-        try:
-            if abs(float(pedido_cpus) - cpus_atual) > 0.05:
-                return True
-        except ValueError:
-            pass
-    return False
+    return os.environ.get("CLIPES_RECURSOS_GERIDO") == "1" and recursos_divergentes(cgroup_root)
 
 
 def load_cached_remote_config(out_root: Path | str | None = None, alias: str | None = None) -> dict[str, str]:

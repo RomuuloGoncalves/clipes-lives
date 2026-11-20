@@ -321,7 +321,7 @@ def test_live_session_backlog_lost_avisa_discord(tmp_path, monkeypatch, capsys):
         aviso_fn=avisos.append,
     )
     sup.run()
-    assert "janela perdida gaules (fila cheia)" in avisos
+    assert any(a.startswith("janela perdida gaules (fila cheia, score ") for a in avisos)
 
 
 # ---- T7: Limite, aguardando, recusa visível, offline, policy, recorder error ----------------------
@@ -1265,7 +1265,7 @@ def _sessao_backlog(tmp_path, monkeypatch, *, disco_livre_gb, env=None):
         acompanhar.parse_alvo("gaules"), out, queue, _PoolBacklog(), lambda d, r: {"clips": []},
         is_live=lambda u: True, now=lambda: 0.0,
         disk_usage=lambda p: SimpleNamespace(free=disco_livre_gb * 1e9),
-        on_backlog_lost=lambda a, nome: avisos.append(nome),
+        on_backlog_lost=lambda a, nome, score: avisos.append(nome),
     )
     return sess, queue, avisos
 
@@ -1315,6 +1315,70 @@ def test_disco_baixo_descarta_antes_do_limite(tmp_path, monkeypatch):
     assert pendentes == 1
     assert rejeitados == ["gaules_1000"]
     assert avisos == ["gaules_1000"]
+
+
+def _sessao_scores(tmp_path, monkeypatch, scores, *, agora=None, max_backlog="2"):
+    """Sessao com pre_score falso: o i-esimo fechar_janela recebe scores[i] (None -> extract_wav falha)."""
+    sess, queue, avisos = _sessao_backlog(tmp_path, monkeypatch, disco_livre_gb=100, env=max_backlog)
+    it = iter(scores)
+    atual = {}
+
+    def fake_wav(src, wav):
+        atual["v"] = next(it)
+        if atual["v"] is None:
+            raise RuntimeError("ffmpeg falhou")
+        return wav
+
+    monkeypatch.setattr(acompanhar, "extract_wav", fake_wav)
+    monkeypatch.setattr(acompanhar.sinais, "pre_score", lambda wav: atual["v"])
+    msgs: list[str] = []
+    sess.on_backlog_lost = lambda a, nome, score: msgs.append(f"{nome}:{score:.1f}")
+    if agora is not None:
+        sess.now = agora
+    return sess, queue, msgs
+
+
+def test_descarta_menor_pre_score(tmp_path, monkeypatch):
+    sess, queue, msgs = _sessao_scores(tmp_path, monkeypatch, [5.0, 1.0, 9.0])
+    _fechar_n_janelas(sess, 3)
+    assert _contagem(queue)[1] == ["gaules_1300"]
+    assert msgs == ["gaules_1300:1.0"]
+
+
+def test_empate_de_score_descarta_a_mais_antiga(tmp_path, monkeypatch):
+    t = iter([30.0, 10.0, 20.0])
+    sess, queue, msgs = _sessao_scores(tmp_path, monkeypatch, [4.0, 4.0, 4.0], agora=lambda: next(t))
+    _fechar_n_janelas(sess, 3)
+    # created_at: 1000->30, 1300->10 (mais antiga), 1600->20
+    assert _contagem(queue)[1] == ["gaules_1300"]
+
+
+def test_extract_wav_falha_enfileira_com_pre_score_zero(tmp_path, monkeypatch):
+    sess, queue, _ = _sessao_scores(tmp_path, monkeypatch, [None], max_backlog="6")
+    _fechar_n_janelas(sess, 1)
+    (job_dir,) = (queue.root / "pending").iterdir()
+    assert monitor._read_job(job_dir)["pre_score"] == 0.0
+
+
+def test_claim_next_janelas_por_pre_score_e_busca_por_z_score(tmp_path):
+    queue = monitor.DiskQueue(tmp_path / "queue")
+
+    def add(name, **kw):
+        d = queue.root / "pending" / name
+        d.mkdir(parents=True)
+        base = {"channel": "gaules", "session_key": "gaules", "status": "pending"}
+        monitor._write_job(d, {**base, **kw})
+
+    janela = {"window_start": 0, "window_end": 1, "video_start": 0, "last": False}
+    add("a", pre_score=3.0, created_at=1.0, **janela)
+    add("b", pre_score=8.0, created_at=2.0, **janela)
+    add("c", pre_score=8.0, created_at=3.0, **janela)
+    view = acompanhar._SessionQueueView(queue, lambda: {"gaules"})
+    ordem = []
+    for _ in range(3):
+        d = view.claim_next()
+        ordem.append(d.name)
+    assert ordem == ["b", "c", "a"]
 
 
 def test_modulo_acompanhar_sem_discord_rest_direto():

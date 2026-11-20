@@ -218,3 +218,44 @@ def test_asr_uses_cpu_threads_when_env_unset(tmp_path, monkeypatch):
     transcribe_candidates(wav_path, cands, tmp_path / "c3", model_size="small")
     transcribe_fast_blocks(wav_path, [(0.0, 2.0, 1.0)], tmp_path / "c4", model_size="small")
     assert received_threads == [5, 5]
+
+
+def _sem_smi(*args, **kwargs):
+    raise FileNotFoundError("nvidia-smi")
+
+
+def test_capacity_reporta_limite_e_ram_livre_separados(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_CPU_THREADS", raising=False)
+    out = tmp_path / "out"
+    sysfs = _make_sysfs(tmp_path / "sys", mem_max="10737418240")
+    proc = _make_proc(tmp_path / "proc", mem_available_kb=1024 * 1024)
+
+    cap = capacity(out, sysfs=sysfs, proc=proc, run=_sem_smi)
+    assert cap["ram_livre_gb"] == 1.0
+    assert cap["ram_limite_gb"] == 10.0
+    assert cap["ram_limite_estado"] == "limite"
+    assert cap["ram_gb"] == 1.0
+
+
+def test_capacity_memory_max_max_reporta_sem_limite(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_CPU_THREADS", raising=False)
+    out = tmp_path / "out"
+    sysfs = _make_sysfs(tmp_path / "sys", mem_max="max")
+    proc = _make_proc(tmp_path / "proc", mem_available_kb=1024 * 1024)
+
+    cap = capacity(out, sysfs=sysfs, proc=proc, run=_sem_smi)
+    assert cap["ram_limite_gb"] is None
+    assert cap["ram_limite_estado"] == "sem_limite"
+    assert cap["ram_gb"] == 1.0
+
+
+def test_capacity_sem_arquivo_memory_max_reporta_ilegivel(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_CPU_THREADS", raising=False)
+    out = tmp_path / "out"
+    sysfs = _make_sysfs(tmp_path / "sys", mem_max=None)
+    proc = _make_proc(tmp_path / "proc", mem_available_kb=1024 * 1024)
+
+    cap = capacity(out, sysfs=sysfs, proc=proc, run=_sem_smi)
+    assert cap["ram_limite_gb"] is None
+    assert cap["ram_limite_estado"] == "ilegivel"
+    assert cap["ram_livre_gb"] == 1.0

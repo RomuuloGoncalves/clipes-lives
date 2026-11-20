@@ -1,11 +1,44 @@
 """Synthetic tests for 1 Hz multimodal signals, chat parser, and candidate picking."""
 
 from pathlib import Path
+import wave
 import numpy as np
 
 from clipes.candidates import pick_candidate_peaks
 from clipes.ingest import parse_ytdlp_live_chat
-from clipes.signals import FPS_RMS, compute_signals
+from clipes.signals import FPS_RMS, compute_signals, pre_score
+
+
+def _write_wav(path: Path, samples: np.ndarray, sr: int = 16000) -> Path:
+    pcm = np.clip(samples, -1.0, 1.0)
+    pcm = (pcm * 32767).astype("<i2")
+    with wave.open(str(path), "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sr)
+        wf.writeframes(pcm.tobytes())
+    return path
+
+
+def test_pre_score_silence_then_loud_tone_is_high(tmp_path: Path):
+    sr = 16000
+    silence = np.zeros(10 * sr)
+    t = np.arange(2 * sr) / sr
+    tone = 0.5 * np.sin(2 * np.pi * 440.0 * t)
+    wav = _write_wav(tmp_path / "pico.wav", np.concatenate([silence, tone]), sr)
+    assert pre_score(wav) > 20
+
+
+def test_pre_score_constant_signal_is_near_zero(tmp_path: Path):
+    sr = 16000
+    t = np.arange(5 * sr) / sr
+    wav = _write_wav(tmp_path / "const.wav", 0.3 * np.sin(2 * np.pi * 440.0 * t), sr)
+    assert abs(pre_score(wav)) <= 0.5
+
+
+def test_pre_score_empty_wav_is_zero(tmp_path: Path):
+    wav = _write_wav(tmp_path / "vazio.wav", np.zeros(0))
+    assert pre_score(wav) == 0.0
 
 
 def test_planted_multimodal_peaks_and_cache(tmp_path: Path):

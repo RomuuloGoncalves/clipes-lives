@@ -2,6 +2,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from clipes import config
 
 
@@ -389,3 +391,56 @@ def test_recursos_pendentes_compara_pedido_com_cgroup(tmp_path, monkeypatch):
     assert config.recursos_pendentes(tmp_path) is True
     config.apply_remote_config({}, out_root=tmp_path, alias="PC-1")
     assert config.recursos_pendentes(tmp_path) is False
+
+
+def test_validate_sem_limite_asterisco():
+    ok, erro = config.validate_config_payload({"CLIPES_MEM": "*", "CLIPES_CPUS": "*"})
+    assert erro is None and ok == {"CLIPES_MEM": "*", "CLIPES_CPUS": "*"}
+    for mem in ("**", "0", "*g"):
+        for k in ("CLIPES_MEM", "CLIPES_CPUS"):
+            ok, erro = config.validate_config_payload({k: mem})
+            assert erro and not ok
+
+
+@pytest.mark.parametrize(
+    "mem,cpus,mem_cg,cpu_cg,esperado",
+    [
+        ("*", None, "max", None, False),
+        ("*", None, str(5 * 1024**3), None, True),
+        ("10g", None, str(10 * 1024**3), None, False),
+        ("10g", None, str(5 * 1024**3), None, True),
+        ("10g", None, "max", None, True),
+        ("10g", None, "lixo", None, False),
+        (None, "2", None, "200000 100000", False),
+        ("*", "*", "max", "max 100000", False),
+        (None, "*", None, "200000 100000", True),
+        (None, "2", None, "max 100000", True),
+    ],
+)
+def test_recursos_divergentes_tabela(tmp_path, monkeypatch, mem, cpus, mem_cg, cpu_cg, esperado):
+    monkeypatch.delenv("CLIPES_MEM", raising=False)
+    monkeypatch.delenv("CLIPES_CPUS", raising=False)
+    pedido = {k: v for k, v in (("CLIPES_MEM", mem), ("CLIPES_CPUS", cpus)) if v}
+    config.apply_remote_config(pedido, out_root=tmp_path, alias="PC-1")
+    if mem_cg:
+        (tmp_path / "memory.max").write_text(mem_cg, encoding="utf-8")
+    if cpu_cg:
+        (tmp_path / "cpu.max").write_text(cpu_cg, encoding="utf-8")
+    monkeypatch.delenv("CLIPES_RECURSOS_GERIDO", raising=False)
+    assert config.recursos_pendentes(tmp_path) is False
+    assert config.recursos_divergentes(tmp_path) is esperado
+    monkeypatch.setenv("CLIPES_RECURSOS_GERIDO", "1")
+    assert config.recursos_pendentes(tmp_path) is esperado
+
+
+def test_cgroup_limites_fallback_v1(tmp_path):
+    (tmp_path / "memory").mkdir()
+    (tmp_path / "cpu").mkdir()
+    (tmp_path / "memory" / "memory.limit_in_bytes").write_text(str(2**63 - 4096), encoding="utf-8")
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("-1\n", encoding="utf-8")
+    (tmp_path / "cpu" / "cpu.cfs_period_us").write_text("100000\n", encoding="utf-8")
+    assert config._cgroup_limites(tmp_path) == (0, 0.0)
+    (tmp_path / "memory" / "memory.limit_in_bytes").write_text(str(4 * 1024**3), encoding="utf-8")
+    (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("150000\n", encoding="utf-8")
+    assert config._cgroup_limites(tmp_path) == (4 * 1024**3, 1.5)
+    assert config._cgroup_limites(tmp_path / "nada") == (None, None)

@@ -114,6 +114,15 @@ def compute_rms_db(audio_path: Path, duration: float | None = None, fps: int = F
     return np.concatenate(out).astype(np.float32)
 
 
+def pre_score(wav: Path) -> float:
+    """Excursão de áudio da janela: p95 - mediana do RMS dB. WAV sem frames → 0.0."""
+    with wave.open(str(wav), "rb") as wf:
+        if wf.getnframes() == 0:
+            return 0.0
+    r = compute_rms_db(wav)
+    return round(float(np.percentile(r, 95) - np.median(r)), 2)
+
+
 def signal_loudness(rms_db: np.ndarray, n: int) -> np.ndarray:
     """1 Hz loudness score: excess over 60s rolling median (silence masked) + 3s abrupt jump."""
     db = np.asarray(rms_db, dtype=np.float64)
