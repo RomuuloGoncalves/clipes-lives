@@ -744,3 +744,28 @@ def test_index_html_clipes_aviso_e_config_global_por_escopo():
     assert "/api/config_global" in txt and "clips_recentes" in txt
     assert 'escopo === "global"' in txt and 'escopo !== "global"' in txt
     assert "CLIPES_LAYOUT" not in txt
+
+
+def test_html_selects_seguem_tema():
+    import re
+    from pathlib import Path
+    html = (Path(__file__).resolve().parent.parent / "painel" / "index.html").read_text(encoding="utf-8")
+    m = re.search(r"\n\s*select \{(.*?)\n\s*\}", html, re.S)
+    assert m, "regra CSS 'select' global ausente"
+    regra = m.group(1)
+    assert "appearance: none" in regra
+    for v in ("--bg", "--border-strong", "--text", "--radius-sm"):
+        assert f"var({v})" in regra
+    assert "select:focus-visible" in html and "select:disabled" in html
+    assert not re.search(r"<select[^>]*\sstyle=", html)
+
+
+def test_html_config_global_em_modal():
+    from pathlib import Path
+    html = (Path(__file__).resolve().parent.parent / "painel" / "index.html").read_text(encoding="utf-8")
+    assert 'id="cfg-global-open"' in html
+    assert 'id="config-global" class="cfg-modal-backdrop"' in html
+    assert 'id="cfg-global-btn"' in html and 'id="cfg-global-fields"' in html
+    assert "Layout dos clipes (global)" not in html
+    assert '<section id="config-global"' not in html
+    assert 'id="aviso-privado"' in html

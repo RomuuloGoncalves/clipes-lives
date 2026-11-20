@@ -240,6 +240,43 @@
       box-shadow: 0 0 0 3px var(--accent-bg);
     }
 
+    select {
+      appearance: none;
+      -webkit-appearance: none;
+      min-height: 44px;
+      min-width: 140px;
+      max-width: 100%;
+      padding: 10px 36px 10px 12px;
+      border-radius: var(--radius-sm);
+      border: 1px solid var(--border-strong);
+      background-color: var(--bg);
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http%3A//www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8' fill='none' stroke='%2394a3b8' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M1 1.5l5 5 5-5'/%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      color: var(--text);
+      font-size: 1rem;
+      font-family: inherit;
+      cursor: pointer;
+      text-overflow: ellipsis;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    select:hover:not(:disabled) { border-color: var(--accent); }
+    select:focus,
+    select:focus-visible {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-bg);
+    }
+    select:disabled { opacity: 0.5; cursor: not-allowed; }
+    select option { background: var(--surface); color: var(--text); }
+
+    .cfg-field select, #cfg-global-fields select { width: 100%; }
+
+    @media (max-width: 599px) {
+      select { width: 100%; }
+    }
+
     button {
       min-height: 44px;
       padding: 10px 14px;
@@ -739,17 +776,6 @@
       line-height: 1.35;
     }
 
-    .cfg-field select {
-      min-height: 40px;
-      padding: 8px 10px;
-      border-radius: var(--radius-sm);
-      border: 1px solid var(--border-strong);
-      background: var(--surface);
-      color: var(--text);
-      font-size: 0.9375rem;
-      font-family: inherit;
-      width: 100%;
-    }
 
     .cfg-modal-foot {
       display: flex;
@@ -850,6 +876,11 @@
         grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
       }
     }
+    @media (max-width: 599px) {
+      .cfg-modal-backdrop { padding: 0; }
+      .cfg-modal { max-width: none; max-height: none; height: 100%; border-radius: 0; }
+      .cfg-modal-body { overflow-y: auto; flex: 1; }
+    }
   </style>
 </head>
 <body>
@@ -861,6 +892,7 @@
       </div>
       <div class="header-dir">
         <div id="atualizado" class="meta">Carregando...</div>
+        <button id="cfg-global-open" class="btn-ghost" type="button" aria-label="Configuracoes globais">&#9881; Configuracoes globais</button>
         <button id="refresh-btn" class="btn-ghost" type="button" aria-label="Atualizar agora">Atualizar</button>
       </div>
     </header>
@@ -887,13 +919,6 @@
     </section>
 
     <div id="aviso-privado" class="msg erro" hidden></div>
-
-    <section id="config-global" aria-label="Config global">
-      <div class="sec-head"><h2>Config global</h2></div>
-      <div id="cfg-global-fields"></div>
-      <button id="cfg-global-btn" class="btn-primary" type="button">Salvar config global</button>
-      <span class="sec-sub">Vale para todos os PCs, so para clipes novos. Sobrepoe o .env e o modal por PC.</span>
-    </section>
 
     <div class="sec-head">
       <h2>PCs e workers</h2>
@@ -998,6 +1023,23 @@
         <div class="cfg-modal-foot-right">
           <button id="cfg-cancel-btn" class="btn-ghost" type="button">Cancelar</button>
           <button id="cfg-save-btn" class="btn-primary" type="button">Salvar no MongoDB</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div id="config-global" class="cfg-modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="cfg-global-title" hidden>
+    <div class="cfg-modal">
+      <div class="cfg-modal-head">
+        <h3 id="cfg-global-title">Configuracoes globais</h3>
+        <button id="cfg-global-close" class="btn-ghost" type="button" aria-label="Fechar configuracoes globais">Fechar</button>
+      </div>
+      <div id="cfg-global-fields" class="cfg-modal-body"></div>
+      <div class="cfg-modal-foot">
+        <span class="sec-sub">Vale para todos os PCs, so para clipes novos. Sobrepoe o .env e o modal por PC.</span>
+        <div class="cfg-modal-foot-right">
+          <button id="cfg-global-cancel" class="btn-ghost" type="button">Cancelar</button>
+          <button id="cfg-global-btn" class="btn-primary" type="button">Salvar</button>
         </div>
       </div>
     </div>
@@ -1538,6 +1580,18 @@
       novoPcBtn.addEventListener("click", function () {
         abrirConfigModal("", {}, true);
       });
+      var cfgGlobalModalEl = document.getElementById("config-global");
+      function fecharModais() { configModalEl.hidden = true; cfgGlobalModalEl.hidden = true; }
+      [configModalEl, cfgGlobalModalEl].forEach(function (m) {
+        m.addEventListener("click", function (e) { if (e.target === m) m.hidden = true; });
+      });
+      document.addEventListener("keydown", function (e) { if (e.key === "Escape") fecharModais(); });
+      document.getElementById("cfg-global-open").addEventListener("click", function () {
+        cfgGlobalModalEl.hidden = false;
+        document.getElementById("cfg-global-close").focus();
+      });
+      document.getElementById("cfg-global-close").addEventListener("click", fecharModais);
+      document.getElementById("cfg-global-cancel").addEventListener("click", fecharModais);
       cfgCloseBtn.addEventListener("click", fecharConfigModal);
       cfgCancelBtn.addEventListener("click", fecharConfigModal);
       cfgResetBtn.addEventListener("click", function () {
@@ -1644,7 +1698,7 @@
         })
           .then(function (r) {
             return r.json().catch(function () { return {}; }).then(function (b) {
-              if (r.ok) mostrarMsg("Config global salva (vale para clipes novos).", "ok");
+              if (r.ok) { mostrarMsg("Config global salva (vale para clipes novos).", "ok"); cfgGlobalModalEl.hidden = true; }
               else mostrarMsg("Falha ao salvar config global: " + ((b && b.erro) || ("HTTP " + r.status)), "erro");
             });
           })
