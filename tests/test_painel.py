@@ -442,9 +442,19 @@ def test_index_html_slots_fila_e_alvos():
 def test_config_schema_paridade_com_clipes():
     from clipes import config as clipes_config
 
-    assert len(_nucleo.CONFIG_SCHEMA) == 42
+    assert len(_nucleo.CONFIG_SCHEMA) == 45
     assert _nucleo.CONFIG_SCHEMA == clipes_config.CONFIG_SCHEMA
     assert _nucleo.FORBIDDEN_ENV_KEYS == clipes_config.FORBIDDEN_ENV_KEYS
+
+
+def test_validate_config_payload_do_painel_rejeita_min_maior_ou_igual_max():
+    assert _nucleo.validate_config_payload({"CLIPES_TEMP_MIN": "80", "CLIPES_TEMP_MAX": "80"})[1] is not None
+    assert _nucleo.validate_config_payload({"CLIPES_TEMP_MAX": "70"})[1] is not None
+    assert _nucleo.validate_config_payload({"CLIPES_TEMP_MAX": "80"}) == ({"CLIPES_TEMP_MAX": "80"}, None)
+    assert _nucleo.validate_config_payload({"CLIPES_TEMP_MAX": "101"})[1] is not None
+    assert _nucleo.validate_config_payload({"CLIPES_TEMP_MIN": "39"})[1] is not None
+    assert _nucleo.CONFIG_SCHEMA["CLIPES_DISCORD_MAX_MB"]["default"] == "10"
+    assert _nucleo.CONFIG_SCHEMA["CLIPES_VIGIA"]["grupo"] == "temperatura"
 
 
 def test_status_retorna_pcs_online_offline_ordenados_com_config_e_schema(db):

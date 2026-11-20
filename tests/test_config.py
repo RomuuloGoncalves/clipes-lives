@@ -106,10 +106,10 @@ def test_slots_non_strict_cai_no_padrao(monkeypatch):
     assert config.slots(strict=False) == {"twitch": 1, "kick": 1, "youtube": 1, "busca": 1}
 
 
-def test_config_schema_tem_42_variaveis_e_zero_segredos():
-    assert len(config.CONFIG_SCHEMA) == 42
+def test_config_schema_tem_45_variaveis_e_zero_segredos():
+    assert len(config.CONFIG_SCHEMA) == 45
     grupos = {meta["grupo"] for meta in config.CONFIG_SCHEMA.values()}
-    assert grupos == {"lives", "render", "ia", "publicacao"}
+    assert grupos == {"lives", "render", "ia", "publicacao", "temperatura"}
     for key, meta in config.CONFIG_SCHEMA.items():
         assert not config._is_forbidden_key(key)
         assert "default" in meta
@@ -242,3 +242,34 @@ def test_apply_remote_config_precedencia_restauracao_e_cache(monkeypatch, tmp_pa
     assert applied2 == {}
     assert config.os.environ["CLIPES_WHISPER_MODEL"] == "small"
     assert "CLIPES_LAYOUT" not in config.os.environ
+
+
+# ---- ajustes-nov20 T12: grupo temperatura, min<max e padrao 10 MB (VIG-01, VIG-02, DSC-01)
+
+def test_temperatura_defaults_e_faixas_no_schema():
+    vigia = config.CONFIG_SCHEMA["CLIPES_VIGIA"]
+    assert (vigia["grupo"], vigia["tipo"], vigia["default"]) == ("temperatura", "bool", "1")
+    tmax = config.CONFIG_SCHEMA["CLIPES_TEMP_MAX"]
+    assert (tmax["grupo"], tmax["tipo"], tmax["default"], tmax["min"], tmax["max"]) == ("temperatura", "int", "85", 60, 100)
+    tmin = config.CONFIG_SCHEMA["CLIPES_TEMP_MIN"]
+    assert (tmin["grupo"], tmin["tipo"], tmin["default"], tmin["min"], tmin["max"]) == ("temperatura", "int", "75", 40, 95)
+    assert config.CONFIG_SCHEMA["CLIPES_DISCORD_MAX_MB"]["default"] == "10"
+
+
+def test_validate_rejeita_min_maior_ou_igual_max():
+    assert config.validate_config_payload({"CLIPES_TEMP_MIN": "80", "CLIPES_TEMP_MAX": "80"})[1] is not None
+    assert config.validate_config_payload({"CLIPES_TEMP_MIN": "90", "CLIPES_TEMP_MAX": "85"})[1] is not None
+
+
+def test_validate_usa_min_padrao_quando_so_max_informado():
+    # min padrao = 75: MAX=70 fica abaixo do minimo efetivo
+    assert config.validate_config_payload({"CLIPES_TEMP_MAX": "70"})[1] is not None
+    assert config.validate_config_payload({"CLIPES_TEMP_MAX": "80"}) == ({"CLIPES_TEMP_MAX": "80"}, None)
+
+
+def test_validate_faixas_de_temperatura():
+    assert config.validate_config_payload({"CLIPES_TEMP_MAX": "101"})[1] is not None
+    assert config.validate_config_payload({"CLIPES_TEMP_MAX": "59"})[1] is not None
+    assert config.validate_config_payload({"CLIPES_TEMP_MIN": "39"})[1] is not None
+    assert config.validate_config_payload({"CLIPES_TEMP_MIN": "96"})[1] is not None
+    assert config.validate_config_payload({"CLIPES_VIGIA": "0"}) == ({"CLIPES_VIGIA": "0"}, None)

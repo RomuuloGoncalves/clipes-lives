@@ -844,7 +844,7 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
     "CLIPES_DISCORD_MAX_MB": {
         "grupo": "publicacao",
         "tipo": "float",
-        "default": "20",
+        "default": "10",
         "min": 1.0,
         "max": 100.0,
         "descricao": "Tamanho maximo (MB) de video enviado como previa no Discord",
@@ -921,6 +921,30 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "tipo": "tz",
         "default": "America/Sao_Paulo",
         "descricao": "Fuso horario IANA para agendamento e cotas",
+    },
+    # --- temperatura (3) ---
+    "CLIPES_VIGIA": {
+        "grupo": "temperatura",
+        "tipo": "bool",
+        "default": "1",
+        "opcoes": ["1", "0"],
+        "descricao": "Vigia de temperatura: pausa o processamento quando o PC esquenta (1=sim, 0=nao)",
+    },
+    "CLIPES_TEMP_MAX": {
+        "grupo": "temperatura",
+        "tipo": "int",
+        "default": "85",
+        "min": 60,
+        "max": 100,
+        "descricao": "Temperatura (C) em que o vigia pausa o processamento",
+    },
+    "CLIPES_TEMP_MIN": {
+        "grupo": "temperatura",
+        "tipo": "int",
+        "default": "75",
+        "min": 40,
+        "max": 95,
+        "descricao": "Temperatura (C) em que o vigia retoma o processamento (menor que CLIPES_TEMP_MAX)",
     },
 }
 
@@ -1045,6 +1069,10 @@ def validate_config_payload(raw_cfg: Mapping[str, Any]) -> tuple[dict[str, str],
             return {}, err
         if norm is not None:
             clean[key] = norm
+    temp_min = int(clean.get("CLIPES_TEMP_MIN", CONFIG_SCHEMA["CLIPES_TEMP_MIN"]["default"]))
+    temp_max = int(clean.get("CLIPES_TEMP_MAX", CONFIG_SCHEMA["CLIPES_TEMP_MAX"]["default"]))
+    if temp_min >= temp_max:
+        return {}, "CLIPES_TEMP_MIN deve ser menor que CLIPES_TEMP_MAX"
     return clean, None
 
 
