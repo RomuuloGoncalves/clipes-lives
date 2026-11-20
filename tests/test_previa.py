@@ -130,20 +130,20 @@ def test_real_ffmpeg_3s_synthetic_preview_fits_target(tmp_path: Path):
     assert src.stat().st_size == orig_size
 
 
-def test_default_limit_20mb_98_percent_cutoff_and_bitrate_alvo(tmp_path: Path, monkeypatch):
+def test_default_limit_is_10mb_without_env(tmp_path: Path, monkeypatch):
     monkeypatch.delenv("CLIPES_DISCORD_MAX_MB", raising=False)
-    assert DEFAULT_DISCORD_MAX_MB == 20.0
+    assert DEFAULT_DISCORD_MAX_MB == 10.0
 
-    # 19 MB file under default 20 MB limit (<= 98% = 19.6 MB) is returned without ffmpeg
-    src_19m = _make_sparse_file(tmp_path / "clip_19m.mp4", 19 * 1024 * 1024)
+    # 9.5 MB is under 98% of 10 MB (9.8 MB): returned as-is, no ffmpeg
+    src_95m = _make_sparse_file(tmp_path / "clip_95m.mp4", int(9.5 * 1024 * 1024))
     called: list[list[str]] = []
     res = preview_for_discord(
-        src_19m,
+        src_95m,
         duration=60.0,
         cache_dir=tmp_path / "cache",
         run=lambda cmd, **kw: called.append(cmd),
     )
-    assert res == src_19m
+    assert res == src_95m
     assert called == []
 
     # bitrate_alvo respects custom teto and audio_kbps and can drop below 400
@@ -152,3 +152,61 @@ def test_default_limit_20mb_98_percent_cutoff_and_bitrate_alvo(tmp_path: Path, m
     assert v_master == expected
     assert bitrate_alvo(10.0, 20.0, teto=6000, audio_kbps=160) == 6000
     assert bitrate_alvo(500.0, 20.0, teto=6000, audio_kbps=160) < 400
+
+
+def test_retries_at_80_percent_when_first_output_over_98_percent(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CLIPES_DISCORD_MAX_MB", raising=False)
+    src = _make_sparse_file(tmp_path / "clip_retry.mp4", 25 * 1024 * 1024)
+    cache_dir = tmp_path / "cache"
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(cmd)
+        size = 10_500_000 if len(captured) == 1 else 1_000_000  # 1st too big, 2nd fits
+        _make_sparse_file(Path(cmd[-1]), size)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    res = preview_for_discord(src, duration=60.0, cache_dir=cache_dir, run=fake_run)
+
+    assert res == cache_dir / "discord_clip_retry.mp4"
+    assert res.is_file()
+    assert len(captured) == 2
+    v1 = int(captured[0][captured[0].index("-b:v") + 1].rstrip("k"))
+    v2 = int(captured[1][captured[1].index("-b:v") + 1].rstrip("k"))
+    assert v2 == round(v1 * 0.8)
+
+
+def test_returns_none_when_retry_also_over_98_percent(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CLIPES_DISCORD_MAX_MB", raising=False)
+    src = _make_sparse_file(tmp_path / "clip_big.mp4", 25 * 1024 * 1024)
+    cache_dir = tmp_path / "cache"
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(cmd)
+        _make_sparse_file(Path(cmd[-1]), 10_500_000)  # always too big
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    res = preview_for_discord(src, duration=60.0, cache_dir=cache_dir, run=fake_run)
+
+    assert res is None
+    assert len(captured) == 2
+    assert not any(p.name.startswith(".tmp_discord_") for p in cache_dir.iterdir())
+    assert not (cache_dir / "discord_clip_big.mp4").exists()
+
+
+def test_no_retry_when_80_percent_bitrate_below_400(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("CLIPES_DISCORD_MAX_MB", raising=False)
+    src = _make_sparse_file(tmp_path / "clip_edge.mp4", 25 * 1024 * 1024)
+    captured: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        captured.append(cmd)
+        _make_sparse_file(Path(cmd[-1]), 10_500_000)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    # 140 s with 10 MB -> video ~443 kbps (>=400), 80% of it ~354 kbps (<400)
+    res = preview_for_discord(src, duration=140.0, cache_dir=tmp_path / "cache", run=fake_run)
+
+    assert res is None
+    assert len(captured) == 1
