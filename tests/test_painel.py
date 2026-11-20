@@ -435,3 +435,151 @@ def test_index_html_slots_fila_e_alvos():
     for campo in ("slots", "ocupados", "fila", "pc_fixo", "owner", "fase", "entrada", "_id"):
         assert campo in js
     assert "innerHTML" not in js and "insertAdjacentHTML" not in js
+
+
+# ---- Onda 9 (T4/T5): config por PC, paridade de schema e /api/config
+
+def test_config_schema_paridade_com_clipes():
+    from clipes import config as clipes_config
+
+    assert len(_nucleo.CONFIG_SCHEMA) == 42
+    assert _nucleo.CONFIG_SCHEMA == clipes_config.CONFIG_SCHEMA
+    assert _nucleo.FORBIDDEN_ENV_KEYS == clipes_config.FORBIDDEN_ENV_KEYS
+
+
+def test_status_retorna_pcs_online_offline_ordenados_com_config_e_schema(db):
+    db.workers.update_one({"_id": "w-1"}, {"$set": {"config": {"CLIPES_WHISPER_MODEL": "large-v3-turbo"}}})
+    db.workers.insert_one({"_id": "PC-0", "alias": "PC-0", "heartbeat_at": None, "config": {"CLIPES_PORTAO": "on"}})
+
+    r = _nucleo.status(db, NOW, beat_s=20)
+    assert [w["alias"] for w in r["workers"]] == ["PC-0", "PC-1", "PC-2"]
+    assert [w["online"] for w in r["workers"]] == [False, False, True]
+    assert r["workers"][0]["config"] == {"CLIPES_PORTAO": "on"}
+    assert r["workers"][1]["config"] == {"CLIPES_WHISPER_MODEL": "large-v3-turbo"}
+    assert r["workers"][2]["config"] == {}
+    assert r["config_schema"] == _nucleo.CONFIG_SCHEMA
+    json.dumps(r)
+
+
+def test_salvar_config_persiste_limpa_e_faz_upsert_offline(db):
+    code, body = _nucleo.salvar_config(db, {
+        "pc_alias": "PC-1",
+        "config": {"CLIPES_SLOTS": "twitch=2,kick=0", "CLIPES_WHISPER_MODEL": "large-v3-turbo", "CLIPES_BAR_H": "400"},
+    }, NOW)
+    assert code == 200
+    assert body == {
+        "ok": True,
+        "pc_alias": "PC-1",
+        "config": {"CLIPES_SLOTS": "twitch=2,kick=0", "CLIPES_WHISPER_MODEL": "large-v3-turbo", "CLIPES_BAR_H": "400"},
+    }
+    doc = db.workers.find_one({"_id": "w-1"})
+    assert doc["config"] == body["config"]
+    assert doc["config_updated_at"] == NOW
+
+    # Campo vazio "" ou None remove a chave para voltar ao padrao
+    code2, body2 = _nucleo.salvar_config(db, {
+        "pc_alias": "PC-1",
+        "config": {"CLIPES_SLOTS": "twitch=2,kick=0", "CLIPES_WHISPER_MODEL": "", "CLIPES_BAR_H": None},
+    }, NOW)
+    assert code2 == 200
+    assert body2["config"] == {"CLIPES_SLOTS": "twitch=2,kick=0"}
+    assert db.workers.find_one({"_id": "w-1"})["config"] == {"CLIPES_SLOTS": "twitch=2,kick=0"}
+
+    # Upsert de PC novo/offline por pc_alias
+    code3, body3 = _nucleo.salvar_config(db, {
+        "pc_alias": "PC-NOVO",
+        "config": {"CLIPES_LAYOUT": "full"},
+    }, NOW)
+    assert code3 == 200
+    novo = db.workers.find_one({"_id": "PC-NOVO"})
+    assert novo is not None and novo["alias"] == "PC-NOVO" and novo["heartbeat_at"] is None
+    assert novo["config"] == {"CLIPES_LAYOUT": "full"}
+
+
+@pytest.mark.parametrize("chave", [
+    "CLIPES_MONGO_URI", "PAINEL_MONGO_URI", "PAINEL_SENHA", "DISCORD_BOT_TOKEN",
+    "DISCORD_CHANNEL_ID", "GEMINI_API_KEYS", "YOUTUBE_CLIENT_SECRET", "TIKTOK_CLIENT_SECRET",
+    "TWITCH_CLIENT_SECRET", "GROQ_API_KEY", "MINHA_CHAVE_SECRETA", "VARIAVEL_DESCONHECIDA",
+])
+def test_salvar_config_rejeita_segredos_e_desconhecidas(db, chave):
+    code, body = _nucleo.salvar_config(db, {"pc_alias": "PC-1", "config": {chave: "abc"}}, NOW)
+    assert code == 400
+    assert body == {"erro": f"variavel nao permitida: {chave}"}
+    assert db.workers.find_one({"_id": "w-1"}).get("config") is None
+
+
+@pytest.mark.parametrize("cfg", [
+    {"CLIPES_BAR_H": "999"},
+    {"CLIPES_SPLIT_BAR_H": "101"},
+    {"CLIPES_LAYOUT": "inexistente"},
+    {"CLIPES_SLOTS": "twitch=abc"},
+    {"CLIPES_AGENDA_HORARIOS": "25:99"},
+    {"CLIPES_TZ": "Mars/Phobos"},
+])
+def test_salvar_config_rejeita_valores_invalidos(db, cfg):
+    code, body = _nucleo.salvar_config(db, {"pc_alias": "PC-1", "config": cfg}, NOW)
+    assert code == 400
+    assert body["erro"].startswith("valor invalido para ")
+
+
+def test_config_handler_http_codigos_e_csrf(db, env):
+    from painel.api import config as config_fn
+
+    assert chamar(config_fn, db, "GET")[0] == 405
+    code_get, hdr_get, _ = chamar(config_fn, db, "GET")
+    assert code_get == 405 and hdr_get.get("Allow") == "POST"
+    assert chamar(config_fn, db, "POST", raw_body=b"pc_alias=PC-1")[0] == 415
+    assert chamar(
+        config_fn, db, "POST", None,
+        {"pc_alias": "PC-1", "config": {"CLIPES_PORTAO": "on"}},
+        headers={"Origin": "https://atacante.invalid"},
+    )[0] == 403
+
+    code_ok, _, body_ok = chamar(
+        config_fn, db, "POST", None,
+        {"pc_alias": "PC-1", "config": {"CLIPES_PORTAO": "on", "CLIPES_TZ": "UTC"}},
+    )
+    assert code_ok == 200
+    assert json.loads(body_ok) == {
+        "ok": True,
+        "pc_alias": "PC-1",
+        "config": {"CLIPES_PORTAO": "on", "CLIPES_TZ": "UTC"},
+    }
+
+
+def test_index_html_config_modal_e_sem_segredos():
+    from pathlib import Path
+
+    raw = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
+    assert 'id="config-modal"' in raw
+    assert 'id="novo-pc-btn"' in raw
+    assert 'fetch("/api/config"' in raw
+    assert '"configurar"' in raw
+    assert "Restaurar padroes" in raw
+    assert "config_schema" in raw
+    for segredo in _nucleo.FORBIDDEN_ENV_KEYS:
+        assert segredo not in raw, f"segredo {segredo} nao pode aparecer em index.html"
+
+
+def test_dev_server_roteia_api_config(db, env):
+    from painel import dev_server
+
+    h = type("H", (dev_server.PainelDevHandler,), {"client": {"clipes_lives": db}})
+    srv = HTTPServer(("127.0.0.1", 0), h)
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    req_get = urllib.request.Request(f"http://127.0.0.1:{srv.server_port}/api/config", method="GET")
+    with pytest.raises(urllib.error.HTTPError) as exc:
+        urllib.request.urlopen(req_get, timeout=5)
+    assert exc.value.code == 405
+
+    threading.Thread(target=srv.handle_request, daemon=True).start()
+    req_post = urllib.request.Request(
+        f"http://127.0.0.1:{srv.server_port}/api/config",
+        method="POST",
+        data=json.dumps({"pc_alias": "PC-1", "config": {"CLIPES_PORTAO": "on"}}).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req_post, timeout=5) as resp:
+        assert resp.status == 200
+        assert json.loads(resp.read()) == {"ok": True, "pc_alias": "PC-1", "config": {"CLIPES_PORTAO": "on"}}
+    srv.server_close()
