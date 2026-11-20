@@ -281,7 +281,8 @@ def _isolar_config_remota(monkeypatch):
     monkeypatch.setattr(config, "_BOOT_ENV", {})
     monkeypatch.setattr(config, "_APPLIED_REMOTE_KEYS", set())
     for k in ("CLIPES_VIGIA", "CLIPES_TEMP_MAX", "CLIPES_TEMP_MIN"):
-        monkeypatch.delenv(k, raising=False)
+        monkeypatch.setenv(k, "")  # registra o undo: apply_remote_config escreve em os.environ direto
+        monkeypatch.delenv(k)
 
 
 def test_vigia_grava_valores_efetivos_do_remoto(monkeypatch, tmp_path):
