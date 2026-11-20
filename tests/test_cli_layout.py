@@ -198,7 +198,7 @@ def test_cli_respects_render_clip_without_layout_key_and_skip_render(tmp_path: P
     ])
     assert cli.run_pipeline(args) == 0
     saved = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
-    assert saved["clips"][0]["layout"] == "black_bars_16x9"
+    assert saved["clips"][0]["layout"] == "blurred_16x9"
     assert saved["clips"][0]["layout_fallback"] is False
     assert saved["clips"][0]["facecam"] is None
 
@@ -208,7 +208,7 @@ def test_cli_respects_render_clip_without_layout_key_and_skip_render(tmp_path: P
     ])
     assert cli.run_pipeline(args_skip) == 0
     saved_skip = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
-    assert saved_skip["clips"][0]["layout"] == "black_bars_16x9"
+    assert saved_skip["clips"][0]["layout"] == "blurred_16x9"
     assert saved_skip["clips"][0]["layout_fallback"] is False
     assert saved_skip["clips"][0]["facecam"] is None
 

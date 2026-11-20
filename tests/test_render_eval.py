@@ -41,11 +41,11 @@ def test_build_ass_and_empty_ass(tmp_path: Path):
     # Short clip D < 4.0s must clamp Credit to [0, D] with no negative/inverted watermark interval
     short_ass = tmp_path / "short.ass"
     short_count = build_ass([], clip_start=0.0, clip_end=2.5, ass_path=short_ass, channel_credit="twitch.tv/gaules")
-    assert short_count == 2  # 1 Credit (0..2.5) + 1 Card (2.5..3.7)
+    assert short_count == 2  # 1 Credit (0..2.5) + 1 Card (2.5..3.0)
     short_txt = short_ass.read_text(encoding="utf-8")
     assert "0:00:00.00,0:00:02.50,Credit" in short_txt
     assert r"\alpha&H99&" not in short_txt
-    assert "0:00:02.50,0:00:03.70,Card" in short_txt
+    assert "0:00:02.50,0:00:03.00,Card" in short_txt
 
 
 def test_generate_title_heuristic():
@@ -314,9 +314,9 @@ def test_filter_chains_outro_and_blur_env(tmp_path: Path, monkeypatch):
     monkeypatch.setenv("CLIPES_LAYOUT", "full")
     ass_path = tmp_path / "clip.ass"
 
-    # Default (unset) -> black bars; CLIPES_BLUR_BG=1 -> split/boxblur/overlay + tpad before subtitles + no video fade
+    # Default (unset) -> blurred background; CLIPES_BLUR_BG=1 -> split/boxblur/overlay + tpad before subtitles + no video fade
     monkeypatch.delenv("CLIPES_BLUR_BG", raising=False)
-    assert render_mod.is_blur_bg_enabled() is False
+    assert render_mod.is_blur_bg_enabled() is True
     monkeypatch.setenv("CLIPES_BLUR_BG", "1")
     assert render_mod.is_blur_bg_enabled() is True
     fc_blur, v_map = render_mod.build_video_filter(ass_path, n_subs=3, outro_duration=1.2)
@@ -374,9 +374,9 @@ def test_filter_chains_outro_and_blur_env(tmp_path: Path, monkeypatch):
     assert out_mp4.is_file()
     cmd = captured_cmds[0]
     t_idx = len(cmd) - 1 - cmd[::-1].index("-t")
-    assert cmd[t_idx + 1] == "11.200"
+    assert cmd[t_idx + 1] == "10.500"
     af_idx = cmd.index("-af")
-    assert cmd[af_idx + 1] == "loudnorm=I=-14:TP=-1.5:LRA=11,afade=t=out:st=9.500:d=0.5,apad=pad_dur=1.2"
+    assert cmd[af_idx + 1] == "loudnorm=I=-14:TP=-1.5:LRA=11,afade=t=out:st=9.500:d=0.5,apad=pad_dur=0.5"
     fc_idx = cmd.index("-filter_complex")
     assert "split" not in cmd[fc_idx + 1]
     assert "pad=1080:1920" in cmd[fc_idx + 1]
@@ -513,7 +513,7 @@ def test_cli_channel_and_reframe_propagation_and_manifest(tmp_path: Path, monkey
     assert manifest["channel_credit"] == "twitch.tv/gaules"
     first = manifest["clips"][0]
     assert first["channel_credit"] == "twitch.tv/gaules"
-    assert first["rendered_duration"] == round(first["duration"] + 1.2, 3)
+    assert first["rendered_duration"] == round(first["duration"] + 0.5, 3)
     assert first["layout"] == "reframed_face"
 
 
@@ -573,7 +573,7 @@ def test_render_clip_real_ffmpeg_outro_card_and_credit(tmp_path: Path, monkeypat
         )
 
     for mp4 in rendered.values():
-        assert abs(probe_duration(mp4) - (content + 1.2)) <= 0.05
+        assert abs(probe_duration(mp4) - (content + 0.5)) <= 0.05
         streams = _ffprobe_streams(mp4)
         video = next(s for s in streams if s["codec_type"] == "video")
         assert (video["codec_name"], video["width"], video["height"]) == ("h264", 1080, 1920)
@@ -586,12 +586,12 @@ def test_render_clip_real_ffmpeg_outro_card_and_credit(tmp_path: Path, monkeypat
     for ass in (part1_ass, part2_ass):
         assert r"\pos(120,600)\fad(300,400)}twitch.tv/gaules" in ass
         assert r"\pos(120,600)\alpha&H99&}twitch.tv/gaules" in ass
-    assert "0:00:10.00,0:00:11.20,Card" in part1_ass and "Parte 2 →" in part1_ass
+    assert "0:00:10.00,0:00:10.50,Card" in part1_ass and "Parte 2 →" in part1_ass
 
     # Burned frames: the outro freezes the last frame (no fade to black) and shows the centered card.
     mp4 = rendered[1]
     before = _gray_frame(mp4, content - 0.1)
-    outro_early, outro_late = _gray_frame(mp4, content + 0.4), _gray_frame(mp4, content + 1.1)
+    outro_early, outro_late = _gray_frame(mp4, content + 0.15), _gray_frame(mp4, content + 0.45)
     card_box = (slice(900, 1020), slice(240, 840))
     assert abs(outro_late[card_box] - before[card_box]).mean() > 20  # card drawn over the frozen frame
     background = (slice(1500, 1900), slice(0, 1080))  # blurred bottom band, no text during the outro

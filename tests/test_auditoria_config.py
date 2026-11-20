@@ -95,6 +95,8 @@ def test_flags_render(monkeypatch):
     assert render.is_hook_top_enabled() is False
     monkeypatch.setenv("CLIPES_HOOK_TOP", "lixo")
     assert render.is_hook_top_enabled() is True
+    assert render.is_blur_bg_enabled() is True
+    monkeypatch.setenv("CLIPES_BLUR_BG", "0")
     assert render.is_blur_bg_enabled() is False
     monkeypatch.setenv("CLIPES_BLUR_BG", "sim")
     assert render.is_blur_bg_enabled() is True
