@@ -171,9 +171,9 @@ O MongoDB coordena apenas quem grava cada live, os alvos (`alvos`: lives e VODs 
 2. Em **Network Access**, adicione `0.0.0.0/0` (necessário para PCs com IP residencial dinâmico e funções serverless da Vercel), protegendo o acesso com senhas fortes.
 3. Em **Database Access**, crie dois usuários com permissão mínima:
    - `workers`: permissão `readWrite` apenas nas coleções `lives`, `jobs`, `workers`, `commands` e `alvos` (os PCs tomam e renovam alvos com `update` em `alvos`).
-   - `painel`: role customizada com leitura (`find`) em `lives`, `jobs`, `workers`, `alvos` e `insert`/`update` apenas nas coleções `commands` e `alvos` (sem isso, adicionar ou remover alvo pelo painel falha com `not authorized`).
+   - `painel`: role customizada com leitura (`find`) em `lives`, `jobs`, `workers`, `alvos` e `insert`/`update` nas coleções `commands`, `alvos` e `workers` (sem isso, adicionar/remover alvo ou salvar configurações por PC pelo painel falha com `not authorized`).
    - O bot (`docker compose up -d bot`) grava `alvos` com `insert`/`update`, o mesmo que o painel precisa para escrever na coleção.
-4. No `.env` de cada máquina, defina `CLIPES_MONGO_URI` com o usuário `workers` e um apelido distinto em `CLIPES_ALIAS` (ex.: `PC-1`, `PC-2`, `PC-3`).
+4. No `.env` de cada máquina, defina `CLIPES_MONGO_URI` com o usuário `workers` e um apelido distinto em `CLIPES_PC_ALIAS` ou `CLIPES_ALIAS` (ex.: `PC-1`, `PC-2`, `PC-3`).
 
 > O Atlas M0 pausa automaticamente após 30 dias sem conexões; se o Mongo ficar fora do ar, os PCs seguem processando na fila local e tentam reconectar a cada 60 s.
 
@@ -184,7 +184,8 @@ O MongoDB coordena apenas quem grava cada live, os alvos (`alvos`: lives e VODs 
    - `PAINEL_SENHA`: senha forte usada no Basic Auth.
    - `PAINEL_MONGO_URI`: connection string do usuário `painel` (menor privilégio).
    - Opcionais: `PAINEL_MONGO_DB` (padrão `clipes_lives`) e `CLIPES_BEAT_S` (padrão `20`).
-3. O painel atualiza a cada 10 s mostrando status online/offline, CPU, RAM, disco livre, temperatura (`n/d` sem sensor), GPU, job atual, slots e ocupados por plataforma, fila, a lista de alvos ativos com o dono e o botão **liberar recursos** (exige confirmação e digitar `LIBERAR`, encerrando subprocessos e saindo com código `75` para o `./clipar` reiniciar o ciclo após `CLIPES_RESTART_S=60`).
+3. O painel atualiza a cada 10 s mostrando status online/offline (inclusive PCs offline já registrados ou pré-configurados), CPU, RAM, disco livre, temperatura (`n/d` sem sensor), GPU, job atual, slots e ocupados por plataforma, fila, a lista de alvos ativos com o dono, o botão **liberar recursos** (exige confirmação e digitar `LIBERAR`, encerrando subprocessos e saindo com código `75` para o `./clipar` reiniciar o ciclo após `CLIPES_RESTART_S=60`) e o botão **configurar** por PC (mais **+ Configurar novo PC** para pré-cadastrar por `pc_alias`).
+4. **Configuração por PC via painel (`POST /api/config`)**: edita todas as 42 variáveis de ambiente não sensíveis por PC em `db.workers.config`, com precedência `MongoDB (painel) > .env local > padrão do código` (campo vazio restaura o padrão) e recarga em runtime no boot e a cada heartbeat (`CLIPES_BEAT_S`). Variáveis secretas (`CLIPES_MONGO_URI`, tokens e chaves de API) são bloqueadas por whitelist estrita e permanecem apenas no `.env` e `tokens.json` locais.
 
 ### 3. Windows (Docker Desktop + WSL2)
 
