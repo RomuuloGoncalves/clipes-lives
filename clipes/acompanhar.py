@@ -5,11 +5,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import ipaddress
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -1617,6 +1619,16 @@ class Supervisor:
         return int(cli.main(argv))
 
     def _check_vod_policy(self, vod: dict[str, Any], url: str, probe_fn: Callable[[str], dict[str, Any]]) -> str | None:
+        host = urllib.parse.urlparse(url).hostname or ""
+        try:
+            ips = {ipaddress.ip_address(i[4][0].split("%")[0]) for i in socket.getaddrinfo(host, None)}
+        except (OSError, ValueError):
+            return "host nao permitido"
+        if not ips or any(
+            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified
+            for ip in ips
+        ):
+            return "host nao permitido"
         if not self.policy.blocked and self.policy.allowed is None:
             return None
         candidatos: list[str] = []

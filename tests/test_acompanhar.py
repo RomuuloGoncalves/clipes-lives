@@ -1144,3 +1144,48 @@ def test_process_one_vod_limpa_cancelled_vod_ids_no_sucesso(tmp_path):
     sup._check_vod_policy = lambda vod, url, probe: None
     assert sup._process_one_vod("w", lambda u: {}) is True
     assert sup._cancelled_vod_ids == set()
+
+
+def _vod_ssrf(tmp_path, monkeypatch, ip):
+    import socket
+
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(2, 1, 6, "", (ip, 0))])
+    fins, runs = [], []
+
+    class C(_CoordStub):
+        def pegar_vod(self, alias):
+            return {"_id": "v1", "url": "https://exemplo.test/v"}
+
+        def fim_vod(self, *a, **kw):
+            fins.append((a, kw))
+
+    sup = acompanhar.Supervisor(
+        [], tmp_path / "out", pipeline=lambda d, o: {"clips": []}, coord=C(),
+        now=lambda: B, sleep=lambda _s: None,
+        vod_pipeline=lambda url, out: runs.append(url) or 0,
+    )
+    sup._process_one_vod("w", lambda u: {})
+    return fins, runs
+
+
+@pytest.mark.parametrize("ip", ["10.0.0.5", "127.0.0.1", "169.254.1.1", "224.0.0.1"])
+def test_vod_dns_ip_nao_publico_bloqueia(tmp_path, monkeypatch, ip):
+    fins, runs = _vod_ssrf(tmp_path, monkeypatch, ip)
+    assert runs == []
+    assert "falhou" in repr(fins) and "host nao permitido" in repr(fins)
+
+
+def test_vod_dns_ip_publico_roda_pipeline(tmp_path, monkeypatch):
+    fins, runs = _vod_ssrf(tmp_path, monkeypatch, "8.8.8.8")
+    assert runs == ["https://exemplo.test/v"]
+
+
+def test_vod_dns_falha_bloqueia(tmp_path, monkeypatch):
+    import socket
+
+    def boom(*a, **k):
+        raise socket.gaierror("x")
+
+    monkeypatch.setattr(socket, "getaddrinfo", boom)
+    sup = acompanhar.Supervisor([], tmp_path / "o", pipeline=lambda d, o: {}, now=lambda: B, sleep=lambda _s: None)
+    assert sup._check_vod_policy({}, "https://exemplo.test/v", lambda u: {}) == "host nao permitido"
