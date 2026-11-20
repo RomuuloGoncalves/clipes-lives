@@ -1494,6 +1494,26 @@ class Supervisor:
             kwargs["ocupados"] = self._ocupados()
         if has_kw or "fila" in params:
             kwargs["fila"] = self._fila(queue, c)
+        atuais = self._jobs_atuais()
+        if atuais:
+            job_atual = atuais[0]
+        if has_kw or "jobs_atuais" in params:
+            kwargs["jobs_atuais"] = atuais
+        if has_kw or "jobs" in params:
+            amostras = list(self._worker_s)
+            e = capacidade.jobs_efetivos()
+            try:
+                pedidos = int(os.environ.get("CLIPES_JOBS", "").strip())
+            except ValueError:
+                pedidos = 1
+            media = sum(amostras) / len(amostras) if amostras else None
+            kwargs["jobs"] = {
+                "efetivos": e,
+                "pedidos": pedidos,
+                "job_medio_s": round(media, 1) if media else None,
+                "amostras": len(amostras),
+                "lives_sustentaveis": round(e * monitor.LIVE_STEP_S / media, 1) if media else None,
+            }
         res = beat_fn(alias, cap, job_atual, ml, razao, **kwargs)
         if isinstance(res, dict):
             self._apply_runtime_config(res, alias=alias, c=c)

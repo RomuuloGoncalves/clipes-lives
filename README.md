@@ -62,7 +62,7 @@ Processar um VOD ou live ativa. Use o `./clipar` (cria a pasta de saída como se
 ./clipar "https://www.youtube.com/watch?v=cStJTQf9XUk" --live-minutes 4 --max-clips 2
 ```
 
-O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 5 GB), respeitando valores definidos no ambiente; roda com prioridade baixa e liga o `./vigia-temp` (detalhes em "Temperatura e vigia" abaixo). Para uso contínuo, `./clipar servico` (ver "Serviço único" abaixo) mantém a fila de janelas, a busca geral e os VODs em um processo só, com 1 worker que processa um job por vez; se parar, retoma da fila.
+O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 5 GB), respeitando valores definidos no ambiente (`*` em `CLIPES_MEM` ou `CLIPES_CPUS` = sem limite; com CPU sem limite, as threads passam a ser o `nproc`); roda com prioridade baixa e liga o `./vigia-temp` (detalhes em "Temperatura e vigia" abaixo). Para uso contínuo, `./clipar servico` (ver "Serviço único" abaixo) mantém a fila de janelas, a busca geral e os VODs em um processo só, com `CLIPES_JOBS` workers (padrão 1), cada um processando um job por vez; se parar, retoma da fila.
 
 Opções da CLI:
 
@@ -80,6 +80,8 @@ docker compose run --rm clipes <url> \
   --asr-budget-ratio 0.30 \
   --chat   # ou --no-chat (lives e VODs sem chat degradam sem erro)
 ```
+
+Rodar direto com `docker compose run --rm clipes <url>` ou `servico` também vale para o vigia térmico e para os limites de RAM/CPU do painel, sem `./clipar`: o serviço `vigia` do `docker-compose.yml` faz isso e aplica RAM/CPU ao vivo (`docker update`). Detalhes em [docs/vigia-docker.md](docs/vigia-docker.md). Sob `./clipar`, o `vigia` do compose fica ocioso e vale o `./vigia-temp` do host.
 
 Detecção (`--mode`): `peaks` usa só os picos de áudio/chat/heatmap; `quota` transcreve rápido (Whisper small, beam 1) até `--asr-budget-ratio` da duração e escolhe os melhores trechos para garantir `--min-per-hour` clipes por hora; `auto` (padrão) usa picos e só aciona a cota quando os picos fortes não a preenchem. `--no-llm` desliga título/legenda/hashtags por IA local. O `clips.json` registra `detection_mode`, `floor_mode` e `quota_target`.
 
@@ -128,7 +130,7 @@ docker compose run --rm test
 
 ## Temperatura e vigia
 
-O `./vigia-temp` pausa o container quando o PC esquenta e o retoma quando esfria. Ele grava a temperatura em `<saída>/.temp` a cada 5 s (log em `<saída>/.temp.log`); o painel lê esse valor.
+O vigia pausa o container quando o PC esquenta e o retoma quando esfria. Ele grava a temperatura em `<saída>/.temp` a cada 5 s (log em `<saída>/.temp.log`); o painel lê esse valor. Há dois vigias, e só um escreve por vez: o serviço `vigia` do `docker-compose.yml` (sobe com o `clipes`, funciona com `docker compose run` direto e aplica RAM/CPU do painel ao vivo via `docker update`; detalhes em [docs/vigia-docker.md](docs/vigia-docker.md)) e o `./vigia-temp` do host, que o `./clipar` liga. Sob `./clipar`, o do compose fica ocioso.
 
 Ajustes pelo painel (aba **Temperatura**, por PC) ou no `.env`:
 
@@ -140,7 +142,7 @@ O valor configurado pelo painel chega ao PC no próximo heartbeat (`CLIPES_BEAT_
 
 - Leitura velha: se `.temp` tiver mais de 30 s, a temperatura é tratada como ausente (`n/d` no painel), então a última leitura não parece atual com o vigia parado.
 - Uma instância por saída: se já houver um `vigia-temp` vivo (`<saída>/.vigia.pid`), o novo sai com código 0. O `./clipar` inicia o vigia só se não houver um vivo e encerra só o que ele mesmo iniciou.
-- **WSL2 (Windows):** o hwmon do Linux não enxerga o sensor do host. O vigia então consulta o Windows por `powershell.exe`, tentando primeiro o LibreHardwareMonitor (WMI, `root/LibreHardwareMonitor`) e depois `MSAcpi_ThermalZoneTemperature`. Essa consulta roda no máximo a cada 15 s. Para ela funcionar, abra o LibreHardwareMonitor no Windows com o servidor WMI ligado. Se nenhuma fonte responder em 5 s, o vigia grava `sem-sensor`, o `./clipar` imprime um aviso para abrir o LibreHardwareMonitor e o painel mostra `n/d`.
+- **Windows (Docker Desktop / WSL2):** o hwmon do Linux não enxerga o sensor do host. O serviço `vigia` do compose lê o LibreHardwareMonitor por HTTP: abra o LibreHardwareMonitor como administrador com **Options → Remote Web Server → Run** (porta 8085) e confira `http://localhost:8085/data.json` no navegador (`CLIPES_LHM_URL` troca o endereço). O `./vigia-temp` no WSL2 consulta o Windows por `powershell.exe`, tentando primeiro o LibreHardwareMonitor (WMI, `root/LibreHardwareMonitor`, com o servidor WMI ligado) e depois `MSAcpi_ThermalZoneTemperature`; essa consulta roda no máximo a cada 15 s. Se nenhuma fonte responder em 5 s, o vigia grava `sem-sensor`, o `./clipar` imprime um aviso para abrir o LibreHardwareMonitor e o painel mostra `n/d`.
 
 ## Saída
 
@@ -203,15 +205,15 @@ O MongoDB coordena apenas quem grava cada live, os alvos (`alvos`: lives e VODs 
    - `PAINEL_SENHA`: senha forte usada no Basic Auth.
    - `PAINEL_MONGO_URI`: connection string do usuário `painel` (menor privilégio).
    - Opcionais: `PAINEL_MONGO_DB` (padrão `clipes_lives`) e `CLIPES_BEAT_S` (padrão `20`).
-3. O painel atualiza a cada 10 s mostrando status online/offline (inclusive PCs offline já registrados ou pré-configurados), CPU, RAM, disco livre, temperatura (`n/d` sem sensor), GPU, job atual, slots e ocupados por plataforma, fila, a lista de alvos ativos com o dono, o botão **liberar recursos** (exige confirmação e digitar `LIBERAR`, encerrando subprocessos e saindo com código `75` para o `./clipar` reiniciar o ciclo após `CLIPES_RESTART_S=60`) e o botão **configurar** por PC (mais **+ Configurar novo PC** para pré-cadastrar por `pc_alias`).
-4. **Configuração por PC via painel (`POST /api/config`)**: edita todas as 44 variáveis de ambiente não sensíveis por PC em `db.workers.config`, com precedência `MongoDB (painel) > .env local > padrão do código` (campo vazio restaura o padrão) e recarga em runtime no boot e a cada heartbeat (`CLIPES_BEAT_S`). `CLIPES_MEM` (ex.: `4g`) e `CLIPES_CPUS` (ex.: `2`) ficam no grupo **Recursos (RAM/CPU)**: o worker grava o pedido em `out/.recursos` e sai com código `75` quando o limite atual do contêiner difere; o `./clipar` relê o arquivo (precedência painel > `.env` > automático) e recria o contêiner com o novo limite. Só vale sob `./clipar`, não em `docker compose up -d bot`; voltar ao automático pelo painel só vale no próximo reinício. Variáveis secretas (`CLIPES_MONGO_URI`, tokens e chaves de API) são bloqueadas por whitelist estrita e permanecem apenas no `.env` e `tokens.json` locais.
+3. O painel atualiza a cada 10 s mostrando status online/offline (inclusive PCs offline já registrados ou pré-configurados), CPU, RAM, disco livre, temperatura (`n/d` sem sensor), GPU, job atual, slots e ocupados por plataforma, fila, a lista de alvos ativos com o dono, o botão **liberar recursos** (exige confirmação e digitar `LIBERAR`, encerrando subprocessos e saindo com código `75` para o `./clipar` reiniciar o ciclo após `CLIPES_RESTART_S=60`) e o botão **configurar** por PC (mais **+ Configurar novo PC** para pré-cadastrar por `pc_alias`). As colunas **Job atual** (um id por job em andamento), **Capacidade** (`<lives ativas>/<sustentáveis> lives · <jobs> jobs · <média> s por job`; destacada com `fila vai crescer` quando as lives ativas passam das sustentáveis) e **RAM** (`livre / limite`, `sem limite` ou `?` se ilegível, com selo `diverge` quando o pedido do painel difere do limite do contêiner) mostram a capacidade de cada PC.
+4. **Configuração por PC via painel (`POST /api/config`)**: edita todas as 44 variáveis de ambiente não sensíveis por PC em `db.workers.config`, com precedência `MongoDB (painel) > .env local > padrão do código` (campo vazio restaura o padrão) e recarga em runtime no boot e a cada heartbeat (`CLIPES_BEAT_S`). `CLIPES_MEM` (ex.: `4g`, `*` = sem limite), `CLIPES_CPUS` (ex.: `2`, `*` = sem limite) e `CLIPES_RAM_POR_JOB` (ex.: `2560m`) ficam no grupo **Recursos (RAM/CPU)**: o worker grava o pedido em `out/.recursos` e sai com código `75` quando o limite atual do contêiner difere; o `./clipar` relê o arquivo (precedência painel > `.env` > automático) e recria o contêiner com o novo limite. Com o serviço `vigia` do compose (ver "Temperatura e vigia"), o limite muda ao vivo, inclusive com `docker compose run` direto; sem ele (ex.: `docker compose up -d bot`) só vale sob `./clipar`. Voltar ao automático pelo painel só vale no próximo reinício. Variáveis secretas (`CLIPES_MONGO_URI`, tokens e chaves de API) são bloqueadas por whitelist estrita e permanecem apenas no `.env` e `tokens.json` locais.
 
 ### 3. Windows (Docker Desktop + WSL2)
 
 Nos PCs com Windows (ex.: `PC-2` e `PC-3`):
 
 1. Instale o **Docker Desktop** usando o backend **WSL2**.
-2. Crie `%UserProfile%\.wslconfig` para limitar RAM e núcleos da VM (ajuste ao hardware da máquina) e reinicie o WSL com `wsl --shutdown`:
+2. Crie `%UserProfile%\.wslconfig` para limitar RAM e núcleos da VM (ajuste ao hardware da máquina) e reinicie o WSL com `wsl --shutdown`. No Windows, o limite real de RAM é o da VM: `CLIPES_MEM` não passa desse valor.
 
 ```ini
 [wsl2]
@@ -220,7 +222,7 @@ processors=12
 ```
 
 3. Execute o `./clipar` a partir de uma distro Linux dentro do WSL2, mantendo `OUT_DIR` dentro do sistema de arquivos da distro (evite `/mnt/c` pelo impacto em I/O).
-4. No WSL2 a temperatura vem do Windows via LibreHardwareMonitor (servidor WMI ligado), conforme "Temperatura e vigia". Sem sensor, o `./clipar` imprime o aviso de `sem-sensor` e o painel exibe `n/d`.
+4. A temperatura vem do LibreHardwareMonitor no Windows, com **Options → Remote Web Server → Run** (porta 8085), conforme "Temperatura e vigia". Sem sensor, o `./clipar` imprime o aviso de `sem-sensor` e o painel exibe `n/d`.
 
 ### 4. Serviço único por PC (`./clipar servico`) e slots
 
@@ -230,10 +232,11 @@ Em cada PC, rode uma vez:
 ./clipar servico
 ```
 
-Um único processo faz tudo: o `Supervisor` acompanha os alvos da coleção `alvos` do MongoDB (sem `CLIPES_MONGO_URI`, os alvos vêm do argv: `./clipar servico <canal|url>...`), a busca geral IRC da Twitch roda sobre o `channels.txt` de cada PC (um canal por linha; `#` comenta) e há 1 fila e 1 worker. O worker processa 1 job por vez, nesta ordem: janelas de live e clipes da busca (por `z_score`) e, só com a fila vazia, VODs.
+Um único processo faz tudo: o `Supervisor` acompanha os alvos da coleção `alvos` do MongoDB (sem `CLIPES_MONGO_URI`, os alvos vêm do argv: `./clipar servico <canal|url>...`), a busca geral IRC da Twitch roda sobre o `channels.txt` de cada PC (um canal por linha; `#` comenta) e há 1 fila com até `CLIPES_JOBS` workers. Cada worker processa 1 job por vez, nesta ordem: janelas de live e clipes da busca (por `z_score`) e, só com a fila vazia, VODs.
 
 - **Adicionar e parar pelo Discord**: `/live adicionar` grava o alvo em `alvos`; um PC com vaga da plataforma toma o alvo (claim atômico) em até 30 s. `/live remover` marca o alvo como `removido` e o PC dono fecha a janela em andamento. `/live lista` mostra o PC dono e o estado de cada alvo.
 - **Slots (`CLIPES_SLOTS`)**: padrão `twitch=1,kick=1,youtube=1,busca=1`. Cada valor é o máximo de sessões daquela plataforma neste PC; `0` desliga a plataforma aqui (ex.: `CLIPES_SLOTS=twitch=2,kick=0,busca=0`). Plataforma desconhecida, valor não inteiro ou negativo faz o serviço sair com código 2 e a mensagem `CLIPES_SLOTS invalido: <trecho>`. `busca=0` não abre conexão IRC. `CLIPES_SLOTS` substitui `CLIPES_MAX_LIVES` e o antigo `bench-live`.
+- **Jobs em paralelo (`CLIPES_JOBS`, 1 a 8; vazio = 1)**: quantos jobs o PC processa ao mesmo tempo. O valor efetivo é o menor entre o pedido, as CPUs (limite do contêiner ou núcleos) e a RAM dividida por `CLIPES_RAM_POR_JOB` (padrão `2560m`, ou seja 2,5 GB por job; a RAM é o menor entre o limite do contêiner e a memória total). Cada live tem no máximo 1 job por vez, e os VODs continuam um por vez; logo `CLIPES_JOBS` ajuda quando há várias lives. Recomendação: `2` ou mais em PCs com várias lives. Whisper, llama-server e onnx dividem as threads da CPU entre os jobs efetivos. O log `[jobs] CLIPES_JOBS=N limitado a E` aparece quando o pedido é cortado.
 - **Heartbeat**: cada PC publica `slots` e `ocupados` por plataforma em `workers` (o painel mostra).
 - **Lease**: se o PC dono para de renovar um alvo por 90 s, outro PC com vaga pode tomá-lo. Ao reiniciar, o PC retoma os alvos de que ainda é dono. Mantenha `CLIPES_LEASE_S` >= `90` (padrão): avisos síncronos ao Discord (timeout de até ~60 s) pausam o laço principal.
 - **Sem live duplicada**: a busca geral ignora picos de canais que são alvo `ativo` em `alvos` (de qualquer PC), então uma live não é gravada por dois PCs.

@@ -1783,3 +1783,52 @@ def test_pool_log_de_corte_aparece_uma_vez_por_mudanca(tmp_path, monkeypatch, ca
     out = capsys.readouterr().out
     assert out.count("[jobs] CLIPES_JOBS=4 limitado a 2 ") == 1
     assert out.count("[jobs] CLIPES_JOBS=4 limitado a 3 ") == 1
+
+
+def _beat_kwargs(monkeypatch, tmp_path, coord_beat, amostras=(), jobs_em_andamento=None, efetivos=2):
+    monkeypatch.setattr(acompanhar.capacidade, "jobs_efetivos", lambda: efetivos)
+    sup = acompanhar.Supervisor([], tmp_path / "out", now=lambda: 0.0)
+    sup._worker_s.extend(amostras)
+    sup._jobs_em_andamento.update(jobs_em_andamento or {})
+    sup._call_beat(SimpleNamespace(beat=coord_beat), "pc1", {}, None, 1, 1.0, 20.0)
+
+
+def test_beat_jobs_media_e_lives_sustentaveis(monkeypatch, tmp_path):
+    got = {}
+    _beat_kwargs(monkeypatch, tmp_path, lambda *a, **k: got.update(k), amostras=[100, 200])
+    j = got["jobs"]
+    assert (j["job_medio_s"], j["amostras"], j["efetivos"]) == (150.0, 2, 2)
+    assert j["lives_sustentaveis"] == round(2 * acompanhar.monitor.LIVE_STEP_S / 150, 1)
+
+
+def test_beat_jobs_sem_amostras(monkeypatch, tmp_path):
+    got = {}
+    _beat_kwargs(monkeypatch, tmp_path, lambda *a, **k: got.update(k))
+    j = got["jobs"]
+    assert (j["job_medio_s"], j["amostras"], j["lives_sustentaveis"]) == (None, 0, None)
+
+
+def test_beat_media_das_20_ultimas(monkeypatch, tmp_path):
+    got = {}
+    _beat_kwargs(monkeypatch, tmp_path, lambda *a, **k: got.update(k), amostras=[1000] + [10] * 20)
+    assert got["jobs"]["amostras"] == 20 and got["jobs"]["job_medio_s"] == 10.0
+
+
+def test_beat_coord_antigo_sem_kwargs_recebe(monkeypatch, tmp_path):
+    chamadas = []
+
+    def beat(alias, cap, job_atual, ml, razao):
+        chamadas.append(alias)
+
+    _beat_kwargs(monkeypatch, tmp_path, beat)
+    assert chamadas == ["pc1"]
+
+
+def test_beat_dois_jobs_job_atual_e_o_primeiro(monkeypatch, tmp_path):
+    got = {}
+
+    def beat(alias, cap, job_atual, ml, razao, **k):
+        got.update(k, job_atual=job_atual)
+
+    _beat_kwargs(monkeypatch, tmp_path, beat, jobs_em_andamento={0: "a", 1: "b"})
+    assert got["job_atual"] == "a" and got["jobs_atuais"] == ["a", "b"]

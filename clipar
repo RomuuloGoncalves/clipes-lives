@@ -16,7 +16,9 @@ OUT_DIR="${OUT_DIR:-$ROOT/out}"
 mkdir -p "$OUT_DIR" && export OUT_DIR
 HOST_UID="${HOST_UID:-$(id -u)}"
 HOST_GID="${HOST_GID:-$(id -g)}"
-export HOST_UID HOST_GID
+# O vigia do host (./vigia-temp) e quem manda: o servico `vigia` do compose fica ocioso (um escritor so).
+CLIPES_VIGIA_HOST=1
+export HOST_UID HOST_GID CLIPES_VIGIA_HOST
 
 SYSFS_ROOT="${SYSFS_ROOT:-/sys}"
 PROC_ROOT="${PROC_ROOT:-/proc}"

@@ -11,6 +11,9 @@ services:
     mem_limit: ${CLIPES_MEM:-5g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
+    # Sem condition de saude: o vigia pode falhar sem impedir o clipes.
+    depends_on:
+      - vigia
     environment:
       OUT_DIR: /out
       HOME: /cache
@@ -106,6 +109,38 @@ services:
       - clipes_models:/cache
       - ${OUT_DIR:-./out}:/out
       - ${CLIPES_CONFIG_DIR:-${HOME}/.config/clipes-lives}:/config
+
+  # Vigia termico e de RAM/CPU (le .vigia/.recursos de /out). Unico servico com o socket do Docker (pausa/atualiza o
+  # clipes); por isso sem segredos, sem rede publica, read_only e sem capabilities. Ocioso sob ./clipar (CLIPES_VIGIA_HOST).
+  vigia:
+    image: clipes-lives:latest
+    user: "0:0"
+    restart: unless-stopped
+    read_only: true
+    # DAC_OVERRIDE/CHOWN: gravar em /out (dono HOST_UID, modo 755) e devolver o dono dos arquivos ao usuario.
+    cap_drop: [ALL]
+    cap_add: [DAC_OVERRIDE, CHOWN]
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp
+    mem_limit: 128m
+    cpus: 0.25
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      OUT_DIR: /out
+      HOST_UID: ${HOST_UID:-1000}
+      HOST_GID: ${HOST_GID:-1000}
+      CLIPES_VIGIA_HOST: ${CLIPES_VIGIA_HOST:-}
+      CLIPES_LHM_URL: ${CLIPES_LHM_URL:-}
+      CLIPES_VIGIA: ${CLIPES_VIGIA:-}
+      CLIPES_TEMP_MAX: ${CLIPES_TEMP_MAX:-}
+      CLIPES_TEMP_MIN: ${CLIPES_TEMP_MIN:-}
+    volumes:
+      - ${OUT_DIR:-./out}:/out
+      - /var/run/docker.sock:/var/run/docker.sock
+    command: ["python", "-m", "clipes.vigia"]
 
   bot:
     image: clipes-lives:latest
