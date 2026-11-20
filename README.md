@@ -62,7 +62,7 @@ Processar um VOD ou live ativa. Use o `./clipar` (cria a pasta de saída como se
 ./clipar "https://www.youtube.com/watch?v=cStJTQf9XUk" --live-minutes 4 --max-clips 2
 ```
 
-O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 8 GB), respeitando valores definidos no ambiente; roda com prioridade baixa e liga o `./vigia-temp` (detalhes em "Temperatura e vigia" abaixo). Para uso contínuo, `./clipar servico` (ver "Serviço único" abaixo) mantém a fila de janelas, a busca geral e os VODs em um processo só, com 1 worker que processa um job por vez; se parar, retoma da fila.
+O `./clipar` calcula automaticamente o limite de CPUs (`CLIPES_CPUS`: metade dos núcleos no desktop ou 1/4 em notebook/bateria ou com menos de 4 GB livres, mínimo 1, replicado em `CLIPES_CPU_THREADS`) e de RAM (`CLIPES_MEM`: 60% da memória disponível, teto de 5 GB), respeitando valores definidos no ambiente; roda com prioridade baixa e liga o `./vigia-temp` (detalhes em "Temperatura e vigia" abaixo). Para uso contínuo, `./clipar servico` (ver "Serviço único" abaixo) mantém a fila de janelas, a busca geral e os VODs em um processo só, com 1 worker que processa um job por vez; se parar, retoma da fila.
 
 Opções da CLI:
 

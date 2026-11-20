@@ -8,7 +8,7 @@ services:
       #   WITH_LLM_4B: 1  # baixa e ativa Qwen3-4B (~2,5 GB extra, ~4,5 GB RAM)
     image: clipes-lives:latest
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
-    mem_limit: ${CLIPES_MEM:-8g}
+    mem_limit: ${CLIPES_MEM:-5g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
     environment:
@@ -43,6 +43,8 @@ services:
       CLIPES_TEMP_MAX: ${CLIPES_TEMP_MAX:-}
       CLIPES_TEMP_MIN: ${CLIPES_TEMP_MIN:-}
       CLIPES_RECURSOS_GERIDO: ${CLIPES_RECURSOS_GERIDO:-}
+      CLIPES_MEM: ${CLIPES_MEM:-}
+      CLIPES_CPUS: ${CLIPES_CPUS:-}
       CLIPES_MAX_BACKLOG: ${CLIPES_MAX_BACKLOG:-}
       CLIPES_BAR:
       CLIPES_BRAND_NAME:
@@ -108,7 +110,7 @@ services:
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
     profiles: ["bot"]
     restart: unless-stopped
-    mem_limit: ${CLIPES_MEM:-8g}
+    mem_limit: ${CLIPES_MEM:-5g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
     environment:
@@ -159,7 +161,7 @@ services:
   test:
     image: clipes-lives:latest
     user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
-    mem_limit: ${CLIPES_MEM:-8g}
+    mem_limit: ${CLIPES_MEM:-5g}
     cpus: ${CLIPES_CPUS:-3}
     cpu_shares: 256
     environment:

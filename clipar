@@ -72,11 +72,11 @@ calc_recursos() {
   if [ -z "${CLIPES_MEM:-}" ]; then
     if [ -n "$mem_kb" ] && [ "$mem_kb" -gt 0 ]; then
       mem_mb=$(( (mem_kb * 60) / 102400 ))
-      [ "$mem_mb" -gt 8192 ] && mem_mb=8192
+      [ "$mem_mb" -gt 5120 ] && mem_mb=5120
       [ "$mem_mb" -lt 1 ] && mem_mb=1
       CLIPES_MEM="${mem_mb}m"
     else
-      CLIPES_MEM="8192m"
+      CLIPES_MEM="5120m"
     fi
   fi
   export CLIPES_MEM

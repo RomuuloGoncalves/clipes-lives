@@ -111,7 +111,7 @@ def test_clipar_auto_profile_battery_and_low_ram(tmp_path):
     assert res.returncode == 0
     lines = docker_log.read_text(encoding="utf-8").strip().splitlines()
     assert len(lines) == 1
-    assert "CPUS=3|MEM=7372m|THREADS=3" in lines[0]
+    assert "CPUS=3|MEM=5120m|THREADS=3" in lines[0]
 
     # Low RAM (< 4 GB) without battery also uses nproc // 4
     clipar_low, env_low, log_low, _ = _prepare_clipar_env(
@@ -136,9 +136,9 @@ def test_clipar_auto_profile_desktop_cap_and_user_overrides(tmp_path):
     res = subprocess.run([str(clipar_bin), "monitor"], env=env, capture_output=True, text=True)
     assert res.returncode == 0
     line = docker_log.read_text(encoding="utf-8").strip()
-    assert "CPUS=8|MEM=7372m|THREADS=8" in line
+    assert "CPUS=8|MEM=5120m|THREADS=8" in line
 
-    # 20 GB free caps CLIPES_MEM at 8 GB (8192m)
+    # 20 GB free caps CLIPES_MEM at 5 GB (5120m)
     clipar_20, env_20, log_20, _ = _prepare_clipar_env(
         tmp_path / "desk20",
         nproc_val=16,
@@ -147,7 +147,7 @@ def test_clipar_auto_profile_desktop_cap_and_user_overrides(tmp_path):
     )
     res_20 = subprocess.run([str(clipar_20), "monitor"], env=env_20, capture_output=True, text=True)
     assert res_20.returncode == 0
-    assert "CPUS=8|MEM=8192m|THREADS=8" in log_20.read_text(encoding="utf-8").strip()
+    assert "CPUS=8|MEM=5120m|THREADS=8" in log_20.read_text(encoding="utf-8").strip()
 
     # User-defined CLIPES_CPUS, CLIPES_MEM, CLIPES_CPU_THREADS are never overwritten
     clipar_ovr, env_ovr, log_ovr, _ = _prepare_clipar_env(
@@ -175,7 +175,7 @@ def test_clipar_sem_sensor_warns_without_changing_limits(tmp_path):
     res = subprocess.run([str(clipar_bin), "https://twitch.tv/teste"], env=env, capture_output=True, text=True)
     assert res.returncode == 0
     assert "aviso: sem sensor de temperatura; vigia termico desligado" in res.stderr
-    assert "CPUS=8|MEM=7372m|THREADS=8" in docker_log.read_text(encoding="utf-8").strip()
+    assert "CPUS=8|MEM=5120m|THREADS=8" in docker_log.read_text(encoding="utf-8").strip()
 
 
 # ---- VIG-06 / WIN-02 / VIG-09 (ajustes-nov20 T15) ---------------------------------------------
