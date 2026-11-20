@@ -179,3 +179,40 @@ def test_invalid_quota_flags_exit_2():
     assert cli.main(["http://x", "--min-per-hour", "-1", "--skip-render"]) == 2
     assert cli.main(["http://x", "--asr-budget-ratio", "0.05", "--skip-render"]) == 2
     assert cli.main(["http://x", "--asr-budget-ratio", "1.5", "--skip-render"]) == 2
+
+
+def _mixed_peaks() -> list[CandidatePeak]:  # centros 200, 400, 600, 800, 1000
+    return _peaks(5)
+
+
+def test_own_range_filters_candidates_before_asr2(tmp_path, monkeypatch):
+    ing = _ing(tmp_path)
+    seen = _wire(monkeypatch, ing, _mixed_peaks(), ([], False))
+    assert _run(tmp_path, ["--mode", "peaks", "--own-range", "390,610"]) == 0  # [375, 625]
+    assert [c.peak for c in seen["pass2_candidates"][0]] == [400.0, 600.0]
+    manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert manifest["timings"]["candidatos_fora_dono"] == 3
+
+
+def test_without_own_range_keeps_all_candidates(tmp_path, monkeypatch):
+    ing = _ing(tmp_path)
+    seen = _wire(monkeypatch, ing, _mixed_peaks(), ([], False))
+    assert _run(tmp_path, ["--mode", "peaks"]) == 0
+    assert len(seen["pass2_candidates"][0]) == 5
+    manifest = json.loads((ing.out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert "candidatos_fora_dono" not in manifest["timings"]
+
+
+def test_own_range_inclusive_margin_edges(tmp_path, monkeypatch):
+    ing = _ing(tmp_path)
+    seen = _wire(monkeypatch, ing, _mixed_peaks(), ([], False))
+    assert _run(tmp_path, ["--mode", "peaks", "--own-range", "415,585"]) == 0  # [400, 600]
+    assert [c.peak for c in seen["pass2_candidates"][0]] == [400.0, 600.0]
+
+
+def test_invalid_own_range_is_argparse_error():
+    import pytest
+    for bad in ("5,5", "9,1", "a,b", "10"):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["http://x", "--own-range", bad, "--skip-render"])
+        assert e.value.code == 2

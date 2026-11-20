@@ -62,6 +62,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Seleção: picos, cota por hora, ou auto (padrão: auto)")
     p.add_argument("--min-per-hour", type=float, default=3.0,
                    help="Cota mínima de clipes por hora no modo quota/auto (padrão: 3)")
+    p.add_argument("--own-range", type=_own_range, default=None, metavar="LO,HI",
+                   help="Só candidatos com centro em [LO-15, HI+15] s (região dona do worker)")
     p.add_argument("--asr-budget-ratio", type=float, default=0.30,
                    help="Fração máxima da duração transcrita na Passada 1 (padrão: 0.30)")
     p.add_argument("--no-llm", action="store_true",
@@ -210,6 +212,16 @@ def _topics_from_pass1(segments: list[Word]) -> list[TopicSegment]:
     return topics
 
 
+def _own_range(raw: str) -> tuple[float, float]:
+    try:
+        lo, hi = (float(x) for x in raw.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("use 'lo,hi' com floats") from None
+    if not lo < hi:
+        raise argparse.ArgumentTypeError("lo deve ser < hi")
+    return lo, hi
+
+
 def _select_candidates(
     args: argparse.Namespace,
     bundle: SignalBundle,
@@ -224,7 +236,22 @@ def _select_candidates(
     mode = args.mode
     min_target = 0 if args.min_per_hour == 0 else 1
     quota_target = max(min_target, min(args.max_clips, math.ceil(args.min_per_hour * bundle.duration / 3600.0)))
-    peaks = pick_candidate_peaks(bundle, max_clips=args.max_clips, min_separation=90)
+    own = getattr(args, "own_range", None)
+    dropped = 0
+
+    def in_own(cands: list[CandidatePeak]) -> list[CandidatePeak]:
+        nonlocal dropped
+        if own is None:
+            return cands
+        kept = [c for c in cands if own[0] - 15.0 <= c.peak <= own[1] + 15.0]
+        dropped += len(cands) - len(kept)
+        timings["candidatos_fora_dono"] = dropped
+        return kept
+
+    if own is None:
+        peaks = pick_candidate_peaks(bundle, max_clips=args.max_clips, min_separation=90)
+    else:  # filtra antes da cota: o orçamento vai para a região dona
+        peaks = in_own(pick_candidate_peaks(bundle, max_clips=10**6, min_separation=90))[: args.max_clips * 2]
     p90 = float(np.percentile(bundle.smoothed, 90.0)) if len(bundle.smoothed) else 0.0
     strong = [c for c in peaks if c.raw_score >= max(p90, 0.25)]  # absolute floor: a flat curve has no strong peaks
     if mode == "peaks":
@@ -249,7 +276,7 @@ def _select_candidates(
         max_clips=args.max_clips,
         min_per_hour=args.min_per_hour,
     )
-    return chosen, floor_mode, quota_target, True
+    return in_own(chosen), floor_mode, quota_target, True
 
 
 def _resolve_portao_mode() -> str:
