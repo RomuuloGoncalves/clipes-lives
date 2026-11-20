@@ -369,6 +369,7 @@
 
     .temp-warn { color: var(--warn-fg); font-weight: 700; }
     .temp-hot { color: var(--off-fg); font-weight: 700; }
+    .temp-off { color: var(--muted); font-weight: 700; }
 
     .slot-list {
       display: flex;
@@ -1043,7 +1044,8 @@
         { id: "lives", label: "Slots e Lives" },
         { id: "render", label: "Layout e Marca" },
         { id: "ia", label: "IA, Portao e Traducao" },
-        { id: "publicacao", label: "Master e Publicacao" }
+        { id: "publicacao", label: "Master e Publicacao" },
+        { id: "temperatura", label: "Temperatura" }
       ];
 
       function el(tag, cls, txt) {
@@ -1319,7 +1321,11 @@
             tdTemp.appendChild(el("span", "nd", "n/d"));
           } else {
             var tempVal = Number(cap.temp_c);
-            var tempCls = tempVal >= 85 ? "temp-hot" : (tempVal >= 75 ? "temp-warn" : "");
+            var tempCfg = w.config || {};
+            var tempMax = Number(tempCfg.CLIPES_TEMP_MAX || 85);
+            var tempMin = Number(tempCfg.CLIPES_TEMP_MIN || 75);
+            var tempCls = String(tempCfg.CLIPES_VIGIA) === "0" ? "temp-off"
+              : (tempVal >= tempMax ? "temp-hot" : (tempVal >= tempMin ? "temp-warn" : ""));
             tdTemp.appendChild(el("span", tempCls, String(cap.temp_c) + " C"));
           }
           tr.appendChild(tdTemp);
