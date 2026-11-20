@@ -16,23 +16,26 @@ from clipes.layout import (
 
 
 def test_variantes_sum_to_1920():
-    assert DEFAULT_VARIANTE == "split-barra"
-    assert set(VARIANTES) == {"split-cheio", "split-barra", "split-fina"}
+    assert DEFAULT_VARIANTE == "split-starcuts"
+    assert set(VARIANTES) == {"split-starcuts", "split-cheio", "split-barra", "split-fina"}
     for name, v in VARIANTES.items():
         assert v.bar_h + v.cam_h + v.game_h == CANVAS_H, name
         assert v.cam_h >= 400
         assert v.game_h >= 900
 
+    assert (VARIANTES["split-starcuts"].bar_h, VARIANTES["split-starcuts"].cam_h, VARIANTES["split-starcuts"].game_h) == (0, 600, 1320)
     assert (VARIANTES["split-cheio"].bar_h, VARIANTES["split-cheio"].cam_h, VARIANTES["split-cheio"].game_h) == (0, 768, 1152)
     assert (VARIANTES["split-barra"].bar_h, VARIANTES["split-barra"].cam_h, VARIANTES["split-barra"].game_h) == (340, 520, 1060)
     assert (VARIANTES["split-fina"].bar_h, VARIANTES["split-fina"].cam_h, VARIANTES["split-fina"].game_h) == (170, 700, 1050)
 
 
 def test_alturas_env_valid_and_invalid(capsys):
+    assert alturas("split-starcuts", {}) == (0, 600, 1320)
     assert alturas("split-barra", {}) == (340, 520, 1060)
-    assert alturas("", {}) == (340, 520, 1060)
+    assert alturas("", {}) == (0, 600, 1320)
 
     # Valid override
+    assert alturas("split-starcuts", {"CLIPES_SPLIT_CAM_H": "700"}) == (0, 700, 1220)
     assert alturas("split-barra", {"CLIPES_SPLIT_BAR_H": "200", "CLIPES_SPLIT_CAM_H": "600"}) == (200, 600, 1120)
     assert alturas("split-cheio", {"CLIPES_SPLIT_CAM_H": "700"}) == (0, 700, 1220)
 

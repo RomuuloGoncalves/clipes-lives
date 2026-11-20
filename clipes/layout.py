@@ -12,7 +12,7 @@ CANVAS_H = 1920
 MIN_CAM_H = 400
 MIN_GAME_H = 900
 MIN_GAME_FRACTION = 0.5
-DEFAULT_VARIANTE = "split-barra"
+DEFAULT_VARIANTE = "split-starcuts"
 
 
 @dataclass(frozen=True)
@@ -55,6 +55,22 @@ class Variante:
 # B-14: tabela usada pelo calculo de recorte (split_layout/alturas). render._SPLIT_STYLES guarda a geometria de
 # texto/barra do filter_complex e tem valores proprios (name_y etc.); nao unificadas para nao mudar o visual (adiado).
 VARIANTES: dict[str, Variante] = {
+    "split-starcuts": Variante(
+        name="split-starcuts",
+        bar_h=0,
+        cam_h=600,
+        bar_bg=None,
+        fg="#101010",
+        handle_fg="#707070",
+        logo_size=0,
+        logo_x=0,
+        logo_y=0,
+        name_x=0,
+        name_y=0,
+        handle_y=0,
+        title_in_bar=True,
+        hook_on_cam=False,
+    ),
     "split-cheio": Variante(
         name="split-cheio",
         bar_h=0,
@@ -137,7 +153,7 @@ def _fc_box(fc: Any) -> tuple[float, float, float, float]:
 
 
 def resolve_variante(variante: str | None) -> str:
-    """Normalize layout variant name; empty or unknown defaults to split-barra."""
+    """Normalize layout variant name; empty or unknown defaults to split-starcuts."""
     key = (variante or "").strip().lower()
     return key if key in VARIANTES else DEFAULT_VARIANTE
 
