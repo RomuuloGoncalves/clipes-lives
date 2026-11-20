@@ -772,6 +772,9 @@
       margin-top: 16px;
       padding: 12px 0;
     }
+    #vods-recentes[hidden] {
+      display: none;
+    }
     #vods-recentes h2 {
       font-size: 1rem;
       font-weight: 600;
@@ -962,9 +965,11 @@
       </table>
     </div>
 
-    <div id="vods-recentes" class="sec-head" hidden>
-      <h2>VODs recentes (24 h)</h2>
-    </div>
+    <section id="vods-recentes" hidden>
+      <div class="sec-head">
+        <h2>VODs recentes (24 h)</h2>
+      </div>
+    </section>
 
     <div class="sec-head">
       <h2>Jobs (24 h)</h2>

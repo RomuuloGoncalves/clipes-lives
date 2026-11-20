@@ -643,3 +643,20 @@ def test_canonicalizacao_kick_clip_twitch_clip_e_plataforma_generica():
     assert p["plataforma"] == "twitch" and p["tipo"] == "vod"
     assert _nucleo._parse_alvo_painel("https://www.mywww.example.com/v/1")["plataforma"] == "mywww.example.com"
     assert _nucleo._parse_alvo_painel("https://m.vimeo.com/123")["plataforma"] == "vimeo.com"
+
+
+# ---- Ajustes nov20 (T4): secao #vods-recentes escondida e em bloco
+
+def test_index_html_vods_recentes_hidden_e_em_bloco():
+    import re
+    from pathlib import Path
+
+    raw = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
+    tag = re.search(r'<section id="vods-recentes"([^>]*)>', raw)
+    assert tag, "vods-recentes deve ser <section id=\"vods-recentes\">"
+    assert re.search(r"\shidden(\s|$)", " " + tag.group(1) + " "), "secao deve nascer hidden"
+    assert "sec-head" not in tag.group(0), "o proprio section nao pode ter classe sec-head"
+    bloco = raw[tag.end():]
+    assert re.match(r'\s*<div class="sec-head">\s*<h2>[^<]+</h2>\s*</div>', bloco), "cabecalho em sec-head/h2 dentro da secao"
+    compacto = re.sub(r"\s+", "", raw)
+    assert re.search(r"#vods-recentes\[hidden\]\{display:none;?\}", compacto), "falta regra CSS [hidden]"
