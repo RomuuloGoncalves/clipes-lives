@@ -745,6 +745,8 @@ class Supervisor:
         self.probe_arg = probe
         self.coord = coord
         self.now = now
+        self._divergente_desde: float | None = None
+        self._divergente_avisado = False
         self.sleep = sleep
         self.disk_usage = disk_usage
         self.step = step
@@ -1439,6 +1441,7 @@ class Supervisor:
         beat_fn = getattr(c, "beat", None)
         if not callable(beat_fn):
             return
+        self._checar_recursos(cap, alias)
         try:
             params = inspect.signature(beat_fn).parameters
             has_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
@@ -1458,6 +1461,26 @@ class Supervisor:
         if isinstance(res, dict):
             self._apply_runtime_config(res, alias=alias, c=c)
         return res
+
+    def _checar_recursos(self, cap: dict[str, Any], alias: str) -> None:
+        """REC-05: marca divergencia RAM/CPU no heartbeat e avisa 1x apos 600 s seguidos."""
+        div = bool(config.recursos_divergentes())
+        cap["recursos_divergentes"] = div
+        if not div:
+            self._divergente_desde = None
+            self._divergente_avisado = False
+            return
+        t = self.now()
+        if self._divergente_desde is None:
+            self._divergente_desde = t
+        if not self._divergente_avisado and t - self._divergente_desde >= 600:
+            self._divergente_avisado = True
+            mem, cpus = os.environ.get("CLIPES_MEM", ""), os.environ.get("CLIPES_CPUS", "")
+            a, b = config._cgroup_limites()
+            self.aviso_fn(
+                f"PC {alias}: painel pede RAM {mem}/CPU {cpus}, contêiner tem {a}/{b}; "
+                "inicie pelo ./clipar para aplicar"
+            )
 
     def _apply_runtime_config(
         self,

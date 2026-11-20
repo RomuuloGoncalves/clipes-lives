@@ -919,12 +919,7 @@ def run_local_pipeline(job_dir: Path, out_root: Path) -> dict[str, Any]:
         args = cli.build_parser().parse_args(cli_args)
     except SystemExit as exc:  # argparse sai com SystemExit (nao e Exception): nao pode matar o servico
         raise RuntimeError(f"argumentos invalidos do cli (codigo {exc.code})") from None
-    original_ingest = cli.ingest
-    cli.ingest = ingest_job
-    try:
-        exit_code = cli.run_pipeline(args)
-    finally:
-        cli.ingest = original_ingest
+    exit_code = cli.run_pipeline(args, ingest_fn=ingest_job)
     if exit_code != 0:
         raise RuntimeError(f"pipeline exited with {exit_code}")
     out_dir = ingested["result"].out_dir

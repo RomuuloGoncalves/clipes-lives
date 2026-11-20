@@ -47,6 +47,21 @@ def test_status_lives_e_jobs_24h(db):
     assert r["jobs_24h"] == {"done": 1, "lost": 1}
 
 
+def test_status_repassa_jobs_atuais_e_jobs(db):
+    # worker novo: heartbeat com jobs_atuais e jobs
+    db.workers.update_one({"_id": "w-2"}, {"$set": {
+        "jobs_atuais": ["j1", "j2"],
+        "jobs": {"efetivos": 2, "pedidos": 3, "job_medio_s": 120.0, "amostras": 5,
+                 "lives_sustentaveis": 5.0}}})
+    ws = {w["id"]: w for w in _nucleo.status(db, NOW)["workers"]}
+    assert ws["w-2"]["jobs_atuais"] == ["j1", "j2"]
+    assert ws["w-2"]["jobs"] == {"efetivos": 2, "pedidos": 3, "job_medio_s": 120.0,
+                                 "amostras": 5, "lives_sustentaveis": 5.0}
+    # worker antigo (sem os campos): lista vazia e null
+    assert ws["w-1"]["jobs_atuais"] == []
+    assert ws["w-1"]["jobs"] is None
+
+
 def test_comando_codigos(db):
     assert _nucleo.criar_comando(db, "w-2", "", NOW)[0] == 400
     assert _nucleo.criar_comando(db, "w-9", "LIBERAR", NOW)[0] == 404
@@ -442,7 +457,7 @@ def test_index_html_slots_fila_e_alvos():
 def test_config_schema_paridade_com_clipes():
     from clipes import config as clipes_config
 
-    assert len(_nucleo.CONFIG_SCHEMA) == 56
+    assert len(_nucleo.CONFIG_SCHEMA) == 58
     assert _nucleo.CONFIG_SCHEMA == clipes_config.CONFIG_SCHEMA
     assert _nucleo.FORBIDDEN_ENV_KEYS == clipes_config.FORBIDDEN_ENV_KEYS
 
@@ -525,6 +540,10 @@ def test_salvar_config_rejeita_segredos_e_desconhecidas(db, chave):
     {"CLIPES_SLOTS": "twitch=abc"},
     {"CLIPES_AGENDA_HORARIOS": "25:99"},
     {"CLIPES_TZ": "Mars/Phobos"},
+    {"CLIPES_JOBS": "9"},
+    {"CLIPES_RAM_POR_JOB": "0"},
+    {"CLIPES_RAM_POR_JOB": "2.5g"},
+    {"CLIPES_RAM_POR_JOB": "abc"},
 ])
 def test_salvar_config_rejeita_valores_invalidos(db, cfg):
     code, body = _nucleo.salvar_config(db, {"pc_alias": "PC-1", "config": cfg}, NOW)
@@ -544,6 +563,12 @@ def test_config_http_aceita_asterisco_como_sem_limite_e_recusa_lixo(db, env, cha
     code_ruim, _, body_ruim = chamar(config_fn, db, "POST", None, {"pc_alias": "PC-1", "config": {chave: "*g"}})
     assert code_ruim == 400
     assert json.loads(body_ruim)["erro"].startswith(f"valor invalido para {chave}")
+
+
+@pytest.mark.parametrize("valor", ["3g", "2560m"])
+def test_salvar_config_aceita_ram_por_job(db, valor):
+    code, _ = _nucleo.salvar_config(db, {"pc_alias": "PC-1", "config": {"CLIPES_RAM_POR_JOB": valor}}, NOW)
+    assert code == 200
 
 
 def test_config_handler_http_codigos_e_csrf(db, env):
@@ -783,6 +808,14 @@ def test_html_config_global_em_modal():
     assert "Layout dos clipes (global)" not in html
     assert '<section id="config-global"' not in html
     assert 'id="aviso-privado"' in html
+
+
+def test_index_html_coluna_job_atual_com_varios_ids():
+    from pathlib import Path
+    html = (Path(__file__).resolve().parent.parent / "painel" / "index.html").read_text(encoding="utf-8")
+    assert 'tdLabel("Job atual", "td-full")' in html
+    assert "w.jobs_atuais" in html and "w.job_atual" in html
+    assert 'el("div", "mono", String(j))' in html
 
 
 # ---- VOD Kick: id/UUID completo na URL canonica

@@ -1385,3 +1385,58 @@ def test_modulo_acompanhar_sem_discord_rest_direto():
     fonte = Path(acompanhar.__file__).read_text(encoding="utf-8")
     assert "DiscordRest(" not in fonte
     assert "client.post" not in fonte
+
+
+def _sup_recursos(monkeypatch, tmp_path, divergente, avisos):
+    t = [0.0]
+    monkeypatch.setattr(acompanhar.config, "recursos_divergentes", lambda: divergente[0])
+    sup = acompanhar.Supervisor(
+        [], tmp_path / "out", now=lambda: t[0], aviso_fn=avisos.append,
+    )
+    coord = SimpleNamespace(beat=lambda *a, **k: None)
+
+    def beat(at):
+        t[0] = at
+        cap: dict = {}
+        sup._call_beat(coord, "pc1", cap, None, 1, 1.0, 20.0)
+        return cap
+
+    return beat
+
+
+def test_recursos_divergentes_aviso_unico_apos_600s(monkeypatch, tmp_path):
+    avisos: list[str] = []
+    div = [True]
+    beat = _sup_recursos(monkeypatch, tmp_path, div, avisos)
+    assert beat(0)["recursos_divergentes"] is True
+    assert beat(599)["recursos_divergentes"] is True
+    assert avisos == []
+    beat(600)
+    assert len(avisos) == 1 and "PC pc1" in avisos[0] and "./clipar" in avisos[0]
+    beat(1200)
+    assert len(avisos) == 1
+
+
+def test_recursos_voltam_a_bater_permite_novo_aviso(monkeypatch, tmp_path):
+    avisos: list[str] = []
+    div = [True]
+    beat = _sup_recursos(monkeypatch, tmp_path, div, avisos)
+    beat(0)
+    beat(600)
+    assert len(avisos) == 1
+    div[0] = False
+    assert beat(700)["recursos_divergentes"] is False
+    div[0] = True
+    beat(800)
+    beat(1399)
+    assert len(avisos) == 1
+    beat(1400)
+    assert len(avisos) == 2
+
+
+def test_recursos_divergentes_sem_gerido_nao_sai_com_75(monkeypatch, tmp_path):
+    monkeypatch.delenv("CLIPES_RECURSOS_GERIDO", raising=False)
+    avisos: list[str] = []
+    beat = _sup_recursos(monkeypatch, tmp_path, [True], avisos)
+    for t in (0, 600, 1200):
+        beat(t)  # nao levanta SystemExit

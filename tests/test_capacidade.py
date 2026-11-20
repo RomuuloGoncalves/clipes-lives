@@ -259,3 +259,47 @@ def test_capacity_sem_arquivo_memory_max_reporta_ilegivel(tmp_path, monkeypatch)
     assert cap["ram_limite_gb"] is None
     assert cap["ram_limite_estado"] == "ilegivel"
     assert cap["ram_livre_gb"] == 1.0
+
+
+def _jobs(tmp_path, monkeypatch, *, jobs, cpu_max="800000 100000", mem_max=str(16 * 1024**3), ram_job=None, mem_total_kb=4 * 1024 * 1024):
+    monkeypatch.setenv("CLIPES_JOBS", jobs)
+    if ram_job is None:
+        monkeypatch.delenv("CLIPES_RAM_POR_JOB", raising=False)
+    else:
+        monkeypatch.setenv("CLIPES_RAM_POR_JOB", ram_job)
+    sysfs = _make_sysfs(tmp_path / "sys", cpu_max=cpu_max, mem_max=mem_max)
+    proc = _make_proc(tmp_path / "proc")
+    (proc / "meminfo").write_text(f"MemTotal: {mem_total_kb} kB\nMemAvailable: {mem_total_kb} kB\n", encoding="utf-8")
+    return capacidade_mod.jobs_efetivos(sysfs=sysfs, proc=proc)
+
+
+GB = 1024**3
+
+
+def test_jobs_efetivos_limitado_por_pedido_cpus_e_ram(tmp_path, monkeypatch):
+    assert _jobs(tmp_path, monkeypatch, jobs="4") == 4
+    assert _jobs(tmp_path, monkeypatch, jobs="4", cpu_max="200000 100000") == 2
+    assert _jobs(tmp_path, monkeypatch, jobs="4", mem_max=str(5 * GB)) == 2
+
+
+def test_jobs_efetivos_sem_limite_usa_memtotal_e_pedido_invalido_vira_um(tmp_path, monkeypatch):
+    assert _jobs(tmp_path, monkeypatch, jobs="4", mem_max="max") == 1  # MemTotal 4 GiB
+    assert _jobs(tmp_path, monkeypatch, jobs="") == 1
+    assert _jobs(tmp_path, monkeypatch, jobs="abc") == 1
+
+
+def test_ram_por_job_configuravel(tmp_path, monkeypatch):
+    assert _jobs(tmp_path, monkeypatch, jobs="8", mem_max=str(10 * GB), ram_job="4g") == 2
+    assert _jobs(tmp_path, monkeypatch, jobs="8", mem_max=str(10 * GB), ram_job="2g") == 5
+    assert _jobs(tmp_path, monkeypatch, jobs="8", mem_max=str(5 * GB), ram_job="1500m") == 3
+    for ruim in ("", "abc"):
+        assert _jobs(tmp_path, monkeypatch, jobs="8", mem_max=str(5 * GB), ram_job=ruim) == 2
+
+
+def test_threads_por_job_divide_threads_entre_jobs(monkeypatch):
+    monkeypatch.setenv("CLIPES_CPU_THREADS", "8")
+    monkeypatch.setattr(capacidade_mod, "jobs_efetivos", lambda *a, **k: 3)
+    assert capacidade_mod.threads_por_job() == 2
+    monkeypatch.setenv("CLIPES_CPU_THREADS", "1")
+    monkeypatch.setattr(capacidade_mod, "jobs_efetivos", lambda *a, **k: 8)
+    assert capacidade_mod.threads_por_job() == 1

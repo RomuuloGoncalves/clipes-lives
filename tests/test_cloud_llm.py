@@ -248,3 +248,35 @@ def test_cota_path_usa_set_out_dir_antes_de_out_dir_env(tmp_path, monkeypatch):
     explicit = tmp_path / "explicit.json"
     monkeypatch.setenv("CLIPES_GEMINI_COTA_FILE", str(explicit))
     assert cloud_llm._cota_path() == explicit
+
+
+def test_reset_round_em_outra_thread_nao_apaga_falha_desta(cota):
+    import threading
+
+    monkey_fake = Fake(500, 500, 500, 500)
+    assert run(monkey_fake) is None  # todos os pares falham nesta thread
+    t = threading.Thread(target=cloud_llm.reset_round)
+    t.start()
+    t.join()
+    sem_chamadas = Fake()
+    assert run(sem_chamadas) is None
+    assert sem_chamadas.calls == []  # falhas desta thread continuam marcadas
+
+
+def test_duas_threads_mesma_chave_respeitam_intervalo(monkeypatch, cota):
+    import threading
+    import time
+
+    monkeypatch.setenv("GEMINI_API_KEYS", "AIzaKEY-A")
+    monkeypatch.setenv("CLIPES_GEMINI_MIN_INTERVAL_S", "0.2")
+    cloud_llm._last_call.clear()
+    stamps = []
+
+    def fake(req, timeout=None):
+        stamps.append(time.time())
+        return _Resp(json.dumps({"candidates": [{"content": {"parts": [{"text": '{"titulo":"x"}'}]}}]}).encode())
+
+    ts = [threading.Thread(target=lambda: cloud_llm.complete_cloud("p", SCHEMA, "s", urlopen=fake)) for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(stamps) == 2 and abs(stamps[1] - stamps[0]) >= 0.19

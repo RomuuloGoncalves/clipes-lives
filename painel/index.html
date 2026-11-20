@@ -1378,7 +1378,15 @@
           tr.appendChild(tdTemp);
 
           tr.appendChild(tdLabel("GPU", "td-full", fmtGpu(cap.gpu)));
-          tr.appendChild(tdLabel("Job atual", "td-full", w.job_atual || "-"));
+          var jobsAtuais = Array.isArray(w.jobs_atuais) && w.jobs_atuais.length
+            ? w.jobs_atuais : (w.job_atual ? [w.job_atual] : []);
+          var tdJob = tdLabel("Job atual", "td-full");
+          if (jobsAtuais.length) {
+            jobsAtuais.forEach(function (j) { tdJob.appendChild(el("div", "mono", String(j))); });
+          } else {
+            tdJob.textContent = "-";
+          }
+          tr.appendChild(tdJob);
 
           var slots = w.slots || {};
           var ocupados = w.ocupados || {};

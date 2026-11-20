@@ -352,7 +352,7 @@ def _dimensoes_ou_padrao(mp4: Path) -> tuple[int, int]:
         return 1080, 1920
 
 
-def run_pipeline(args: argparse.Namespace) -> int:
+def run_pipeline(args: argparse.Namespace, *, ingest_fn=None) -> int:
     if getattr(args, "ate_acabar", False):
         print("removido: use ./clipar servico (e /live adicionar no Discord)", file=sys.stderr, flush=True)
         return 2
@@ -369,7 +369,7 @@ def run_pipeline(args: argparse.Namespace) -> int:
     timings: dict[str, float] = {}
 
     t0 = time.perf_counter()
-    ing = ingest(
+    ing = (ingest_fn or ingest)(
         url=args.url,
         out_root=out_root,
         live_minutes=args.live_minutes,

@@ -62,7 +62,7 @@ def transcribe_candidates(
         return [], None
 
     model_name = model_size or os.environ.get("CLIPES_WHISPER_MODEL", "small")
-    threads = cpu_threads or capacidade.cpu_threads()
+    threads = cpu_threads or capacidade.threads_por_job()
     windows = merge_windows([(c.start_win, c.end_win) for c in candidates])
 
     words_path = cache_dir / "words.json"
@@ -184,7 +184,7 @@ def transcribe_fast_blocks(
         return []
 
     model_name = model_size or os.environ.get("CLIPES_WHISPER_MODEL", "small")
-    threads = cpu_threads or capacidade.cpu_threads()
+    threads = cpu_threads or capacidade.threads_por_job()
     windows = merge_windows([(s, e) for s, e, _ in blocks], gap=0.0)
     norm_windows = [(round(s, 2), round(e, 2)) for s, e in windows]
 

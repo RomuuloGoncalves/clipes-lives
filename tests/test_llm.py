@@ -256,7 +256,7 @@ def test_llama_server_session_uses_cpu_threads_by_default(tmp_path: Path, monkey
     import urllib.request
 
     from clipes import llm
-    from clipes.capacidade import cpu_threads
+    from clipes.capacidade import threads_por_job
 
     fake_gguf = tmp_path / "model.gguf"
     fake_gguf.write_bytes(b"GGUF")
@@ -296,15 +296,15 @@ def test_llama_server_session_uses_cpu_threads_by_default(tmp_path: Path, monkey
     monkeypatch.setattr(subprocess, "Popen", lambda cmd, **kw: FakeProc(cmd, **kw))
     monkeypatch.setattr(urllib.request, "urlopen", lambda url, timeout=1.0: FakeResp())
 
-    expected_default = str(cpu_threads())
+    expected_default = str(threads_por_job())
     with llm.llama_server_session(server_bin=str(fake_bin)):
         pass
     assert cmds[-1][cmds[-1].index("-t") + 1] == expected_default
 
-    monkeypatch.setattr(llm, "cpu_threads", lambda: 5)
+    monkeypatch.setattr(llm, "threads_por_job", lambda: 2)
     with llm.llama_server_session(server_bin=str(fake_bin)):
         pass
-    assert cmds[-1][cmds[-1].index("-t") + 1] == "5"
+    assert cmds[-1][cmds[-1].index("-t") + 1] == "2"
 
 
 def test_validate_no_hallucinated_entities_and_title_rules():

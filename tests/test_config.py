@@ -109,7 +109,7 @@ def test_slots_non_strict_cai_no_padrao(monkeypatch):
 
 
 def test_config_schema_tem_45_variaveis_e_zero_segredos():
-    assert len(config.CONFIG_SCHEMA) == 56
+    assert len(config.CONFIG_SCHEMA) == 58
     grupos = {meta["grupo"] for meta in config.CONFIG_SCHEMA.values()}
     assert grupos == {"lives", "render", "ia", "publicacao", "temperatura", "antiflop", "recursos"}
     for key, meta in config.CONFIG_SCHEMA.items():
@@ -353,6 +353,26 @@ def test_config_global_le_so_chaves_globais_validas():
     assert config.config_global(db) == {}
 
 
+def test_clipes_jobs_faixa_e_vazio_usa_padrao():
+    assert config.CONFIG_SCHEMA["CLIPES_JOBS"]["grupo"] == "lives"
+    assert config.validate_config_payload({"CLIPES_JOBS": "3"}) == ({"CLIPES_JOBS": "3"}, None)
+    for ruim in ("0", "9", "2.5", "x"):
+        erro = config.validate_config_payload({"CLIPES_JOBS": ruim})[1]
+        assert erro is not None and erro.startswith("valor invalido para CLIPES_JOBS"), ruim
+    assert config.validate_config_payload({"CLIPES_JOBS": ""}) == ({}, None)
+
+
+def test_apply_remote_config_clipes_jobs_restaura_boot(monkeypatch, tmp_path):
+    monkeypatch.setattr(config, "_BOOT_ENV", {})
+    monkeypatch.setattr(config, "_APPLIED_REMOTE_KEYS", set())
+    monkeypatch.setenv("CLIPES_JOBS", "")
+    monkeypatch.delenv("CLIPES_JOBS")
+    config.apply_remote_config({"CLIPES_JOBS": "3"}, out_root=tmp_path, alias="PC-1")
+    assert config.os.environ["CLIPES_JOBS"] == "3"
+    config.apply_remote_config({}, out_root=tmp_path, alias="PC-1")
+    assert "CLIPES_JOBS" not in config.os.environ
+
+
 def test_recursos_mem_e_cpus_validam_formato_e_faixa():
     assert config.CONFIG_SCHEMA["CLIPES_MEM"]["grupo"] == "recursos"
     assert config.validate_config_payload({"CLIPES_MEM": "4G"}) == ({"CLIPES_MEM": "4g"}, None)
@@ -444,3 +464,12 @@ def test_cgroup_limites_fallback_v1(tmp_path):
     (tmp_path / "cpu" / "cpu.cfs_quota_us").write_text("150000\n", encoding="utf-8")
     assert config._cgroup_limites(tmp_path) == (4 * 1024**3, 1.5)
     assert config._cgroup_limites(tmp_path / "nada") == (None, None)
+
+
+def test_ram_por_job_no_schema_e_validacao():
+    assert config.CONFIG_SCHEMA["CLIPES_RAM_POR_JOB"]["grupo"] == "recursos"
+    assert config.CONFIG_SCHEMA["CLIPES_RAM_POR_JOB"]["tipo"] == "mem"
+    assert config.validate_config_payload({"CLIPES_RAM_POR_JOB": "3g"}) == ({"CLIPES_RAM_POR_JOB": "3g"}, None)
+    assert config.validate_config_payload({"CLIPES_RAM_POR_JOB": "2560m"})[1] is None
+    for ruim in ("0", "0m", "2.5g", "abc"):
+        assert config.validate_config_payload({"CLIPES_RAM_POR_JOB": ruim})[1] is not None, ruim

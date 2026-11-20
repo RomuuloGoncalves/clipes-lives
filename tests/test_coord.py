@@ -731,6 +731,24 @@ def test_reconcile_alias_migra_config_e_remove_duplicata(env):
     assert docs[0]["config"] == {**cfg, "CLIPES_LAYOUT": "split-barra"}  # doc intacto; filtro so na leitura
 
 
+# ---- T18: beat grava jobs_atuais e jobs ----
+
+
+def test_beat_grava_jobs_atuais_e_jobs_quando_informados(env):
+    _, db, a, _ = env
+    a.beat("PC-1", CAP, None, 1, 0.5, jobs_atuais=["a", "b"], jobs={"efetivos": 2})
+    doc = db.workers.find_one({"_id": "w-a"})
+    assert doc["jobs_atuais"] == ["a", "b"]
+    assert doc["jobs"] == {"efetivos": 2}
+
+
+def test_beat_sem_jobs_nao_grava_as_chaves(env):
+    _, db, a, _ = env
+    a.beat("PC-1", CAP, None, 1, 0.5)
+    doc = db.workers.find_one({"_id": "w-a"})
+    assert "jobs_atuais" not in doc and "jobs" not in doc
+
+
 def test_beat_retorna_config_salvo_em_unica_operacao(env):
     _, db, a, _ = env
     db.workers.insert_one({"_id": "w-a", "alias": "PC-1", "config": {"CLIPES_SLOTS": "twitch=2,busca=0"}})

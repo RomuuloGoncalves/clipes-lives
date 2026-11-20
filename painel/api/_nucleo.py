@@ -29,6 +29,8 @@ class WorkerStatus(TypedDict):
     heartbeat_at: str | None
     capacity: Any
     job_atual: Any
+    jobs_atuais: list[str]
+    jobs: dict[str, Any] | None
     max_lives: Any
     razao: Any
     slots: dict[str, Any] | None
@@ -163,7 +165,10 @@ def status(db: Any, now: datetime, beat_s: float = BEAT_S) -> StatusPayload:
             "id": w["_id"], "alias": w.get("alias"),
             "online": _worker_online(w, now, beat_s),
             "heartbeat_at": _iso(hb), "capacity": w.get("capacity"),
-            "job_atual": w.get("job_atual"), "max_lives": w.get("max_lives"),
+            "job_atual": w.get("job_atual"),
+            "jobs_atuais": [str(x) for x in (w.get("jobs_atuais") or [])],
+            "jobs": _mapa_ou_none(w.get("jobs")),
+            "max_lives": w.get("max_lives"),
             "razao": w.get("razao"),
             "slots": _mapa_ou_none(w.get("slots")), "ocupados": _mapa_ou_none(w.get("ocupados")),
             "fila": _mapa_ou_none(w.get("fila")),
@@ -631,7 +636,7 @@ FORBIDDEN_ENV_KEYS: frozenset[str] = frozenset({
 })
 
 CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
-    # --- lives (7) ---
+    # --- lives (8) ---
     "CLIPES_SLOTS": {
         "grupo": "lives",
         "tipo": "slots",
@@ -685,6 +690,14 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "min": 30.0,
         "max": 600.0,
         "descricao": "Duracao do lease (s) de alvos e locks no MongoDB",
+    },
+    "CLIPES_JOBS": {
+        "grupo": "lives",
+        "tipo": "int",
+        "default": "",
+        "min": 1,
+        "max": 8,
+        "descricao": "Jobs processados em paralelo (vazio = 1; limitado por CPUs e RAM/2,5 GB)",
     },
     # --- render (12) ---
     "CLIPES_LAYOUT": {
@@ -990,6 +1003,13 @@ CONFIG_SCHEMA: dict[str, dict[str, Any]] = {
         "sem_limite": "*",
         "descricao": "Limite de RAM do conteiner (ex.: 4g ou 4096m; 512m a 128g; * = sem limite; vazio = automatico). Aplicado ao reiniciar o ./clipar (sai com codigo 75)",
     },
+    "CLIPES_RAM_POR_JOB": {
+        "grupo": "recursos",
+        "tipo": "mem",
+        "default": "",
+        "min_mb": 1,
+        "descricao": "RAM reservada por job (ex.: 2g ou 2560m; 1m a 128g; vazio = padrao 2,5 GB); define quantos jobs cabem na RAM do conteiner",
+    },
     "CLIPES_CPUS": {
         "grupo": "recursos",
         "tipo": "float",
@@ -1147,8 +1167,9 @@ def _validate_single(key: str, raw_val: Any) -> tuple[str | None, str | None]:
         if m is None:
             return None, f"valor invalido para {key}: formato 4g ou 4096m"
         mb = int(m.group(1)) * (1024 if m.group(2) == "g" else 1)
-        if mb < 512 or mb > 131072:
-            return None, f"valor invalido para {key}: entre 512m e 128g"
+        min_mb = meta.get("min_mb", 512)
+        if mb < min_mb or mb > 131072:
+            return None, f"valor invalido para {key}: entre {min_mb}m e 128g"
         return f"{m.group(1)}{m.group(2)}", None
 
     if tipo == "slots":

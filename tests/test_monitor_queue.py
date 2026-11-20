@@ -268,9 +268,9 @@ def test_run_local_pipeline_passa_own_range_da_regiao_dona(tmp_path, monkeypatch
 
     seen = []
 
-    def fake_run_pipeline(args):
+    def fake_run_pipeline(args, ingest_fn=None):
         seen.append(args)
-        ing = cli.ingest(args.url, Path(args.out_dir), args.live_minutes, args.chat)
+        ing = ingest_fn(args.url, Path(args.out_dir), args.live_minutes, args.chat)
         (ing.out_dir / "clips.json").write_text(json.dumps({"clips": []}), encoding="utf-8")
         return 0
 
@@ -316,9 +316,9 @@ def test_run_local_pipeline_own_range_negativo_e_parseavel(tmp_path, monkeypatch
 
     seen = []
 
-    def fake_run_pipeline(args):
+    def fake_run_pipeline(args, ingest_fn=None):
         seen.append(args)
-        ing = cli.ingest(args.url, Path(args.out_dir), args.live_minutes, args.chat)
+        ing = ingest_fn(args.url, Path(args.out_dir), args.live_minutes, args.chat)
         (ing.out_dir / "clips.json").write_text(json.dumps({"clips": []}), encoding="utf-8")
         return 0
 
@@ -355,3 +355,104 @@ def test_worker_argv_invalido_do_cli_rejeita_job_e_segue(tmp_path, monkeypatch):
     assert monitor.run_worker_step(queue, tmp_path / "out", policy)  # worker continua vivo
     failed = json.loads((queue.root / "rejected" / "boom_1763380000" / "job.json").read_text())
     assert failed["reject_reason"] == "pipeline_error" and "argumentos invalidos" in failed["error"]
+
+
+def _args_run_pipeline(tmp_path):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        ate_acabar=False, min_dur=10.0, max_dur=60.0, min_per_hour=0.0, asr_budget_ratio=0.5,
+        out_dir=str(tmp_path / "out"), url="https://www.twitch.tv/gaules", live_minutes=5, chat=False,
+    )
+
+
+def test_run_pipeline_usa_ingest_fn_injetado(tmp_path, monkeypatch):
+    chamadas = []
+
+    def fake_ingest(**kwargs):
+        chamadas.append(kwargs)
+        raise RuntimeError("parou no ingest falso")
+
+    def ingest_padrao(**_):
+        raise AssertionError("ingest padrao nao deve rodar quando ingest_fn e passado")
+
+    monkeypatch.setattr(cli, "ingest", ingest_padrao)
+    args = _args_run_pipeline(tmp_path)
+    with pytest.raises(RuntimeError, match="parou no ingest falso"):
+        cli.run_pipeline(args, ingest_fn=fake_ingest)
+    assert len(chamadas) == 1 and chamadas[0]["url"] == args.url
+
+
+def test_run_pipeline_sem_ingest_fn_respeita_monkeypatch_de_cli_ingest(tmp_path, monkeypatch):
+    chamadas = []
+
+    def fake_ingest(**kwargs):
+        chamadas.append(kwargs)
+        raise RuntimeError("parou no ingest monkeypatchado")
+
+    monkeypatch.setattr(cli, "ingest", fake_ingest)
+    args = _args_run_pipeline(tmp_path)
+    with pytest.raises(RuntimeError, match="parou no ingest monkeypatchado"):
+        cli.run_pipeline(args)
+    assert len(chamadas) == 1
+
+
+def test_run_local_pipeline_nao_troca_cli_ingest_global(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    original = cli.ingest
+    vistos = []
+
+    def fake_run_pipeline(args, ingest_fn=None):
+        vistos.append(cli.ingest is original)  # durante a chamada, o global segue intacto
+        ing = ingest_fn(url=args.url, out_root=Path(args.out_dir), live_minutes=args.live_minutes,
+                        enable_chat=bool(args.chat))
+        (ing.out_dir / "clips.json").write_text(json.dumps({"clips": []}), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    _fake_ingest_local(monkeypatch)
+    job = tmp_path / "j"
+    job.mkdir()
+    (job / "job.json").write_text(json.dumps({"job_id": "j"}))
+    (tmp_path / "out" / "j").mkdir(parents=True)
+    monitor.run_local_pipeline(job, tmp_path / "out")
+    assert vistos == [True] and cli.ingest is original
+
+
+def test_run_local_pipeline_duas_threads_recebem_cada_uma_o_seu_ingest(tmp_path, monkeypatch):
+    import threading
+    from pathlib import Path
+
+    barreira = threading.Barrier(2, timeout=5)  # as duas chamadas ficam em voo ao mesmo tempo
+
+    def fake_run_pipeline(args, ingest_fn=None):
+        barreira.wait()
+        ing = ingest_fn(url=args.url, out_root=Path(args.out_dir), live_minutes=args.live_minutes,
+                        enable_chat=bool(args.chat))
+        (ing.out_dir / "clips.json").write_text(json.dumps({"clips": [], "job": ing.video_id}), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    _fake_ingest_local(monkeypatch)
+    out = tmp_path / "out"
+    jobs = {}
+    for nome in ("a", "b"):
+        jd = tmp_path / nome
+        jd.mkdir()
+        (jd / "job.json").write_text(json.dumps({"job_id": nome}))
+        (out / nome).mkdir(parents=True)
+        jobs[nome] = jd
+
+    resultados = {}
+
+    def rodar(nome):
+        resultados[nome] = monitor.run_local_pipeline(jobs[nome], out)
+
+    threads = [threading.Thread(target=rodar, args=(n,)) for n in jobs]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=10)
+    assert resultados["a"]["job"] == "a" and resultados["a"]["output_dir"].endswith("a")
+    assert resultados["b"]["job"] == "b" and resultados["b"]["output_dir"].endswith("b")

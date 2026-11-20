@@ -386,7 +386,8 @@ class Coord:
 
     def beat(self, alias: str, capacity: dict, job_atual: str | None, max_lives: int, razao: float,
              beat_s: float | None = None, *, slots: dict[str, int] | None = None,
-             ocupados: dict[str, int] | None = None, fila: dict[str, int] | None = None) -> dict:
+             ocupados: dict[str, int] | None = None, fila: dict[str, int] | None = None,
+             jobs_atuais: list[str] | None = None, jobs: dict | None = None) -> dict:
         now = self._dt()
         fields: dict = {"alias": alias, "capacity": capacity, "job_atual": job_atual,
                         "max_lives": max_lives, "razao": razao, "heartbeat_at": now}
@@ -398,6 +399,10 @@ class Coord:
             fields["ocupados"] = dict(ocupados)
         if fila is not None:
             fields["fila"] = dict(fila)
+        if jobs_atuais is not None:
+            fields["jobs_atuais"] = list(jobs_atuais)
+        if jobs is not None:
+            fields["jobs"] = dict(jobs)
         doc = self.db.workers.find_one_and_update(
             {"_id": self.worker_id},
             {"$set": fields,

@@ -84,7 +84,7 @@ def embed_sentences(texts: list[str], onnx_path: str | None = None) -> np.ndarra
         token_type_ids = np.array([e.type_ids for e in encoded], dtype=np.int64)
 
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = capacidade.cpu_threads()
+        opts.intra_op_num_threads = capacidade.threads_por_job()
         opts.inter_op_num_threads = 1
         sess = ort.InferenceSession(str(model_path), sess_options=opts, providers=["CPUExecutionProvider"])
 

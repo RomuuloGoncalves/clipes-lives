@@ -9,7 +9,6 @@ import types
 import numpy as np
 
 import clipes.capacidade as capacidade_mod
-from clipes.capacidade import cpu_threads
 
 from clipes.eval import cuts_mid_word, evaluate_clips
 from clipes.models import CandidatePeak, TopicSegment, Word
@@ -256,7 +255,7 @@ def test_long_transcript_real_segment_topics_split_and_snap_integration():
     assert metrics["duration_ok_rate"] == 1.0
 
 
-def test_embed_sentences_uses_cpu_threads_in_onnx_session(tmp_path, monkeypatch):
+def test_embed_sentences_uses_threads_por_job_in_onnx_session(tmp_path, monkeypatch):
     monkeypatch.delenv("CLIPES_CPU_THREADS", raising=False)
     model_file = tmp_path / "model.onnx"
     model_file.write_bytes(b"fake-onnx")
@@ -308,13 +307,13 @@ def test_embed_sentences_uses_cpu_threads_in_onnx_session(tmp_path, monkeypatch)
     monkeypatch.setitem(sys.modules, "onnxruntime", fake_ort)
     monkeypatch.setitem(sys.modules, "tokenizers", fake_tok)
 
-    expected_real = cpu_threads()
+    expected_real = capacidade_mod.threads_por_job()
     embs = embed_sentences(["primeira frase"], onnx_path=str(model_file))
     assert embs is not None
     assert observed_threads == [expected_real]
 
     observed_threads.clear()
-    monkeypatch.setattr(capacidade_mod, "cpu_threads", lambda: 5)
+    monkeypatch.setattr(capacidade_mod, "threads_por_job", lambda: 2)
     embs2 = embed_sentences(["segunda frase"], onnx_path=str(model_file))
     assert embs2 is not None
-    assert observed_threads == [5]
+    assert observed_threads == [2]

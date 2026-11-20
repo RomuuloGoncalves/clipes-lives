@@ -40,6 +40,47 @@ def cpu_threads(sysfs: str | Path = "/sys") -> int:
     return os.cpu_count() or 1
 
 
+# ponytail: 2,5 GB por job e um teto empirico (yt-dlp + ffmpeg + whisper); ajustavel via CLIPES_RAM_POR_JOB
+RAM_POR_JOB_PADRAO_MB = 2560
+
+
+def ram_por_job_mb() -> int:
+    """RAM (MB) reservada por job: CLIPES_RAM_POR_JOB (formato mem, 1m a 128g) ou o padrao."""
+    m = config._MEM_RE.fullmatch(os.environ.get("CLIPES_RAM_POR_JOB", "").strip().lower())
+    if m is None:
+        return RAM_POR_JOB_PADRAO_MB
+    mb = int(m.group(1)) * (1024 if m.group(2) == "g" else 1)
+    return mb if 1 <= mb <= 131072 else RAM_POR_JOB_PADRAO_MB
+
+
+def _mem_total_bytes(proc: Path) -> int:
+    try:
+        for line in (proc / "meminfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return 0
+
+
+def jobs_efetivos(sysfs: str | Path = "/sys", proc: str | Path = "/proc") -> int:
+    """Jobs paralelos = max(1, min(CLIPES_JOBS, CPUs, RAM / ram_por_job)); pedido invalido = 1."""
+    try:
+        pedido = int(os.environ.get("CLIPES_JOBS", "").strip())
+    except ValueError:
+        return 1
+    mem, cpus = config._cgroup_limites(Path(sysfs) / "fs" / "cgroup")
+    cpus_n = cpus if cpus and cpus > 0 else (os.cpu_count() or 1)
+    ram = mem if mem and mem > 0 else _mem_total_bytes(Path(proc))
+    por_ram = int(ram / (1024 * 1024) // ram_por_job_mb())
+    return max(1, min(pedido, int(cpus_n), por_ram))
+
+
+def threads_por_job() -> int:
+    """Threads de CPU por job: cpu_threads() dividido entre os jobs efetivos."""
+    return max(1, cpu_threads() // jobs_efetivos())
+
+
 def _read_mem_available_bytes(proc: Path) -> int | None:
     meminfo = proc / "meminfo"
     try:

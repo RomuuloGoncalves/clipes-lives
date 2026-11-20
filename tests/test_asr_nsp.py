@@ -96,3 +96,69 @@ def test_transcribe_candidates_cache_antigo_sem_nsp_carrega_como_zero(tmp_path: 
     assert lang == "pt"
     assert len(words) == 2
     assert all(w.no_speech_prob == 0.0 for w in words)
+
+
+def _recording_whisper(monkeypatch, record: list[dict]):
+    class RecordingWhisperModel:
+        def __init__(self, *args, **kwargs):
+            record.append(kwargs)
+
+        def transcribe(self, audio_slice, **kwargs):
+            seg = SimpleNamespace(start=0.5, end=1.0, text=" ola", no_speech_prob=0.0, words=[])
+            info = SimpleNamespace(language="pt", language_probability=0.99)
+            return [seg], info
+
+    fake_mod = types.ModuleType("faster_whisper")
+    fake_mod.WhisperModel = RecordingWhisperModel  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake_mod)
+
+
+def test_transcribe_candidates_usa_threads_por_job_sem_argumento(tmp_path: Path, monkeypatch):
+    from clipes import capacidade
+
+    wav = _make_wav(tmp_path / "audio.wav", seconds=20.0)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    record: list[dict] = []
+    _recording_whisper(monkeypatch, record)
+    monkeypatch.setattr(capacidade, "threads_por_job", lambda: 2)
+    monkeypatch.setattr(capacidade, "cpu_threads", lambda: 8)  # distingue threads_por_job do cpu_threads bruto
+
+    cand = CandidatePeak(peak=10.0, raw_score=0.9, start_win=2.0, end_win=12.0)
+    transcribe_candidates(wav, [cand], cache, model_size="small", beam_size=5)
+
+    assert record[0]["cpu_threads"] == 2
+
+
+def test_transcribe_candidates_argumento_explicito_vence(tmp_path: Path, monkeypatch):
+    from clipes import capacidade
+
+    wav = _make_wav(tmp_path / "audio.wav", seconds=20.0)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    record: list[dict] = []
+    _recording_whisper(monkeypatch, record)
+    monkeypatch.setattr(capacidade, "threads_por_job", lambda: 2)
+    monkeypatch.setattr(capacidade, "cpu_threads", lambda: 8)  # distingue threads_por_job do cpu_threads bruto
+
+    cand = CandidatePeak(peak=10.0, raw_score=0.9, start_win=2.0, end_win=12.0)
+    transcribe_candidates(wav, [cand], cache, model_size="small", beam_size=5, cpu_threads=5)
+
+    assert record[0]["cpu_threads"] == 5
+
+
+def test_transcribe_fast_blocks_usa_threads_por_job(tmp_path: Path, monkeypatch):
+    from clipes import capacidade
+    from clipes.asr import transcribe_fast_blocks
+
+    wav = _make_wav(tmp_path / "audio.wav", seconds=20.0)
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    record: list[dict] = []
+    _recording_whisper(monkeypatch, record)
+    monkeypatch.setattr(capacidade, "threads_por_job", lambda: 2)
+    monkeypatch.setattr(capacidade, "cpu_threads", lambda: 8)  # distingue threads_por_job do cpu_threads bruto
+
+    transcribe_fast_blocks(wav, [(2.0, 12.0, 0.9)], cache, model_size="small")
+
+    assert record[0]["cpu_threads"] == 2

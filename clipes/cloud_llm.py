@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -19,10 +20,9 @@ _URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generate
 _DEFAULT_MODELS = "gemini-2.5-flash,gemini-2.5-flash-lite"
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.IGNORECASE)
 
-_failed: set[tuple[str, int]] = set()
-_used: list[str] = []
+_tl = threading.local()  # _failed/_used/_logged por thread (um job por thread)
+_lock = threading.Lock()  # protege _last_call e _save_cota
 _last_call: dict[int, float] = {}
-_logged = False
 _out_dir: Path | None = None
 
 
@@ -50,15 +50,18 @@ def mask(text: str) -> str:
     return text
 
 
+def _st() -> threading.local:
+    if not hasattr(_tl, "failed"):
+        _tl.failed, _tl.used, _tl.logged = set(), [], False
+    return _tl
+
+
 def reset_round() -> None:
-    _failed.clear()
-    _used.clear()
-    global _logged
-    _logged = False
+    _tl.failed, _tl.used, _tl.logged = set(), [], False
 
 
 def providers_used() -> list[str]:
-    return list(_used)
+    return list(_st().used)
 
 
 def _timeout() -> float:
@@ -105,10 +108,11 @@ def _load_cota(path: Path, dia: str) -> set[str]:
 
 def _save_cota(path: Path, dia: str, esgotados: set[str]) -> None:
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps({"dia": dia, "esgotados": sorted(esgotados)}))
-        tmp.replace(path)
+        with _lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text(json.dumps({"dia": dia, "esgotados": sorted(esgotados)}))
+            tmp.replace(path)
     except OSError as exc:
         print(f"[llm] aviso: não gravou cota: {mask(str(exc))}")
 
@@ -167,19 +171,20 @@ def complete_cloud(
     """Tenta cada (modelo, chave) na ordem; devolve (resposta, 'cloud:gemini:<modelo>') ou None."""
     if not cloud_enabled():
         return None
-    global _logged
+    st = _st()
     keys = _keys()
     pairs = [(m, i) for m in _models() for i in range(len(keys))]
     path, dia = _cota_path(), _dia(now)
     esgotados = _load_cota(path, dia)
     for model, idx in pairs:
         pair = (model, idx)
-        if pair in _failed or f"{model}#{idx}" in esgotados:
+        if pair in st.failed or f"{model}#{idx}" in esgotados:
             continue
-        wait = _min_interval() - (now() - _last_call.get(idx, float("-inf")))
-        if wait > 0:
-            sleep(wait)
-        _last_call[idx] = now()
+        with _lock:  # sleep dentro do lock: serializa o intervalo minimo por chave
+            wait = _min_interval() - (now() - _last_call.get(idx, float("-inf")))
+            if wait > 0:
+                sleep(wait)
+            _last_call[idx] = now()
         try:
             obj = _call(model, keys[idx], prompt, schema, system_prompt, urlopen)
         except Exception as exc:  # 429/5xx/404/timeout/rede: segue para o próximo par
@@ -189,12 +194,12 @@ def complete_cloud(
             print(f"[llm] gemini {model}#{idx} falhou: {mask(str(exc))}")
             obj = None
         if obj is None:
-            _failed.add(pair)
+            st.failed.add(pair)
             continue
-        if "gemini" not in _used:
-            _used.append("gemini")
+        if "gemini" not in st.used:
+            st.used.append("gemini")
         return obj, f"cloud:gemini:{model}"
-    if not _logged and all(f"{m}#{i}" in esgotados for m, i in pairs):
-        _logged = True
+    if not st.logged and all(f"{m}#{i}" in esgotados for m, i in pairs):
+        st.logged = True
         print("[llm] cota gratuita do Gemini esgotada")
     return None
