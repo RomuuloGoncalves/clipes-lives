@@ -123,7 +123,7 @@ def test_rotas_index_status_alvos_e_comando(servidor_local) -> None:
     with urllib.request.urlopen(req_alvo) as resp:
         assert resp.status == 201
         res_alvo = json.loads(resp.read().decode("utf-8"))
-        assert res_alvo == {"ok": True, "_id": "canal_teste"}
+        assert res_alvo == {"ok": True, "_id": "canal_teste", "tipo": "live"}
     assert db.alvos.find_one({"_id": "canal_teste"}) is not None
 
     # POST /api/comando autenticado -> 202

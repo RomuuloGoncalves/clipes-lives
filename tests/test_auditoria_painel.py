@@ -249,7 +249,7 @@ def test_t17_api_alvos_acesso_livre_sem_auth(monkeypatch):
     corpo = {"acao": "adicionar", "alvo": "twitch.tv/fulano", "pc": ""}
 
     code, _, body = _chamar_client(alvos_api, client, "POST", None, corpo)
-    assert code == 201 and json.loads(body) == {"ok": True, "_id": "fulano"}
+    assert code == 201 and json.loads(body) == {"ok": True, "_id": "fulano", "tipo": "live"}
     assert client["clipes_lives"].alvos.count_documents({}) == 1
 
 
