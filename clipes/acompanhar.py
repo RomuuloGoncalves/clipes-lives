@@ -280,7 +280,7 @@ class LiveSession:
         now: Callable[[], float],
         disk_usage: Callable[[Any], Any],
         step: int = monitor.LIVE_STEP_S,
-        max_dur: float = 60.0,
+        max_dur: float | None = None,
         min_dur: float | None = None,
         min_free_gb: float | None = None,
         coord_getter: Callable[[], Any | None] | None = None,
@@ -302,8 +302,9 @@ class LiveSession:
         self.now = now
         self.disk_usage = disk_usage
         self.step = step
-        self.max_dur = float(max_dur)
-        self.min_dur = float(min_dur) if min_dur is not None else None
+        # sem argumento explicito: le CLIPES_DUR_MAX/MIN no momento de abrir a sessao (config recarregada no heartbeat)
+        self.max_dur = config.env_float("CLIPES_DUR_MAX", 45) if max_dur is None else float(max_dur)
+        self.min_dur = config.env_float("CLIPES_DUR_MIN", 15) if min_dur is None else float(min_dur)
         self.pad = self.max_dur / 2
         self.min_free = config.env_float("CLIPES_MIN_FREE_GB", 5.0, min_value=0.0) if min_free_gb is None else float(min_free_gb)
         self.max_backlog = config.env_int("CLIPES_MAX_BACKLOG", 6, min_value=1)
@@ -697,7 +698,7 @@ class Supervisor:
         sleep: Callable[[float], Any] = time.sleep,
         disk_usage: Callable[[Any], Any] = shutil.disk_usage,
         step: int = monitor.LIVE_STEP_S,
-        max_dur: float = 60.0,
+        max_dur: float | None = None,
         min_dur: float | None = None,
         min_free_gb: float | None = None,
         policy: monitor.ChannelPolicy | None = None,
@@ -1619,7 +1620,9 @@ class Supervisor:
     def _run_vod_cli(self, url: str, out_root: Path) -> int:
         from . import cli
 
-        argv = [url, "--out-dir", str(out_root), "--max-dur", str(self.max_dur)]
+        # VOD continua com 60s quando nao ha --max-dur explicito (CLIPES_DUR_MAX so vale para live)
+        max_dur = 60.0 if self.max_dur is None else self.max_dur
+        argv = [url, "--out-dir", str(out_root), "--max-dur", str(max_dur)]
         if self.min_dur is not None:
             argv.extend(["--min-dur", str(self.min_dur)])
         return int(cli.main(argv))
@@ -2237,11 +2240,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--queue-dir", type=Path, default=None, help="Padrao: <out-dir>/queue")
     p.add_argument("--channels-file", type=Path, default=Path("channels.txt"), help="Canais da busca geral (1 por linha; padrao: channels.txt)")
     p.add_argument("--policy-file", type=Path, default=None, help="Padrao: CLIPES_POLICY_FILE, senao <OUT_DIR>/policy.json (legado ao lado do channels.txt/cwd so se o padrao nao existir)")
-    p.add_argument("--max-dur", type=float, default=60.0, help="Duracao maxima de cada clipe em segundos")
-    p.add_argument("--min-dur", type=float, default=None, help="Duracao minima de cada clipe em segundos")
+    p.add_argument("--max-dur", type=float, default=None, help="Duracao maxima de cada clipe em segundos (padrao: CLIPES_DUR_MAX ou 45)")
+    p.add_argument("--min-dur", type=float, default=None, help="Duracao minima de cada clipe em segundos (padrao: CLIPES_DUR_MIN ou 15)")
     args = p.parse_args(argv)
 
-    if args.max_dur <= 0:
+    if args.max_dur is not None and args.max_dur <= 0:
         print("[acompanhar] --max-dur deve ser > 0", file=sys.stderr, flush=True)
         return 2
     if args.min_dur is not None and args.min_dur <= 0:

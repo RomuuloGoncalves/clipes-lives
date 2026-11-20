@@ -116,6 +116,50 @@ class FakeMultiPool:
             self.release_on_demand(ch)
 
 
+# ---- DUR-02 (live): CLIPES_DUR_MAX / CLIPES_DUR_MIN lidos ao abrir a sessao -----------------------
+
+
+def _roda_live_e_le_jobs(tmp_path, monkeypatch) -> list[dict]:
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", "1")
+    jobs: list[dict] = []
+
+    def fake_pipe(job_dir: Path, root: Path):
+        jobs.append(json.loads((job_dir / "job.json").read_text()))
+        return {"clips": []}
+
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo("gaules")],
+        tmp_path / "out",
+        pool=FakeMultiPool(clock, {"gaules": B + 620}),
+        pipeline=fake_pipe,
+        is_live=lambda u: clock.t < B + 620,
+        now=clock.now,
+        sleep=clock.sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+    )
+    sup.run()
+    return jobs
+
+
+def test_live_usa_clipes_dur_max_do_ambiente(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLIPES_DUR_MAX", "40")
+    monkeypatch.delenv("CLIPES_DUR_MIN", raising=False)
+    jobs = _roda_live_e_le_jobs(tmp_path, monkeypatch)
+    assert jobs
+    assert all(j["max_dur"] == 40 for j in jobs)
+    assert all(j["min_dur"] == 15 for j in jobs)
+
+
+def test_live_sem_env_usa_max_45_e_min_15(tmp_path, monkeypatch):
+    monkeypatch.delenv("CLIPES_DUR_MAX", raising=False)
+    monkeypatch.delenv("CLIPES_DUR_MIN", raising=False)
+    jobs = _roda_live_e_le_jobs(tmp_path, monkeypatch)
+    assert jobs
+    assert all(j["max_dur"] == 45 and j["min_dur"] == 15 for j in jobs)
+
+
 # ---- T4: parse_alvo & dedup ----------------------------------------------------------------------
 
 
