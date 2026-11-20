@@ -728,7 +728,7 @@ def test_reconcile_alias_migra_config_e_remove_duplicata(env):
     docs = list(db.workers.find({"alias": "PC-1"}))
     assert len(docs) == 1
     assert docs[0]["_id"] == "w-a"
-    assert docs[0]["config"] == cfg
+    assert docs[0]["config"] == {**cfg, "CLIPES_LAYOUT": "split-barra"}  # doc intacto; filtro so na leitura
 
 
 def test_beat_retorna_config_salvo_em_unica_operacao(env):
