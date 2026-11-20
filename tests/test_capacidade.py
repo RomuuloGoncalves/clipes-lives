@@ -7,6 +7,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import types
 import wave
 from pathlib import Path
@@ -119,6 +120,21 @@ def test_capacity_temp_sem_sensor_or_missing_returns_none(tmp_path, monkeypatch)
     (out / ".temp").write_text("sem-sensor\n", encoding="utf-8")
     cap_sem = capacity(out, sysfs=sysfs, proc=proc, run=fail_smi)
     assert cap_sem["temp_c"] is None
+
+
+def test_capacity_temp_stale_file_returns_none_and_fresh_returns_int(tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    temp_file = out / ".temp"
+    temp_file.write_text("78\n", encoding="utf-8")
+
+    old = time.time() - 31
+    os.utime(temp_file, (old, old))
+    assert capacidade_mod._read_temp_c(out) is None
+
+    now = time.time()
+    os.utime(temp_file, (now, now))
+    assert capacidade_mod._read_temp_c(out) == 78
 
 
 def test_capacity_with_fake_gpu_doubles_score(tmp_path, monkeypatch):

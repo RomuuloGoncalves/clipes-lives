@@ -91,6 +91,8 @@ def _read_cpu_pct(proc: Path, cpus: int) -> float | None:
 def _read_temp_c(out_dir: Path) -> int | None:
     temp_file = out_dir / ".temp"
     try:
+        if time.time() - temp_file.stat().st_mtime > 30:
+            return None
         raw = temp_file.read_text(encoding="utf-8").strip()
     except OSError:
         return None
