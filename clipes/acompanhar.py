@@ -1209,29 +1209,6 @@ class Supervisor:
                 m.next_check_at = t + ALVO_RECHECK_S
                 continue
 
-            # Promocao automatica YouTube live -> VOD
-            if (
-                m.auto_vod
-                and m.plataforma == "youtube"
-                and m.alvo.video_id is not None
-            ):
-                # Sonda YouTube para verificar se ja e video gravado/live encerrada
-                _ = self._probe_youtube(fresh_alvo, probe_fn)
-                if fresh_alvo.is_recorded_vod:
-                    c_now = self._coord_active()
-                    if c_now is not None:
-                        promovido = c_now.promover_para_vod(m.alvo_id, fresh_alvo.url)
-                        if promovido == "promovido":
-                            print(f"[acompanhar] alvo {m.alvo_id} promovido para VOD ({fresh_alvo.url})", flush=True)
-                            with self._lock:
-                                self._managed_alvos.pop(m.alvo_id, None)
-                            continue
-                        elif promovido == "duplicado":
-                            print(f"[acompanhar] alvo {m.alvo_id} duplicado (VOD ativo existe), marcado removido", flush=True)
-                            with self._lock:
-                                self._managed_alvos.pop(m.alvo_id, None)
-                            continue
-
             limite = self._limite(m.plataforma)
             status = self._try_start_alvo(
                 fresh_alvo,
@@ -1244,6 +1221,27 @@ class Supervisor:
                 exclude_alvo_id=m.alvo_id,
                 managed=True,
             )
+            # Promocao automatica YouTube live -> VOD (reusa a sonda do _try_start_alvo)
+            if (
+                status == "skip"
+                and fresh_alvo.is_recorded_vod
+                and m.auto_vod
+                and m.plataforma == "youtube"
+                and m.alvo.video_id is not None
+            ):
+                c_now = self._coord_active()
+                if c_now is not None:
+                    promovido = c_now.promover_para_vod(m.alvo_id, fresh_alvo.url)
+                    if promovido == "promovido":
+                        print(f"[acompanhar] alvo {m.alvo_id} promovido para VOD ({fresh_alvo.url})", flush=True)
+                        with self._lock:
+                            self._managed_alvos.pop(m.alvo_id, None)
+                        continue
+                    elif promovido == "duplicado":
+                        print(f"[acompanhar] alvo {m.alvo_id} duplicado (VOD ativo existe), marcado removido", flush=True)
+                        with self._lock:
+                            self._managed_alvos.pop(m.alvo_id, None)
+                        continue
             if status == "started":
                 m.alvo = fresh_alvo
                 m.session_key = fresh_alvo.chave
@@ -1713,6 +1711,7 @@ class Supervisor:
                         self._on_mongo_err(mexc)
             return True
         finally:
+            self._cancelled_vod_ids.discard(vod_id)
             self._active_vod_id[0] = None
             self._current_job[0] = None
 

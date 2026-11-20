@@ -1053,3 +1053,94 @@ def test_supervisor_kick_grava_via_ytdlp_e_twitch_segue_em_streamlink(tmp_path, 
     assert twitch_cmds[0][0] == "streamlink"
     assert db.lives.find_one({"_id": "kick:foo-bar:123"})["status"] == "ended"
     assert db.lives.find_one({"_id": "twitch:gaules:tw9"})["status"] == "ended"
+
+
+# ---- ajustes-nov20 T3: uma sonda por tick (REV-06) e limpeza de _cancelled_vod_ids (REV-08) ----
+
+
+class _CoordStub:
+    def __init__(self):
+        self.promovidos: list[tuple[str, str]] = []
+
+    def promover_para_vod(self, alvo_id, url):
+        self.promovidos.append((alvo_id, url))
+        return "promovido"
+
+    def renew_alvos(self, fases):
+        return set(fases)
+
+    def ensure_live(self, *a, **kw):
+        pass
+
+    def claim_live(self, *a, **kw):
+        return False
+
+
+def _tick_gerenciado(tmp_path, meta, coord=None):
+    coord = coord or _CoordStub()
+    calls: list[str] = []
+
+    def probe(url):
+        calls.append(url)
+        return meta
+
+    sup = acompanhar.Supervisor(
+        [],
+        tmp_path / "out",
+        pipeline=lambda d, o: {"clips": []},
+        coord=coord,
+        is_live=lambda _u: True,
+        probe=probe,
+        now=lambda: B,
+        sleep=lambda _s: None,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+    )
+    entrada = "https://www.youtube.com/watch?v=AbC123"
+    alvo = acompanhar.parse_alvo(entrada)
+    sup._managed_alvos["a1"] = acompanhar._ManagedAlvo(
+        alvo_id="a1", alvo=alvo, entrada=entrada, plataforma="youtube", auto_vod=True
+    )
+    queue = monitor.DiskQueue(tmp_path / "q")
+    sup._tick_managed_alvos(B, 5.0, queue, None, lambda d, o: {}, lambda _u: True, probe)
+    return sup, coord, calls
+
+
+def test_tick_gerenciado_live_sonda_uma_vez(tmp_path):
+    sup, coord, calls = _tick_gerenciado(tmp_path, {"id": "AbC123", "is_live": True, "live_status": "is_live"})
+    assert len(calls) == 1
+    assert coord.promovidos == []
+
+
+def test_tick_gerenciado_offline_sonda_uma_vez(tmp_path):
+    sup, coord, calls = _tick_gerenciado(tmp_path, {"id": "AbC123", "is_live": False, "live_status": "is_upcoming"})
+    assert len(calls) == 1
+    assert coord.promovidos == []
+
+
+def test_tick_gerenciado_gravado_sonda_uma_vez_e_promove(tmp_path):
+    sup, coord, calls = _tick_gerenciado(tmp_path, {"id": "AbC123", "is_live": False, "live_status": "was_live"})
+    assert len(calls) == 1
+    assert coord.promovidos == [("a1", "https://www.youtube.com/watch?v=AbC123")]
+    assert "a1" not in sup._managed_alvos
+
+
+def test_process_one_vod_limpa_cancelled_vod_ids_no_sucesso(tmp_path):
+    class C(_CoordStub):
+        def pegar_vod(self, alias):
+            return {"_id": "v1", "url": "https://www.youtube.com/watch?v=AbC123"}
+
+        def fim_vod(self, *a, **kw):
+            pass
+
+    sup = acompanhar.Supervisor(
+        [],
+        tmp_path / "out",
+        pipeline=lambda d, o: {"clips": []},
+        coord=C(),
+        now=lambda: B,
+        sleep=lambda _s: None,
+        vod_pipeline=lambda url, out: sup._cancelled_vod_ids.add("v1") or 0,
+    )
+    sup._check_vod_policy = lambda vod, url, probe: None
+    assert sup._process_one_vod("w", lambda u: {}) is True
+    assert sup._cancelled_vod_ids == set()
