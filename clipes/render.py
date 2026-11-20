@@ -1029,11 +1029,14 @@ def build_audio_filter(
 ) -> str:
     """Build ffmpeg -af chain: loudnorm -> afade -> apad (order preserves loudness calibration)."""
     fade_start = max(0.0, content_duration - 0.5)
-    return (
-        f"loudnorm=I=-14:TP=-1.5:LRA=11,"
-        f"afade=t=out:st={fade_start:.3f}:d=0.5,"
-        f"apad=pad_dur={outro_duration:g}"
-    )
+    chain = f"loudnorm=I=-14:TP=-1.5:LRA=11,afade=t=out:st={fade_start:.3f}:d=0.5"
+    return f"{chain},apad=pad_dur={outro_duration:g}" if outro_duration > 0 else chain
+
+
+def _outro_duration() -> float:
+    """CLIPES_CARTAO_FINAL=0 desliga o cartão final (outro efetivo 0)."""
+    off = os.environ.get("CLIPES_CARTAO_FINAL", "").strip().lower() in ("0", "false", "no", "off")
+    return 0.0 if off else OUTRO_DURATION
 
 
 def _master_mode() -> str:
@@ -1287,8 +1290,9 @@ def render_clip(
 
         has_hook = bool(clip.hook_top.strip() and clip.duration > 0 and is_hook_top_enabled())
         has_title_text = bool(clip.hook_top.strip() or clip.title.strip())
-        af_chain = build_audio_filter(clip.duration, outro_duration=OUTRO_DURATION)
-        total_dur = clip.duration + OUTRO_DURATION
+        outro_dur = _outro_duration()
+        af_chain = build_audio_filter(clip.duration, outro_duration=outro_dur)
+        total_dur = clip.duration + outro_dur
         starcuts_overlay_path = (
             _resolve_starcuts_overlay(has_title_text)
             if (split_obj is not None and split_variante == "split-starcuts")
@@ -1324,7 +1328,7 @@ def render_clip(
                 channel_credit=channel_credit,
                 part_index=clip.part_index,
                 part_total=clip.part_total,
-                outro_duration=OUTRO_DURATION,
+                outro_duration=outro_dur,
                 hook_top=clip.hook_top,
                 title=clip.title,
                 bar=bar,
@@ -1352,7 +1356,7 @@ def render_clip(
             filter_complex, v_map = build_video_filter(
                 ass_path=ass_path,
                 n_subs=n_subs,
-                outro_duration=OUTRO_DURATION,
+                outro_duration=outro_dur,
                 blur_bg=blur_bg,
                 crop=crop,
                 bar=bar,

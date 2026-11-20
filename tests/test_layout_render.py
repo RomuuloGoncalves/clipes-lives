@@ -919,7 +919,7 @@ def test_t9_master_livre_teto_6000k_sem_retry_nem_downscale(tmp_path: Path, monk
     assert clip.cabe_discord is False
 
 
-def _render_sem_webcam(tmp_path: Path, monkeypatch, env: dict[str, str]):
+def _render_sem_webcam(tmp_path: Path, monkeypatch, env: dict[str, str], full_cmd: bool = False):
     _clear_layout_and_bar_env(monkeypatch)
     monkeypatch.setenv("CLIPES_MASTER_MODE", "livre")
     for k, v in env.items():
@@ -946,6 +946,8 @@ def _render_sem_webcam(tmp_path: Path, monkeypatch, env: dict[str, str]):
     clip = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Sem cam", hook_top="")
     render_mod.render_clip(clip, 1, [], "", out_dir, cache_dir, live_video_path=src)
     cmd = next(c for c in cmds if "-filter_complex" in c)
+    if full_cmd:
+        return clip, cmd
     return clip, cmd[cmd.index("-filter_complex") + 1]
 
 
@@ -965,3 +967,29 @@ def test_lay01_barras_pretas_so_com_full_e_blur_off_explicitos(tmp_path: Path, m
     clip, fc = _render_sem_webcam(tmp_path, monkeypatch, {"CLIPES_LAYOUT": "full", "CLIPES_BLUR_BG": "0"})
     assert clip.layout == "black_bars_16x9"
     assert "pad=1080:1920" in fc
+
+
+def test_fim01_cartao_final_off_sem_tpad_apad_e_t_igual_duracao(tmp_path: Path, monkeypatch):
+    clip, cmd = _render_sem_webcam(tmp_path, monkeypatch, {"CLIPES_CARTAO_FINAL": "0"}, full_cmd=True)
+    joined = " ".join(cmd)
+    assert "tpad" not in joined and "apad" not in joined
+    assert f"afade=t=out:st={clip.duration - 0.5:.3f}:d=0.5" in joined
+    assert cmd[len(cmd) - 1 - cmd[::-1].index("-t") + 1] == f"{clip.duration:.3f}"
+
+
+def test_fim01_cartao_final_on_mantem_comando_atual(tmp_path: Path, monkeypatch):
+    clip, cmd = _render_sem_webcam(tmp_path, monkeypatch, {"CLIPES_CARTAO_FINAL": "1"}, full_cmd=True)
+    joined = " ".join(cmd)
+    assert "tpad=stop_mode=clone:stop_duration=0.5" in joined
+    assert "apad=pad_dur=0.5" in joined
+    assert cmd[len(cmd) - 1 - cmd[::-1].index("-t") + 1] == f"{clip.duration + 0.5:.3f}"
+
+
+def test_fim02_ass_sem_cartao_final_quando_off(tmp_path: Path):
+    ass = tmp_path / "off.ass"
+    render_mod.build_ass(
+        [Word(1.0, 1.4, " Olha")], 0.0, 10.0, ass,
+        channel_credit="twitch.tv/x", part_index=1, part_total=2, outro_duration=0.0,
+    )
+    txt = ass.read_text(encoding="utf-8")
+    assert "Live completa" not in txt and "Parte 2" not in txt
