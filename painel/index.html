@@ -408,6 +408,9 @@
     .temp-hot { color: var(--off-fg); font-weight: 700; }
     .temp-off { color: var(--muted); font-weight: 700; }
 
+    .cap-alerta { color: var(--off-fg); font-weight: 700; }
+    .selo-diverge { color: var(--warn-fg); font-weight: 700; margin-left: 6px; }
+
     .slot-list {
       display: flex;
       flex-wrap: wrap;
@@ -941,6 +944,7 @@
             <th>Job atual</th>
             <th>Slots</th>
             <th>Fila</th>
+            <th>Capacidade</th>
             <th>max_lives</th>
             <th>Acao</th>
           </tr>
@@ -1122,6 +1126,16 @@
         var base = fmtNum(cap.cpus);
         if (cap.cpu_pct === null || cap.cpu_pct === undefined || cap.cpu_pct === "") return base;
         return (base === "-" ? "" : base + " ") + "(" + String(cap.cpu_pct) + "%)";
+      }
+
+      function fmtRam(cap) {
+        if (cap.ram_livre_gb === null || cap.ram_livre_gb === undefined || !cap.ram_limite_estado) {
+          return fmtNum(cap.ram_gb, " GB");
+        }
+        var livre = fmtNum(cap.ram_livre_gb, " GB") + " livre / ";
+        if (cap.ram_limite_estado === "sem_limite") return livre + "sem limite";
+        if (cap.ram_limite_estado === "ilegivel") return livre + "?";
+        return livre + fmtNum(cap.ram_limite_gb, " GB") + " limite";
       }
 
       function fmtGpu(gpu) {
@@ -1342,7 +1356,7 @@
         if (!list.length) {
           var trVazio = el("tr", "tr-vazia");
           var tdVazio = el("td", "meta", "Nenhum PC registrado.");
-          tdVazio.colSpan = 12;
+          tdVazio.colSpan = 13;
           trVazio.appendChild(tdVazio);
           rows.push(trVazio);
           pcsEl.replaceChildren.apply(pcsEl, rows);
@@ -1360,7 +1374,13 @@
           tr.appendChild(tdOn);
 
           tr.appendChild(tdLabel("CPU", "mono", fmtCpu(cap)));
-          tr.appendChild(tdLabel("RAM", "mono", fmtNum(cap.ram_gb, " GB")));
+          var tdRam = tdLabel("RAM", "mono", fmtRam(cap));
+          if (cap.recursos_divergentes === true) {
+            var seloDiverge = el("span", "selo-diverge", "diverge");
+            seloDiverge.title = "pedido do painel diferente do limite do contêiner";
+            tdRam.appendChild(seloDiverge);
+          }
+          tr.appendChild(tdRam);
           tr.appendChild(tdLabel("Disco livre", "mono", fmtNum(cap.disco_livre_gb, " GB")));
 
           var tdTemp = tdLabel("Temp", "mono");
@@ -1408,6 +1428,24 @@
             return s + (Number(fila[k]) || 0);
           }, 0);
           tr.appendChild(tdLabel("Fila", "mono", w.fila ? String(tamFila) : "-"));
+
+          var jobsCap = w.jobs || null;
+          var tdCap = tdLabel("Capacidade", "mono td-full");
+          if (!jobsCap || jobsCap.lives_sustentaveis === null || jobsCap.lives_sustentaveis === undefined) {
+            tdCap.textContent = "medindo";
+          } else {
+            var sustentaveis = Math.floor(Number(jobsCap.lives_sustentaveis));
+            var livesAtivas = (Number(ocupados.twitch) || 0) + (Number(ocupados.kick) || 0) + (Number(ocupados.youtube) || 0);
+            var medioS = jobsCap.job_medio_s === null || jobsCap.job_medio_s === undefined
+              ? "-" : String(Math.round(Number(jobsCap.job_medio_s)));
+            tdCap.textContent = livesAtivas + "/" + fmtNum(sustentaveis) + " lives · "
+              + fmtNum(jobsCap.efetivos) + " jobs · " + medioS + " s";
+            if (livesAtivas > sustentaveis) {
+              tdCap.className = "mono td-full cap-alerta";
+              tdCap.title = "fila vai crescer: aumente CLIPES_JOBS ou reduza CLIPES_SLOTS";
+            }
+          }
+          tr.appendChild(tdCap);
 
           tr.appendChild(tdLabel("max_lives", "mono", fmtNum(w.max_lives)));
 

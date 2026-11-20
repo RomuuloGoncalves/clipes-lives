@@ -774,9 +774,9 @@ def test_m16_fechar_janela_grava_max_dur_e_min_dur_no_job_json(tmp_path, monkeyp
 def test_m16_run_local_pipeline_repassa_max_dur_e_min_dur_e_respeita_job_antigo(tmp_path, monkeypatch):
     seen_args: list[Any] = []
 
-    def fake_run_pipeline(args):
+    def fake_run_pipeline(args, ingest_fn=None):
         seen_args.append(args)
-        ing = cli.ingest(args.url, Path(args.out_dir), args.live_minutes, args.chat)
+        ing = (ingest_fn or cli.ingest)(args.url, Path(args.out_dir), args.live_minutes, args.chat)
         (ing.out_dir / "clips.json").write_text(json.dumps({"video_id": ing.video_id, "clips": []}), encoding="utf-8")
         return 0
 

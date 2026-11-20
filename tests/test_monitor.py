@@ -505,9 +505,9 @@ def test_run_local_pipeline_usa_min_per_hour_zero_e_mantem_duracoes(tmp_path, mo
 
     seen_args = []
 
-    def fake_run_pipeline(args):
+    def fake_run_pipeline(args, ingest_fn=None):
         seen_args.append(args)
-        ing = cli.ingest(args.url, Path(args.out_dir), args.live_minutes, args.chat)
+        ing = (ingest_fn or cli.ingest)(args.url, Path(args.out_dir), args.live_minutes, args.chat)
         (ing.out_dir / "clips.json").write_text(json.dumps({"video_id": ing.video_id, "clips": []}), encoding="utf-8")
         return 0
 

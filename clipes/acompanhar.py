@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import collections
 import inspect
 import ipaddress
 import json
@@ -23,7 +24,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
-from . import config, monitor, signals as sinais
+from . import capacidade, config, monitor, signals as sinais
 from .executor_publicacao import PublishLoop
 from .ingest import extract_wav, sanitize_id
 from .janelas import filter_emitted, owns, window_end
@@ -222,22 +223,40 @@ def _is_busca_job(job: dict[str, Any]) -> bool:
 class _SessionQueueView(monitor.DiskQueue):
     """Visao da DiskQueue que reivindica janelas proprias e jobs com origem='busca'."""
 
-    def __init__(self, queue: monitor.DiskQueue, own_keys: Callable[[], set[str]]) -> None:
+    def __init__(
+        self,
+        queue: monitor.DiskQueue,
+        own_keys: Callable[[], set[str]],
+        ocupadas: set[str] | None = None,
+        claim_lock: Any | None = None,
+    ) -> None:
         self._queue = queue
         self.root = queue.root
         self._own_keys = own_keys
+        self._ocupadas = ocupadas
+        self._claim_lock = claim_lock
+        self.claimed_key: str | None = None
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._queue, name)
 
     def claim_next(self) -> Path | None:
+        if self._claim_lock is None:
+            return self._claim_next()
+        with self._claim_lock:
+            return self._claim_next()
+
+    def _claim_next(self) -> Path | None:
         own = self._own_keys()
+        ocupadas = self._ocupadas if self._ocupadas is not None else ()
         pending = []
         for job_dir in (self.root / "pending").iterdir():
             try:
                 job = monitor._read_job(job_dir)
                 skey = job.get("session_key") or job.get("channel")
                 if not (_is_busca_job(job) or (skey in own and _is_window_job(job))):
+                    continue
+                if skey in ocupadas:
                     continue
                 pending.append((
                     -float((job.get("pre_score") if _is_window_job(job) else job.get("z_score")) or 0.0),
@@ -255,11 +274,17 @@ class _SessionQueueView(monitor.DiskQueue):
                         job = monitor._read_job(job_dir)
                         job["status"] = "processing"
                         monitor._write_job(job_dir, job)
-                        return self._move(job_dir, "processing")
-                job = monitor._read_job(job_dir)
-                job["status"] = "processing"
-                monitor._write_job(job_dir, job)
-                return self._move(job_dir, "processing")
+                        moved = self._move(job_dir, "processing")
+                else:
+                    job = monitor._read_job(job_dir)
+                    job["status"] = "processing"
+                    monitor._write_job(job_dir, job)
+                    moved = self._move(job_dir, "processing")
+                skey = job.get("session_key") or job.get("channel")
+                if self._ocupadas is not None and isinstance(skey, str):
+                    self._ocupadas.add(skey)
+                    self.claimed_key = skey
+                return moved
             except OSError:
                 continue
         return None
@@ -789,12 +814,24 @@ class Supervisor:
         self._alvo_by_key: dict[str, Alvo] = {a.chave: a for a in self.alvos}
         self._mongo_offline_until = float("-inf")
         self._need_replay = self.coord is not None
-        self._current_job: list[str | None] = [None]
+        self._consumidores: dict[int, threading.Thread] = {}
+        self._jobs_alvo = 0
+        self._cancel = threading.Event()
+        self._parar_consumidores = threading.Event()
+        self._jobs_em_andamento: dict[int, str] = {}
+        self._lives_ocupadas: set[str] = set()
+        self._claim_lock = threading.Lock()
+        self._vod_lock = threading.Lock()
+        self._worker_s: collections.deque[float] = collections.deque(maxlen=20)
         self._jobs: list[str] = []
+        self._jobs_ef_logado: int | None = None
         self._last_refusal_reason: str | None = None
         self._saw_blocked = False
         self._saw_not_claimed = False
         self._saw_lease_lost = False
+
+    def _jobs_atuais(self) -> list[str]:
+        return list(self._jobs_em_andamento.values())
 
     def _coord_active(self) -> Any | None:
         if self.coord is None or self.now() < self._mongo_offline_until:
@@ -1635,8 +1672,16 @@ class Supervisor:
         pipeline_fn: Callable[[Path, Path], dict[str, Any]],
         *,
         skip_lost: bool = True,
+        idx: int = -1,
     ) -> bool:
         def dispatch_pipeline(job_dir: Path, root: Path) -> dict[str, Any]:
+            t0 = time.monotonic()
+            res = _dispatch(job_dir, root)
+            if not self._cancel.is_set():
+                self._worker_s.append(time.monotonic() - t0)
+            return res
+
+        def _dispatch(job_dir: Path, root: Path) -> dict[str, Any]:
             job = monitor._read_job(job_dir)
             if _is_busca_job(job):
                 return pipeline_fn(job_dir, root)
@@ -1648,17 +1693,79 @@ class Supervisor:
                 raise RuntimeError(f"job de sessao com lease perdida: {skey!r}")
             return sess.pipeline(job_dir, root)
 
-        scoped_queue = _SessionQueueView(queue, lambda: self._own_session_keys(skip_lost=skip_lost))
-        return monitor.run_worker_step(
-            scoped_queue,
-            self.out_root,
-            self.policy,
-            dispatch_pipeline,
-            coord=self._coord_active(),
-            on_mongo_error=self._on_mongo_err,
-            lost_lives=self._lost_lives,
-            on_job_active=lambda jid: self._current_job.__setitem__(0, jid),
+        def on_active(jid: str | None) -> None:
+            if jid is None:
+                self._jobs_em_andamento.pop(idx, None)
+            else:
+                self._jobs_em_andamento[idx] = jid
+
+        view = _SessionQueueView(
+            queue,
+            lambda: self._own_session_keys(skip_lost=skip_lost),
+            self._lives_ocupadas,
+            self._claim_lock,
         )
+        try:
+            return monitor.run_worker_step(
+                view,
+                self.out_root,
+                self.policy,
+                dispatch_pipeline,
+                coord=self._coord_active(),
+                on_mongo_error=self._on_mongo_err,
+                lost_lives=self._lost_lives,
+                on_job_active=on_active,
+                cancel=self._cancel,
+            )
+        finally:
+            if view.claimed_key is not None:
+                self._lives_ocupadas.discard(view.claimed_key)
+
+    def _sync_consumidores(self, queue: Any, pipeline_fn: Any, worker_alias: str, probe_fn: Any, vod: bool) -> None:
+        e = capacidade.jobs_efetivos()
+        if e != self._jobs_ef_logado:
+            self._jobs_ef_logado = e
+            try:
+                pedido = int(os.environ.get("CLIPES_JOBS", "").strip())
+            except ValueError:
+                pedido = 1
+            if e < pedido:
+                _mem, _cpus = config._cgroup_limites()
+                cpus = _cpus if _cpus and _cpus > 0 else (os.cpu_count() or 1)
+                ram = _mem if _mem and _mem > 0 else capacidade._mem_total_bytes(Path("/proc"))
+                print(f"[jobs] CLIPES_JOBS={pedido} limitado a {e} (cpus={cpus:g}, ram_gb={ram / 1024**3:.1f})", flush=True)
+        self._jobs_alvo = e if e >= 2 else 0
+        for idx in [i for i, t in self._consumidores.items() if not t.is_alive()]:
+            del self._consumidores[idx]
+        for idx in range(self._jobs_alvo):
+            if idx not in self._consumidores:
+                t = threading.Thread(
+                    target=self._consumidor,
+                    args=(idx, queue, pipeline_fn, worker_alias, probe_fn, vod),
+                    daemon=True,
+                    name=f"consumidor-{idx}",
+                )
+                self._consumidores[idx] = t
+                t.start()
+
+    def _consumidor(self, idx: int, queue: Any, pipeline_fn: Any, worker_alias: str, probe_fn: Any, vod: bool) -> None:
+        while not self._parar_consumidores.is_set() and idx < self._jobs_alvo:
+            try:
+                worked = self._process_one(queue, pipeline_fn, skip_lost=True, idx=idx)
+                if not worked and vod and self._vod_lock.acquire(blocking=False):
+                    try:
+                        worked = self._process_one_vod(worker_alias, probe_fn)
+                    finally:
+                        self._vod_lock.release()
+            except Exception as exc:
+                if monitor._is_mongo_error(exc):
+                    self._on_mongo_err(exc)
+                else:
+                    print(f"[jobs] erro no consumidor {idx}: {type(exc).__name__}: {exc}", flush=True)
+                self._parar_consumidores.wait(5.0)
+                continue
+            if not worked:
+                self._parar_consumidores.wait(0.1)
 
     def _run_vod_cli(self, url: str, out_root: Path) -> int:
         from . import cli
@@ -1725,7 +1832,7 @@ class Supervisor:
 
         vod_id = str(vod["_id"])
         url = str(vod.get("url") or "").strip()
-        self._current_job[0] = vod_id
+        self._jobs_em_andamento[-1] = vod_id
         self._active_vod_id[0] = vod_id
         try:
             if not url:
@@ -1780,7 +1887,7 @@ class Supervisor:
         finally:
             self._cancelled_vod_ids.discard(vod_id)
             self._active_vod_id[0] = None
-            self._current_job[0] = None
+            self._jobs_em_andamento.pop(-1, None)
 
     def _release_session(
         self,
@@ -1929,7 +2036,7 @@ class Supervisor:
                                 ml_k = max(1, self._total_slots_live())
                                 razao_k = monitor._read_perfil_razao(self.out_root, cap_k.get("cpus"))
                                 self._call_beat(
-                                    c, worker_alias, cap_k, self._current_job[0], ml_k, razao_k, beat_interval,
+                                    c, worker_alias, cap_k, (self._jobs_atuais() or [None])[0], ml_k, razao_k, beat_interval,
                                     queue=queue,
                                 )
                                 renew_alvos_fn = getattr(c, "renew_alvos", None)
@@ -2075,6 +2182,7 @@ class Supervisor:
 
                 def _liberar() -> None:
                     # M-03: para gravadores, mata filhos e solta leases sem marcar ended
+                    self._cancel.set()
                     _stop_keepalive()
                     if pool is not None and hasattr(pool, "stop_all"):
                         try:
@@ -2122,7 +2230,7 @@ class Supervisor:
                         cmd_action: str | None = None
                         try:
                             self._call_beat(
-                                c_active, worker_alias, cap_now, self._current_job[0], ml_now, razao_now, beat_interval,
+                                c_active, worker_alias, cap_now, (self._jobs_atuais() or [None])[0], ml_now, razao_now, beat_interval,
                                 queue=queue,
                             )
                             if self.beat_s is None:
@@ -2229,8 +2337,11 @@ class Supervisor:
                         if not self._active:
                             break
 
+                    self._sync_consumidores(queue, pipeline_fn, worker_alias, probe_fn, mongo_mode)
                     worked = False
-                    if self._has_own_pending(queue, skip_lost=True):
+                    if any(t.is_alive() for t in self._consumidores.values()):
+                        pass
+                    elif self._has_own_pending(queue, skip_lost=True):
                         worked = self._process_one(queue, pipeline_fn, skip_lost=True)
                     elif mongo_mode:
                         worked = self._process_one_vod(worker_alias, probe_fn)
@@ -2240,6 +2351,9 @@ class Supervisor:
                     if hasattr(pool, "enforce_cap"):
                         pool.enforce_cap(monitor.BUFFER_CAP_BYTES)
 
+                self._jobs_alvo = 0
+                for t in list(self._consumidores.values()):
+                    t.join()
                 while self._has_own_pending(queue, skip_lost=True):
                     if not self._process_one(queue, pipeline_fn, skip_lost=True):
                         break
@@ -2255,6 +2369,9 @@ class Supervisor:
                 return {"status": status, "jobs": all_jobs, "reason": None}
         finally:
             try:
+                self._parar_consumidores.set()
+                for t in list(self._consumidores.values()):
+                    t.join(timeout=10.0)
                 _stop_keepalive()
                 for key, sess in list(self._active.items()):
                     self._release_session(key, sess, release_pool=True, reraise_non_mongo=True)

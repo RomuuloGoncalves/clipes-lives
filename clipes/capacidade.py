@@ -71,7 +71,9 @@ def jobs_efetivos(sysfs: str | Path = "/sys", proc: str | Path = "/proc") -> int
         return 1
     mem, cpus = config._cgroup_limites(Path(sysfs) / "fs" / "cgroup")
     cpus_n = cpus if cpus and cpus > 0 else (os.cpu_count() or 1)
-    ram = mem if mem and mem > 0 else _mem_total_bytes(Path(proc))
+    # menor entre limite do cgroup e RAM do host/VM (MemTotal): o limite nunca pode inflar a RAM real
+    candidatos = [v for v in (mem, _mem_total_bytes(Path(proc))) if v and v > 0]
+    ram = min(candidatos) if candidatos else 0
     por_ram = int(ram / (1024 * 1024) // ram_por_job_mb())
     return max(1, min(pedido, int(cpus_n), por_ram))
 

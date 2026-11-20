@@ -1,6 +1,7 @@
 """Painel (PAINEL-02, CMD-01): nucleo + handlers com mongomock e servidor local em porta efemera."""
 import base64
 import json
+import re
 import threading
 import urllib.error
 import urllib.request
@@ -853,3 +854,28 @@ def test_vod_kick_canonica_casa_extrator_kick_vod():
     gen = pytest.importorskip("yt_dlp.extractor").gen_extractor_classes
     nomes = [ie.IE_NAME for ie in gen() if ie.suitable(_KICK_CANON) and ie.IE_NAME != "generic"]
     assert "kick:vod" in nomes
+
+
+def test_index_html_coluna_capacidade_com_alerta():
+    # CAPA-04: coluna Capacidade logo depois de Fila; alerta quando ativas > sustentaveis
+    from pathlib import Path
+
+    raw = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
+    assert re.search(r"<th>Fila</th>\s*<th>Capacidade</th>", raw)
+    assert ".cap-alerta {" in raw
+    assert "fila vai crescer: aumente CLIPES_JOBS ou reduza CLIPES_SLOTS" in raw
+    assert "tdCap.className = \"mono td-full cap-alerta\";" in raw
+    assert "tdVazio.colSpan = 13;" in raw
+
+
+def test_index_html_ram_livre_limite_e_selo_diverge():
+    # CAPA-05: RAM "livre / limite" (sem limite / ? nos estados) e selo diverge com title
+    from pathlib import Path
+
+    raw = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
+    assert "function fmtRam(cap)" in raw
+    assert "cap.ram_limite_estado" in raw
+    assert "sem limite" in raw
+    assert "livre / " in raw and '" limite"' in raw
+    assert "selo-diverge" in raw and ".selo-diverge {" in raw
+    assert "pedido do painel diferente do limite do contêiner" in raw

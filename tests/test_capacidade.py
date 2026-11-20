@@ -261,7 +261,7 @@ def test_capacity_sem_arquivo_memory_max_reporta_ilegivel(tmp_path, monkeypatch)
     assert cap["ram_livre_gb"] == 1.0
 
 
-def _jobs(tmp_path, monkeypatch, *, jobs, cpu_max="800000 100000", mem_max=str(16 * 1024**3), ram_job=None, mem_total_kb=4 * 1024 * 1024):
+def _jobs(tmp_path, monkeypatch, *, jobs, cpu_max="800000 100000", mem_max=str(16 * 1024**3), ram_job=None, mem_total_kb=64 * 1024 * 1024):
     monkeypatch.setenv("CLIPES_JOBS", jobs)
     if ram_job is None:
         monkeypatch.delenv("CLIPES_RAM_POR_JOB", raising=False)
@@ -283,9 +283,27 @@ def test_jobs_efetivos_limitado_por_pedido_cpus_e_ram(tmp_path, monkeypatch):
 
 
 def test_jobs_efetivos_sem_limite_usa_memtotal_e_pedido_invalido_vira_um(tmp_path, monkeypatch):
-    assert _jobs(tmp_path, monkeypatch, jobs="4", mem_max="max") == 1  # MemTotal 4 GiB
+    assert _jobs(tmp_path, monkeypatch, jobs="4", mem_max="max", mem_total_kb=4 * 1024 * 1024) == 1  # MemTotal 4 GiB
     assert _jobs(tmp_path, monkeypatch, jobs="") == 1
     assert _jobs(tmp_path, monkeypatch, jobs="abc") == 1
+
+
+def test_jobs_efetivos_ram_e_o_menor_entre_cgroup_e_memtotal(tmp_path, monkeypatch):
+    # cgroup 10g inflado sobre MemTotal 7,5 GiB: teto por RAM usa 7,5 GiB -> 3 jobs de 2g
+    assert _jobs(tmp_path, monkeypatch, jobs="8", mem_max=str(10 * GB), ram_job="2g", mem_total_kb=int(7.5 * 1024 * 1024)) == 3
+    # cgroup 4g abaixo de MemTotal 16g: usa 4g -> 2 jobs
+    assert _jobs(tmp_path, monkeypatch, jobs="8", mem_max=str(4 * GB), ram_job="2g", mem_total_kb=16 * 1024 * 1024) == 2
+    # cgroup 'max' (sem limite) usa MemTotal 4g -> 2 jobs
+    assert _jobs(tmp_path, monkeypatch, jobs="8", mem_max="max", ram_job="2g", mem_total_kb=4 * 1024 * 1024) == 2
+
+
+def test_jobs_efetivos_sem_memtotal_legivel_usa_cgroup(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLIPES_JOBS", "8")
+    monkeypatch.setenv("CLIPES_RAM_POR_JOB", "2g")
+    sysfs = _make_sysfs(tmp_path / "sys", cpu_max="800000 100000", mem_max=str(8 * GB))
+    proc = _make_proc(tmp_path / "proc")
+    (proc / "meminfo").write_text("MemAvailable: 1 kB\n", encoding="utf-8")  # sem MemTotal
+    assert capacidade_mod.jobs_efetivos(sysfs=sysfs, proc=proc) == 4  # 8g / 2g
 
 
 def test_ram_por_job_configuravel(tmp_path, monkeypatch):

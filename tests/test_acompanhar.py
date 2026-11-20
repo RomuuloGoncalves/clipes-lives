@@ -1440,3 +1440,346 @@ def test_recursos_divergentes_sem_gerido_nao_sai_com_75(monkeypatch, tmp_path):
     beat = _sup_recursos(monkeypatch, tmp_path, [True], avisos)
     for t in (0, 600, 1200):
         beat(t)  # nao levanta SystemExit
+
+
+def _add_janela(queue, name, skey, score):
+    d = queue.root / "pending" / name
+    d.mkdir(parents=True)
+    monitor._write_job(d, {
+        "job_id": name, "channel": skey, "session_key": skey, "status": "pending", "pre_score": score,
+        "created_at": 1.0, "window_start": 0, "window_end": 1, "video_start": 0, "last": False,
+    })
+
+
+def test_claim_next_duas_views_um_job_so_um_recebe(tmp_path):
+    import threading
+
+    for i in range(50):
+        queue = monitor.DiskQueue(tmp_path / f"q{i}")
+        _add_janela(queue, "j", "gaules", 1.0)
+        ocup: set[str] = set()
+        lock = threading.Lock()
+        views = [acompanhar._SessionQueueView(queue, lambda: {"gaules"}, ocup, lock) for _ in range(2)]
+        res: list = []
+        barrier = threading.Barrier(2)
+
+        def run(v):
+            barrier.wait()
+            res.append(v.claim_next())
+
+        ts = [threading.Thread(target=run, args=(v,)) for v in views]
+        [t.start() for t in ts]
+        [t.join() for t in ts]
+        assert sum(r is not None for r in res) == 1
+
+
+def test_claim_next_pula_live_ocupada_e_volta_apos_discard(tmp_path):
+    queue = monitor.DiskQueue(tmp_path / "q")
+    _add_janela(queue, "a1", "A", 9.0)
+    _add_janela(queue, "b1", "B", 1.0)
+    ocup = {"A"}
+    view = acompanhar._SessionQueueView(queue, lambda: {"A", "B"}, ocup)
+    assert view.claim_next().name == "b1"
+    assert view.claimed_key == "B" and ocup == {"A", "B"}
+    ocup.discard("A")
+    assert acompanhar._SessionQueueView(queue, lambda: {"A", "B"}, ocup).claim_next().name == "a1"
+
+
+def test_process_one_cancelado_devolve_job_e_libera_live(tmp_path):
+    queue = monitor.DiskQueue(tmp_path / "q")
+    _add_janela(queue, "a1", "A", 1.0)
+    sup = acompanhar.Supervisor([], tmp_path / "out", queue_root=queue.root)
+    sess = acompanhar.LiveSession(
+        acompanhar.parse_alvo("A"), tmp_path / "out", queue, None, lambda d, r: {"clips": []},
+        is_live=lambda u: True, now=lambda: 0.0, disk_usage=lambda p: SimpleNamespace(free=1e12),
+    )
+    sup._all_sessions["A"] = sess
+    visto: list = []
+
+    def pipe(d, r):
+        visto.append(sup._jobs_atuais())
+        sup._cancel.set()
+        raise RuntimeError("morto")
+
+    sess.pipeline = pipe
+    assert sup._process_one(queue, pipe, skip_lost=True, idx=0) is True
+    assert visto == [["a1"]]
+    assert sup._jobs_atuais() == []
+    assert (queue.root / "pending" / "a1").is_dir()
+    assert sup._lives_ocupadas == set()
+
+
+# ---- jobs-paralelos T20: pool de consumidores no Supervisor ---------------------------------------
+
+
+def _sup_pool(tmp_path, monkeypatch, pipe, jobs, *, n=3, hook=None, coord=None, **kw):
+    clock = Clock(B + 10)
+    monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
+    monkeypatch.setenv("CLIPES_MAX_LIVES", str(n))
+    monkeypatch.setenv("CLIPES_SLOTS", f"twitch={n}")
+    monkeypatch.setattr(acompanhar.capacidade, "jobs_efetivos", jobs)
+    names = [f"c{i}" for i in range(n)]
+    stops = {c: B + 620 for c in names}
+    pool = FakeMultiPool(clock, stops)
+
+    def sleep(d):
+        clock.sleep(d)
+        if hook is not None:
+            hook()
+
+    sup = acompanhar.Supervisor(
+        [acompanhar.parse_alvo(c) for c in names],
+        tmp_path / "out",
+        pool=pool,
+        pipeline=pipe,
+        is_live=lambda u: clock.t < stops[u.rsplit("/", 1)[-1]],
+        now=clock.now,
+        sleep=sleep,
+        disk_usage=lambda p: SimpleNamespace(free=100 * 1e9),
+        coord=coord,
+        **kw,
+    )
+    return sup, tmp_path / "out" / "queue"
+
+
+def _ok(job_dir: Path) -> dict:
+    j = json.loads((job_dir / "job.json").read_text())
+    c = j["window_end"] - 100 - j["video_start"]
+    return {"clips": [{"file": "c.mp4", "score": 1.0, "start": c - 20, "end": c + 20}]}
+
+
+def _sess(job_dir: Path) -> str:
+    j = json.loads((job_dir / "job.json").read_text())
+    return j.get("session_key") or j["channel"]
+
+
+def test_pool_tres_consumidores_paralelizam_sessoes_sem_duplicar_job(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    lock = threading.Lock()
+    spans: list[tuple[str, float, float, str]] = []
+
+    def pipe(job_dir, root):
+        t0 = time.monotonic()
+        time.sleep(0.3)
+        with lock:
+            spans.append((_sess(job_dir), t0, time.monotonic(), job_dir.name))
+        return _ok(job_dir)
+
+    sup, qroot = _sup_pool(tmp_path, monkeypatch, pipe, lambda: 3)
+    t0 = time.monotonic()
+    assert sup.run()["status"] == "ended"
+    assert time.monotonic() - t0 < 1.5
+    assert len(spans) == 6
+    assert sorted(p.name for p in (qroot / "done").iterdir()) == sorted(s[3] for s in spans)
+    for a in spans:
+        for b in spans:
+            if a is not b and a[0] == b[0]:
+                assert a[2] <= b[1] or b[2] <= a[1]  # mesma sessao nunca em paralelo
+
+
+def test_pool_jobs_1_nao_cria_threads_consumidor(tmp_path, monkeypatch):
+    import threading
+
+    vistos: list[str] = []
+
+    def pipe(job_dir, root):
+        vistos.extend(t.name for t in threading.enumerate() if t.name.startswith("consumidor-"))
+        return _ok(job_dir)
+
+    sup, qroot = _sup_pool(tmp_path, monkeypatch, pipe, lambda: 1)
+    sup.run()
+    assert vistos == [] and sup._consumidores == {}
+    assert len(list((qroot / "done").iterdir())) == 6
+
+
+def test_pool_trocar_3_para_1_termina_os_3_e_depois_so_inline(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    val = [3]
+    go = threading.Event()
+    lock = threading.Lock()
+    quem: list[str] = []
+    bloqueados: list[str] = []
+
+    def pipe(job_dir, root):
+        with lock:
+            quem.append(threading.current_thread().name)
+            primeiros = len(quem) <= 3
+        if primeiros:
+            bloqueados.append(job_dir.name)
+            go.wait(10)
+        return _ok(job_dir)
+
+    sup, qroot = _sup_pool(tmp_path, monkeypatch, pipe, lambda: val[0], hook=lambda: time.sleep(0.005))
+    th = threading.Thread(target=sup.run, name="runner")
+    th.start()
+    for _ in range(600):
+        if len(bloqueados) == 3:
+            break
+        time.sleep(0.01)
+    assert len(bloqueados) == 3 and all(n.startswith("consumidor-") for n in quem)
+    val[0] = 1
+    for _ in range(600):
+        if sup._jobs_alvo == 0:
+            break
+        time.sleep(0.01)
+    go.set()
+    th.join(20)
+    assert not th.is_alive()
+    assert len(list((qroot / "done").iterdir())) == 6
+    assert all(not n.startswith("consumidor-") for n in quem[3:])
+
+
+def test_pool_trocar_1_para_2_sobe_duas_threads(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    val = [1]
+    vistos: set[str] = set()
+
+    def hook():
+        val[0] = 2
+        time.sleep(0.005)
+        vistos.update(t.name for t in threading.enumerate() if t.name.startswith("consumidor-"))
+
+    sup, _ = _sup_pool(tmp_path, monkeypatch, lambda d, o: {"clips": []}, lambda: val[0], hook=hook)
+    sup.run()
+    assert vistos == {"consumidor-0", "consumidor-1"}
+
+
+def test_pool_laco_continua_ticando_sessoes_durante_pipeline(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    ativo = threading.Event()
+    ticks = [0]
+    orig = acompanhar.LiveSession.tick
+
+    def tick(self, t):
+        if ativo.is_set():
+            ticks[0] += 1
+        return orig(self, t)
+
+    monkeypatch.setattr(acompanhar.LiveSession, "tick", tick)
+    medido = [False]
+
+    def pipe(job_dir, root):
+        if not medido[0]:
+            medido[0] = True
+            ativo.set()
+            time.sleep(0.5)
+            ativo.clear()
+        return {"clips": []}
+
+    sup, _ = _sup_pool(tmp_path, monkeypatch, pipe, lambda: 2, n=2, hook=lambda: time.sleep(0.005))
+    sup.run()
+    assert medido[0] and ticks[0] >= 2
+
+
+def test_pool_dois_consumidores_nunca_dois_pegar_vod_ao_mesmo_tempo(tmp_path):
+    import threading
+    import time
+
+    em_andamento = [0]
+    pico = [0]
+    lock = threading.Lock()
+    fila = [{"_id": "v1", "url": "https://x.test/1"}, {"_id": "v2", "url": "https://x.test/2"}]
+    fins: list[str] = []
+
+    class C(_CoordStub):
+        def pegar_vod(self, alias):
+            with lock:
+                em_andamento[0] += 1
+                pico[0] = max(pico[0], em_andamento[0])
+            try:
+                time.sleep(0.1)
+                return fila.pop(0) if fila else None
+            finally:
+                with lock:
+                    em_andamento[0] -= 1
+
+        def fim_vod(self, vod_id, *a, **kw):
+            fins.append(vod_id)
+
+    sup = acompanhar.Supervisor(
+        [], tmp_path / "out", pipeline=lambda d, o: {"clips": []}, coord=C(), now=lambda: B, sleep=lambda _s: None,
+        vod_pipeline=lambda url, out: time.sleep(0.1) or 0,
+    )
+    sup._check_vod_policy = lambda vod, url, probe: None
+    queue = monitor.DiskQueue(tmp_path / "out" / "queue")
+    sup._jobs_alvo = 2
+    ths = [
+        threading.Thread(target=sup._consumidor, args=(i, queue, sup.pipeline, "w", lambda u: {}, True)) for i in range(2)
+    ]
+    [t.start() for t in ths]
+    for _ in range(300):
+        if len(fins) == 2:
+            break
+        time.sleep(0.01)
+    sup._parar_consumidores.set()
+    [t.join(5) for t in ths]
+    assert sorted(fins) == ["v1", "v2"]
+    assert pico[0] == 1
+
+
+def test_pool_liberar_com_dois_jobs_devolve_ambos_a_pending_e_encerra_threads(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    db = mongomock.MongoClient().db
+    clock_ref: list = []
+    coord = Coord(db, "w-pool", now=lambda: clock_ref[0].now(), lease_s=90)
+    rodando: list[str] = []
+    solto = threading.Event()
+    enviado = [False]
+
+    def pipe(job_dir, root):
+        rodando.append(job_dir.name)
+        solto.wait(10)
+        raise RuntimeError("morto pelo liberar")
+
+    def hook():
+        time.sleep(0.01)
+        if not enviado[0] and len(rodando) >= 2:
+            enviado[0] = True
+            db.commands.insert_one({
+                "_id": "cmd-lib-pool", "worker_id": "w-pool", "acao": "liberar", "status": "pending",
+                "criado_em": coord._dt(), "expira_em": coord._dt(+300), "executado_em": None,
+            })
+
+    sup, qroot = _sup_pool(
+        tmp_path, monkeypatch, pipe, lambda: 2, n=2, hook=hook, coord=coord,
+        kill_children=solto.set, stream_id="s_pool", capacity_fn=lambda _: {"cpus": 4, "score": 30}, beat_s=0.01,
+    )
+    clock_ref.append(SimpleNamespace(now=sup.now))
+    t0 = time.monotonic()
+    with pytest.raises(SystemExit) as exc:
+        sup.run()
+    assert exc.value.code == 75
+    assert time.monotonic() - t0 <= 10
+    assert len(list((qroot / "pending").iterdir())) >= 2
+    assert list((qroot / "processing").iterdir()) == []
+    assert not any(t.name.startswith("consumidor-") and t.is_alive() for t in threading.enumerate())
+
+
+def test_pool_log_de_corte_aparece_uma_vez_por_mudanca(tmp_path, monkeypatch, capsys):
+    import time
+
+    monkeypatch.setenv("CLIPES_JOBS", "4")
+    val = [2]
+    passos = [0]
+
+    def hook():
+        passos[0] += 1
+        if passos[0] == 50:
+            val[0] = 3
+        time.sleep(0.002)
+
+    sup, _ = _sup_pool(tmp_path, monkeypatch, lambda d, o: {"clips": []}, lambda: val[0], hook=hook)
+    sup.run()
+    out = capsys.readouterr().out
+    assert out.count("[jobs] CLIPES_JOBS=4 limitado a 2 ") == 1
+    assert out.count("[jobs] CLIPES_JOBS=4 limitado a 3 ") == 1
