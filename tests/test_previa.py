@@ -56,6 +56,13 @@ def test_recompresses_when_above_limit_with_formula_bitrate(tmp_path: Path):
     assert cmd[cmd.index("-preset") + 1] == "veryfast"
     assert cmd[cmd.index("-c:a") + 1] == "aac"
     assert cmd[cmd.index("-b:a") + 1] == "96k"
+    assert cmd[cmd.index("-map_metadata") + 1] == "-1"
+    assert cmd[cmd.index("-map_metadata:s:v") + 1] == "-1"
+    assert cmd[cmd.index("-map_metadata:s:a") + 1] == "-1"
+    assert cmd[cmd.index("-map_chapters") + 1] == "-1"
+    assert cmd[cmd.index("-fflags") + 1] == "+bitexact"
+    assert cmd[cmd.index("-flags:v") + 1] == "+bitexact"
+    assert cmd[cmd.index("-flags:a") + 1] == "+bitexact"
 
     expected_total_kbps = int((limit_mb * 1024 * 1024 * 0.90 * 8) / (1000 * duration))
     expected_video_kbps = max(400, min(2500, expected_total_kbps - 96))

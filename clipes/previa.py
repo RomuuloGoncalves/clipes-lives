@@ -87,6 +87,13 @@ def preview_for_discord(
         "-bufsize", f"{bufsize_kbps}k",
         "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", f"{_AUDIO_KBPS}k",
+        "-map_metadata", "-1",
+        "-map_metadata:s:v", "-1",
+        "-map_metadata:s:a", "-1",
+        "-map_chapters", "-1",
+        "-fflags", "+bitexact",
+        "-flags:v", "+bitexact",
+        "-flags:a", "+bitexact",
         "-movflags", "+faststart",
         str(tmp_out),
     ]
