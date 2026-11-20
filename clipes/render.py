@@ -349,6 +349,46 @@ def is_hook_top_enabled() -> bool:
     return config.env_flag("CLIPES_HOOK_TOP", True)
 
 
+def is_bilingual_subtitle_enabled() -> bool:
+    """Bilingual subtitles (original on top, PT-BR below) are off unless CLIPES_LEGENDA_ORIGINAL=1."""
+    return config.env_flag("CLIPES_LEGENDA_ORIGINAL", False)
+
+
+def wrap_subtitle_block(text: str, max_chars: int = 32, max_lines: int = 2) -> str:
+    """ASS-escape and wrap a subtitle block into balanced lines without truncating."""
+    clean = _ass_escape(" ".join(text.split()))
+    if not clean or max_lines <= 1 or len(clean) <= max_chars:
+        return clean
+    words = clean.split()
+    if len(words) <= 1:
+        return clean
+    if max_lines == 2:
+        best_idx = 1
+        best_score = (float("inf"), float("inf"))
+        for i in range(1, len(words)):
+            left = " ".join(words[:i])
+            right = " ".join(words[i:])
+            overflow = max(0, len(left) - max_chars) + max(0, len(right) - max_chars)
+            diff = abs(len(left) - len(right))
+            score = (overflow, diff)
+            if score < best_score:
+                best_score = score
+                best_idx = i
+        return r"\N".join((" ".join(words[:best_idx]), " ".join(words[best_idx:])))
+    lines: list[str] = []
+    cur = ""
+    for word in words:
+        candidate = f"{cur} {word}" if cur else word
+        if len(candidate) <= max_chars or not cur or len(lines) + 1 >= max_lines:
+            cur = candidate
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    return r"\N".join(lines)
+
+
 def _truncate_ellipsis(text: str, max_chars: int) -> str:
     if max_chars <= 0:
         return ""
@@ -424,6 +464,8 @@ def build_ass(
     bar: BarConfig | None = None,
     split: Any | None = None,
     variante: str | None = None,
+    translated_cues: list[Any] | None = None,
+    bilingual: bool | None = None,
 ) -> int:
     """Write word-highlighted ASS subtitles, channel credit, and end card. Returns dialogue count."""
     content_dur = max(0.0, clip_end - clip_start)
@@ -675,42 +717,68 @@ def build_ass(
             f"{{\\pos({width // 2},{card_y})\\fad(250,0)}}{card_text}"
         )
 
-    if not selected:
+    if not selected and not translated_cues:
         ass_path.write_text(header + ("\n".join(events) + "\n" if events else ""), encoding="utf-8")
         return len(events)
 
-    groups: list[list[Word]] = []
-    cur: list[Word] = []
-    for w in selected:
-        cur.append(w)
-        if len(cur) >= words_per_cue or w.ends_sentence:
-            groups.append(cur)
-            cur = []
-    if cur:
-        groups.append(cur)
-
-    # ASS colors are &HBBGGRR&
-    white = "&H00FFFFFF&"
-    highlight = "&H0000FFFF&"  # bright yellow
-
-    for group in groups:
-        for i, w in enumerate(group):
-            s0 = max(0.0, max(w.start, clip_start) - clip_start)
-            next_s = group[i + 1].start if i + 1 < len(group) else w.end
-            en = min(clip_end - clip_start, max(w.end, next_s) - clip_start)
-            if en <= s0:
-                en = min(clip_end - clip_start, s0 + 0.12)
+    if translated_cues:
+        use_bilingual = is_bilingual_subtitle_enabled() if bilingual is None else bool(bilingual)
+        for cue in translated_cues:
+            cue_start = float(getattr(cue, "start", 0.0))
+            cue_end = float(getattr(cue, "end", 0.0))
+            s0 = max(0.0, max(cue_start, clip_start) - clip_start)
+            en = min(clip_end - clip_start, cue_end - clip_start)
             if en <= s0:
                 continue
-
-            parts: list[str] = []
-            for j, item in enumerate(group):
-                tok = _ass_escape(item.clean)
-                col = highlight if j == i else white
-                parts.append(f"{{\\c{col}}}{tok}")
+            pt_raw = str(getattr(cue, "translated", "") or "").strip()
+            pt_wrapped = wrap_subtitle_block(pt_raw)
+            if not pt_wrapped:
+                continue
+            if use_bilingual:
+                orig_raw = str(getattr(cue, "original", "") or "").strip()
+                orig_wrapped = wrap_subtitle_block(orig_raw, max_chars=40)
+                if orig_wrapped:
+                    body = f"{{\\fs44\\c&H00D0D0D0&}}{orig_wrapped}\\N{{\\fs64\\c&H00FFFFFF&}}{pt_wrapped}"
+                else:
+                    body = pt_wrapped
+            else:
+                body = pt_wrapped
             events.append(
-                f"Dialogue: 0,{_ass_time(s0)},{_ass_time(en)},Cap,,0,0,0,,{cap_prefix}{' '.join(parts)}"
+                f"Dialogue: 0,{_ass_time(s0)},{_ass_time(en)},Cap,,0,0,0,,{cap_prefix}{body}"
             )
+    else:
+        groups: list[list[Word]] = []
+        cur: list[Word] = []
+        for w in selected:
+            cur.append(w)
+            if len(cur) >= words_per_cue or w.ends_sentence:
+                groups.append(cur)
+                cur = []
+        if cur:
+            groups.append(cur)
+
+        # ASS colors are &HBBGGRR&
+        white = "&H00FFFFFF&"
+        highlight = "&H0000FFFF&"  # bright yellow
+
+        for group in groups:
+            for i, w in enumerate(group):
+                s0 = max(0.0, max(w.start, clip_start) - clip_start)
+                next_s = group[i + 1].start if i + 1 < len(group) else w.end
+                en = min(clip_end - clip_start, max(w.end, next_s) - clip_start)
+                if en <= s0:
+                    en = min(clip_end - clip_start, s0 + 0.12)
+                if en <= s0:
+                    continue
+
+                parts: list[str] = []
+                for j, item in enumerate(group):
+                    tok = _ass_escape(item.clean)
+                    col = highlight if j == i else white
+                    parts.append(f"{{\\c{col}}}{tok}")
+                events.append(
+                    f"Dialogue: 0,{_ass_time(s0)},{_ass_time(en)},Cap,,0,0,0,,{cap_prefix}{' '.join(parts)}"
+                )
 
     ass_path.write_text(header + "\n".join(events) + "\n", encoding="utf-8")
     return len(events)
@@ -1219,6 +1287,7 @@ def render_clip(
                 bar=bar,
                 split=active_split,
                 variante=active_var,
+                translated_cues=getattr(clip, "translated_cues", None),
             )
 
         def _run_encode(

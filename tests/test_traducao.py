@@ -359,3 +359,158 @@ def test_providers_used_preserved_across_traduzir_clipes_and_enrich_clips(tmp_pa
     assert cloud_llm.providers_used() == ["gemini"]
     assert clip.title_source == "heuristic_fallback"
     assert "aconteceu" in clip.title.lower()
+
+
+def test_build_ass_translated_cues_parity_pt_and_bilingual(tmp_path, monkeypatch):
+    from clipes import render
+
+    words = [
+        _w(1.0, 1.4, "What"),
+        _w(1.4, 1.8, "is"),
+        _w(1.8, 2.2, "happening?"),
+    ]
+    cues = [
+        SubtitleCue(
+            start=1.0,
+            end=2.2,
+            original="What is happening?",
+            translated="O que está acontecendo agora?",
+        ),
+        SubtitleCue(
+            start=2.8,
+            end=4.5,
+            original="Let's go!",
+            translated="Bora lá!",
+        ),
+    ]
+
+    # 1) Parity: translated_cues=None must match word-by-word karaoke bit-for-bit
+    ass_default = tmp_path / "default.ass"
+    ass_none = tmp_path / "none.ass"
+    n_def = render.build_ass(words, 0.0, 6.0, ass_default, channel_credit="@streamer")
+    n_none = render.build_ass(words, 0.0, 6.0, ass_none, channel_credit="@streamer", translated_cues=None)
+    assert n_def == n_none
+    assert ass_default.read_text(encoding="utf-8") == ass_none.read_text(encoding="utf-8")
+
+    # 2) Translated pure PT-BR mode (CLIPES_LEGENDA_ORIGINAL unset / 0)
+    monkeypatch.delenv("CLIPES_LEGENDA_ORIGINAL", raising=False)
+    assert render.is_bilingual_subtitle_enabled() is False
+    ass_pt = tmp_path / "pt.ass"
+    render.build_ass(words, 0.0, 6.0, ass_pt, channel_credit="@streamer", translated_cues=cues)
+    pt_lines = [line for line in ass_pt.read_text(encoding="utf-8").splitlines() if ",Cap,," in line]
+    assert len(pt_lines) == 2
+    assert pt_lines[0].startswith("Dialogue: 0,0:00:01.00,0:00:02.20,Cap,,0,0,0,,")
+    assert "O que está" in pt_lines[0] and "acontecendo agora?" in pt_lines[0]
+    assert pt_lines[1].startswith("Dialogue: 0,0:00:02.80,0:00:04.50,Cap,,0,0,0,,Bora lá!")
+    assert "What is happening?" not in ass_pt.read_text(encoding="utf-8")
+
+    # 3) Bilingual mode (CLIPES_LEGENDA_ORIGINAL=1)
+    monkeypatch.setenv("CLIPES_LEGENDA_ORIGINAL", "1")
+    assert render.is_bilingual_subtitle_enabled() is True
+    ass_bi = tmp_path / "bi.ass"
+    render.build_ass(words, 0.0, 6.0, ass_bi, channel_credit="@streamer", translated_cues=cues)
+    bi_lines = [line for line in ass_bi.read_text(encoding="utf-8").splitlines() if ",Cap,," in line]
+    assert len(bi_lines) == 2
+    assert r"{\fs44\c&H00D0D0D0&}What is happening?\N{\fs64\c&H00FFFFFF&}" in bi_lines[0]
+    assert r"{\fs44\c&H00D0D0D0&}Let's go!\N{\fs64\c&H00FFFFFF&}Bora lá!" in bi_lines[1]
+
+
+def test_cli_run_pipeline_translates_non_pt_and_writes_manifest(tmp_path, monkeypatch):
+    import wave
+    import numpy as np
+    from clipes import cli
+    from clipes.models import CandidatePeak, IngestResult
+
+    def _setup_ing(vid: str) -> IngestResult:
+        out_dir = tmp_path / "out" / vid
+        cache_dir = out_dir / ".cache"
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        wav_path = cache_dir / "audio.wav"
+        sr = 16000
+        duration = 90.0
+        samples = (np.ones(int(sr * duration), dtype=np.int16) * 200).tobytes()
+        with wave.open(str(wav_path), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr)
+            wf.writeframes(samples)
+        return IngestResult(
+            video_id=vid,
+            title="English Stream",
+            url="https://www.twitch.tv/streamer",
+            extractor="twitch:vod",
+            is_live=False,
+            duration=duration,
+            audio_path=wav_path,
+            video_path=None,
+            heatmap=None,
+            chat_messages=None,
+            out_dir=out_dir,
+            cache_dir=cache_dir,
+            channel="twitch.tv/streamer",
+        )
+
+    words = [_w(30.0, 30.4, "What"), _w(30.4, 30.8, "a"), _w(30.8, 31.3, "play!")]
+
+    def _mock_pipeline(ing: IngestResult, detected_lang: str):
+        clip = SnappedClip(peak=31.0, start=20.0, end=50.0, score=0.9, text="What a play!")
+        monkeypatch.setattr(cli, "ingest", lambda **kwargs: ing)
+        monkeypatch.setattr(
+            cli,
+            "pick_candidate_peaks",
+            lambda *a, **kw: [CandidatePeak(peak=31.0, raw_score=0.9, start_win=0.0, end_win=80.0)],
+        )
+        monkeypatch.setattr(cli, "transcribe_candidates", lambda **kwargs: (words, detected_lang))
+        monkeypatch.setattr(cli, "select_clips", lambda *a, **kw: [clip])
+        monkeypatch.setattr(cli, "enrich_clips_with_llm", lambda *a, **kw: None)
+        return clip
+
+    # 1) lang="en" translates and records legenda_traduzida=True
+    monkeypatch.delenv("CLIPES_LEGENDA_IDIOMA", raising=False)
+    ing_en = _setup_ing("vid_en")
+    clip_en = _mock_pipeline(ing_en, "en")
+    monkeypatch.setattr(
+        cloud_llm,
+        "complete_cloud",
+        lambda *a, **kw: ({"blocos": [{"id": 0, "pt": "Que jogada!"}]}, "cloud:gemini:gemini-2.5-flash"),
+    )
+    rc = cli.main(["https://www.twitch.tv/streamer", "--out-dir", str(tmp_path / "out"), "--skip-render"])
+    assert rc == 0
+    assert clip_en.translated_cues is not None
+    manifest_en = json.loads((ing_en.out_dir / "clips.json").read_text(encoding="utf-8"))
+    assert "traducao_s" in manifest_en["timings"]
+    c0_en = manifest_en["clips"][0]
+    assert c0_en["legenda_traduzida"] is True
+    assert c0_en["legenda_idioma"] == "pt"
+    assert c0_en["legenda_fonte"] == "cloud:gemini:gemini-2.5-flash"
+
+    # 2) lang="pt", --no-llm, and CLIPES_LEGENDA_IDIOMA=off never call translator
+    def fail_cloud(*a, **kw):
+        raise AssertionError("translator should not be called")
+
+    monkeypatch.setattr(cloud_llm, "complete_cloud", fail_cloud)
+
+    ing_pt = _setup_ing("vid_pt")
+    _mock_pipeline(ing_pt, "pt")
+    assert cli.main(["https://www.twitch.tv/streamer", "--out-dir", str(tmp_path / "out"), "--skip-render"]) == 0
+    c0_pt = json.loads((ing_pt.out_dir / "clips.json").read_text(encoding="utf-8"))["clips"][0]
+    assert c0_pt["legenda_traduzida"] is False
+    assert c0_pt["legenda_fonte"] == "original"
+
+    ing_nollm = _setup_ing("vid_nollm")
+    _mock_pipeline(ing_nollm, "en")
+    assert (
+        cli.main(["https://www.twitch.tv/streamer", "--out-dir", str(tmp_path / "out"), "--no-llm", "--skip-render"])
+        == 0
+    )
+    c0_nollm = json.loads((ing_nollm.out_dir / "clips.json").read_text(encoding="utf-8"))["clips"][0]
+    assert c0_nollm["legenda_traduzida"] is False
+    assert c0_nollm["legenda_fonte"] == "original"
+
+    monkeypatch.setenv("CLIPES_LEGENDA_IDIOMA", "off")
+    ing_off = _setup_ing("vid_off")
+    _mock_pipeline(ing_off, "en")
+    assert cli.main(["https://www.twitch.tv/streamer", "--out-dir", str(tmp_path / "out"), "--skip-render"]) == 0
+    c0_off = json.loads((ing_off.out_dir / "clips.json").read_text(encoding="utf-8"))["clips"][0]
+    assert c0_off["legenda_traduzida"] is False
+    assert c0_off["legenda_fonte"] == "original"
