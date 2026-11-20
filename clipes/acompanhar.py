@@ -220,6 +220,10 @@ def _is_busca_job(job: dict[str, Any]) -> bool:
     return job.get("origem") == "busca"
 
 
+_CONSUMIDOR_OCIOSO_S = 1.0  # espera do consumidor sem trabalho (mesma cadencia do caminho inline)
+_JOIN_CONSUMIDORES_S = 30.0  # parada espera os consumidores ate isto; pipeline travado nao trava o servico
+
+
 class _SessionQueueView(monitor.DiskQueue):
     """Visao da DiskQueue que reivindica janelas proprias e jobs com origem='busca'."""
 
@@ -267,19 +271,27 @@ class _SessionQueueView(monitor.DiskQueue):
             except (OSError, ValueError, TypeError, AttributeError):
                 continue
         mutex = getattr(self._queue, "mutex", None)
+        def _claim(job_dir: Path) -> tuple[dict[str, Any], Path]:
+            job = monitor._read_job(job_dir)
+            job["status"] = "processing"
+            monitor._write_job(job_dir, job)
+            try:
+                return job, self._move(job_dir, "processing")
+            except OSError:
+                job["status"] = "pending"  # move falhou: nao deixa pending/ marcado processing
+                try:
+                    monitor._write_job(job_dir, job)
+                except OSError:
+                    pass
+                raise
+
         for *_, job_dir in sorted(pending):
             try:
                 if mutex is not None:
                     with mutex:
-                        job = monitor._read_job(job_dir)
-                        job["status"] = "processing"
-                        monitor._write_job(job_dir, job)
-                        moved = self._move(job_dir, "processing")
+                        job, moved = _claim(job_dir)
                 else:
-                    job = monitor._read_job(job_dir)
-                    job["status"] = "processing"
-                    monitor._write_job(job_dir, job)
-                    moved = self._move(job_dir, "processing")
+                    job, moved = _claim(job_dir)
                 skey = job.get("session_key") or job.get("channel")
                 if self._ocupadas is not None and isinstance(skey, str):
                     self._ocupadas.add(skey)
@@ -527,18 +539,26 @@ class LiveSession:
                     j = {}
                 return (float(j.get("pre_score") or 0.0), float(j.get("created_at") or 0.0), d.name)
 
-            lost_dir = min(backlog, key=_chave)
-            lost_score = _chave(lost_dir)[0]
+            lost_dir = None
+            for cand in sorted(backlog, key=_chave):
+                try:
+                    lost_job = monitor._read_job(cand)
+                except (OSError, ValueError):
+                    lost_job = {}
+                cand_score = _chave(cand)[0]
+                try:
+                    self.queue.complete(cand, "rejected", {"reject_reason": "lost", "lost": True})
+                except OSError:
+                    continue  # consumidor ja fez claim: nao esta perdida, tenta o proximo
+                lost_dir, lost_score = cand, cand_score
+                break
+            if lost_dir is None:
+                return
             print(
                 f"[live] backlog {len(backlog)} (limite {self.max_backlog}, disco_baixo={disco_baixo}): "
                 f"{lost_dir.name} lost (score {lost_score:.1f})",
                 flush=True,
             )
-            try:
-                lost_job = monitor._read_job(lost_dir)
-            except (OSError, ValueError):
-                lost_job = {}
-            self.queue.complete(lost_dir, "rejected", {"reject_reason": "lost", "lost": True})
             c_lost = self.coord_getter()
             if c_lost is not None and lost_job.get("mongo_job_id"):
                 try:
@@ -1550,6 +1570,8 @@ class Supervisor:
         applied = config.apply_remote_config(remote_cfg, out_root=self.out_root, alias=alias)
         if config.recursos_pendentes():
             print("[config] novo limite de RAM/CPU do painel; reiniciando para aplicar", flush=True)
+            self._cancel.set()  # jobs em andamento voltam a pending/ (requeue)
+            (self.kill_children or monitor._terminate_child_processes)()
             raise SystemExit(75)
         new_slots = config.slots(strict=False)
         with self._lock:
@@ -1785,7 +1807,7 @@ class Supervisor:
                 self._parar_consumidores.wait(5.0)
                 continue
             if not worked:
-                self._parar_consumidores.wait(0.1)
+                self._parar_consumidores.wait(_CONSUMIDOR_OCIOSO_S)
 
     def _run_vod_cli(self, url: str, out_root: Path) -> int:
         from . import cli
@@ -2373,7 +2395,7 @@ class Supervisor:
 
                 self._jobs_alvo = 0
                 for t in list(self._consumidores.values()):
-                    t.join()
+                    t.join(timeout=_JOIN_CONSUMIDORES_S)
                 while self._has_own_pending(queue, skip_lost=True):
                     if not self._process_one(queue, pipeline_fn, skip_lost=True):
                         break
@@ -2391,7 +2413,7 @@ class Supervisor:
             try:
                 self._parar_consumidores.set()
                 for t in list(self._consumidores.values()):
-                    t.join(timeout=10.0)
+                    t.join(timeout=min(10.0, _JOIN_CONSUMIDORES_S))
                 _stop_keepalive()
                 for key, sess in list(self._active.items()):
                     self._release_session(key, sess, release_pool=True, reraise_non_mongo=True)

@@ -1557,6 +1557,7 @@ def test_pool_tres_consumidores_paralelizam_sessoes_sem_duplicar_job(tmp_path, m
     import threading
     import time
 
+    monkeypatch.setattr(acompanhar, "_CONSUMIDOR_OCIOSO_S", 0.1)  # so acelera o 1o ciclo ocioso; ha trabalho na fila
     lock = threading.Lock()
     spans: list[tuple[str, float, float, str]] = []
 
@@ -1832,3 +1833,124 @@ def test_beat_dois_jobs_job_atual_e_o_primeiro(monkeypatch, tmp_path):
 
     _beat_kwargs(monkeypatch, tmp_path, beat, jobs_em_andamento={0: "a", 1: "b"})
     assert got["job_atual"] == "a" and got["jobs_atuais"] == ["a", "b"]
+
+
+# ---- revisao CLIPES_JOBS: corridas e carga -------------------------------------------------------
+
+
+def test_descarte_backlog_com_job_claimado_no_meio_nao_derruba_a_sessao(tmp_path, monkeypatch):
+    import os
+
+    sess, queue, msgs = _sessao_scores(tmp_path, monkeypatch, [5.0, 1.0, 9.0])
+    _fechar_n_janelas(sess, 2)
+    orig = sess.pending
+
+    def pending_com_claim():
+        lista = orig()
+        # consumidor faz claim do menor score entre a listagem e o complete
+        os.replace(queue.root / "pending" / "gaules_1300", queue.root / "processing" / "gaules_1300")
+        return lista
+
+    sess.pending = pending_com_claim
+    _fechar_n_janelas(sess, 1, inicio=2)  # nao levanta
+    assert (queue.root / "processing" / "gaules_1300").is_dir()
+    assert "gaules_1300" not in _contagem(queue)[1]
+    assert not any(m.startswith("gaules_1300") for m in msgs)
+
+
+def test_consumidor_ocioso_nao_martela_pegar_vod(tmp_path):
+    chamadas = [0]
+
+    class C(_CoordStub):
+        def pegar_vod(self, alias):
+            chamadas[0] += 1
+
+        def fim_vod(self, *a, **kw):
+            pass
+
+    class Rel:
+        def __init__(self):
+            self.t = 0.0
+
+        def is_set(self):
+            return self.t >= 3.0
+
+        def wait(self, d):
+            self.t += d
+
+    sup = acompanhar.Supervisor([], tmp_path / "out", pipeline=lambda d, o: {"clips": []}, coord=C(), now=lambda: B)
+    queue = monitor.DiskQueue(tmp_path / "out" / "queue")
+    sup._jobs_alvo = 3
+    for i in range(3):
+        sup._parar_consumidores = Rel()
+        sup._consumidor(i, queue, sup.pipeline, "w", lambda u: {}, True)
+    assert chamadas[0] <= 3 * 4
+
+
+def test_parada_nao_trava_com_consumidor_preso(tmp_path, monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(acompanhar, "_JOIN_CONSUMIDORES_S", 0.3)
+    go = threading.Event()
+
+    def pipe(job_dir, root):
+        go.wait(15)
+        return _ok(job_dir)
+
+    sup, _ = _sup_pool(tmp_path, monkeypatch, pipe, lambda: 2, n=2, hook=lambda: time.sleep(0.005))
+    th = threading.Thread(target=sup.run, daemon=True)
+    th.start()
+    th.join(8)
+    travou = th.is_alive()
+    go.set()
+    th.join(5)
+    assert not travou
+
+
+def test_recursos_pendentes_devolve_job_em_andamento_a_pending(tmp_path, monkeypatch):
+    import threading
+
+    queue = monitor.DiskQueue(tmp_path / "q")
+    _add_janela(queue, "a1", "A", 1.0)
+    sup = acompanhar.Supervisor([], tmp_path / "out", queue_root=queue.root, kill_children=lambda: None)
+    sess = acompanhar.LiveSession(
+        acompanhar.parse_alvo("A"), tmp_path / "out", queue, None, lambda d, r: {"clips": []},
+        is_live=lambda u: True, now=lambda: 0.0, disk_usage=lambda p: SimpleNamespace(free=1e12),
+    )
+    sup._all_sessions["A"] = sess
+    iniciou, go = threading.Event(), threading.Event()
+
+    def pipe(d, r):
+        iniciou.set()
+        go.wait(10)
+        raise RuntimeError("morto")
+
+    sess.pipeline = pipe
+    th = threading.Thread(target=sup._process_one, args=(queue, pipe), kwargs={"skip_lost": True, "idx": 0})
+    th.start()
+    assert iniciou.wait(5)
+    monkeypatch.setattr(acompanhar.config, "apply_remote_config", lambda *a, **k: {})
+    monkeypatch.setattr(acompanhar.config, "recursos_pendentes", lambda: True)
+    with pytest.raises(SystemExit) as ei:
+        sup._apply_runtime_config({}, alias="pc")
+    assert ei.value.code == 75
+    go.set()
+    th.join(5)
+    assert (queue.root / "pending" / "a1").is_dir()
+
+
+def test_claim_next_falha_no_move_nao_deixa_pending_marcado_processing(tmp_path, monkeypatch):
+    queue = monitor.DiskQueue(tmp_path / "q")
+    _add_janela(queue, "a1", "A", 1.0)
+    real = monitor.os.replace
+
+    def replace(src, dst):
+        if Path(dst).parent.name == "processing":
+            raise OSError("boom")
+        return real(src, dst)
+
+    monkeypatch.setattr(monitor.os, "replace", replace)
+    view = acompanhar._SessionQueueView(queue, lambda: {"A"}, set())
+    assert view.claim_next() is None
+    assert monitor._read_job(queue.root / "pending" / "a1")["status"] == "pending"
