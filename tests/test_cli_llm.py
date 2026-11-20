@@ -57,14 +57,23 @@ def _mock_base_stages(monkeypatch, ing: IngestResult, clips: list[SnappedClip], 
 
 def test_cli_no_llm_flag_fills_deterministic_metadata_fast(tmp_path: Path, monkeypatch):
     ing = _make_ing(tmp_path, "no_llm_vid")
-    words = [Word(30.0, 30.5, " Olha"), Word(30.6, 31.1, " esse"), Word(31.2, 31.8, " clutch!")]
+    # Fala longa: o título ("Olha esse clutch!") só aparece após as 25 primeiras palavras,
+    # então não ecoa a abertura da fala e o hook_top determinístico não fica vazio.
+    preamble = (
+        "Ninguém acreditava que o time ia virar essa partida hoje porque faltava muito pouco "
+        "tempo no relógio e a torcida já estava calada no ginásio inteiro"
+    ).split()
+    assert len(preamble) >= 26
+    words = [Word(10.0 + i * 0.3, 10.2 + i * 0.3, f" {tok}") for i, tok in enumerate(preamble)]
+    words += [Word(30.0, 30.5, " Olha"), Word(30.6, 31.1, " esse"), Word(31.2, 31.8, " clutch!")]
+    speech = " ".join(preamble) + " Olha esse clutch!"
     clip = SnappedClip(
         peak=31.0,
-        start=20.0,
+        start=10.0,
         end=50.0,
         score=0.88,
         active_signals=["loudness", "chat"],
-        text="Olha esse clutch!",
+        text=speech,
     )
     _mock_base_stages(monkeypatch, ing, [clip], words)
 
@@ -102,7 +111,7 @@ def test_cli_no_llm_flag_fills_deterministic_metadata_fast(tmp_path: Path, monke
     assert c0["title_source"] == "heuristic_fallback"
     assert c0["hook_top"] == "Olha esse clutch!"
     assert c0["description_source"] == "fallback"
-    assert c0["description_long"].startswith("Olha esse clutch!\n\nOlha esse clutch!")
+    assert c0["description_long"].startswith(f"Olha esse clutch!\n\n{speech}")
     assert c0["llm_score"] is None
     assert c0["llm_reason"] == ""
     assert 1 <= len(c0["hashtags"]) <= 3
@@ -414,7 +423,7 @@ def test_cli_cloud_privacy_notice_written_only_when_cloud_used(tmp_path: Path, m
         lambda *a, **kw: {
             "titulo": "O jogador conseguiu virar no último segundo!",
             "gancho": "Ninguém esperava essa jogada no último segundo da partida.",
-            "gancho_topo": "O jogador conseguiu virar?",
+            "gancho_topo": "Ninguém esperava essa virada?",
             "descricao_longa": long_desc,
             "hashtags": ["#gaules", "#cs2br", "#cortes"],
             "nota": 9.1,
@@ -432,7 +441,7 @@ def test_cli_cloud_privacy_notice_written_only_when_cloud_used(tmp_path: Path, m
     manifest_cloud = json.loads((ing_cloud.out_dir / "clips.json").read_text(encoding="utf-8"))
     mc = manifest_cloud["clips"][0]
     assert mc["title_source"] == "cloud:gemini:gemini-2.5-flash"
-    assert mc["hook_top"] == "O jogador conseguiu virar?"
+    assert mc["hook_top"] == "Ninguém esperava essa virada?"
     assert mc["description_source"] == "llm"
     assert mc["clip_id"] == "cloud_vid_c01"
     assert (ing_cloud.out_dir / "clip_01_o-jogador-conseguiu-virar-no-ultimo.descricao.txt").read_text(encoding="utf-8") == mc["description_long"]
