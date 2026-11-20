@@ -1414,3 +1414,41 @@ def test_t5_excluir_ignora_pico_e_solta_canal_quente_em_ate_30s(tmp_path, monkey
 
 
 
+
+
+# ---- lease perdida: o resultado fica local, nunca no Mongo (US-1 AC12) -----------------------------
+
+
+def _run_step_com_lease(tmp_path, pipeline, lost_lives):
+    db = mongomock.MongoClient().db
+    coord = Coord(db, "w-a")
+    coord.add_job("canal_100", "twitch:canal:1", (0, 100), 5.0)
+    queue = monitor.DiskQueue(tmp_path / "q")
+    queue.enqueue(make_staged_job(tmp_path / "stage", channel="canal", peak=100, live_id="twitch:canal:1"))
+    assert monitor.run_worker_step(
+        queue, tmp_path / "out", monitor.ChannelPolicy(), pipeline=pipeline, coord=coord, lost_lives=lost_lives,
+    ) is True
+    return db.jobs.find_one({"_id": "canal_100"}), queue
+
+
+def _pipeline_ok(job_dir, root):
+    return {"clips": [{"score": 0.9}], "output_dir": str(root / "canal [1]")}
+
+
+def _pipeline_erro(job_dir, root):
+    raise RuntimeError("boom")
+
+
+@pytest.mark.parametrize("pipeline,local,mongo_final", [
+    (_pipeline_ok, "done", "done"),                # M47
+    (_pipeline_erro, "rejected", "rejected"),      # M48
+])
+def test_lease_perdida_conclui_local_e_nao_grava_no_mongo(tmp_path, pipeline, local, mongo_final):
+    doc, queue = _run_step_com_lease(tmp_path, pipeline, {"twitch:canal:1"})
+    assert [p.name for p in (queue.root / local).iterdir()] == ["canal_100"]
+    assert doc["status"] == "processing"  # finish_job nao foi chamado
+    assert not doc.get("result")
+
+    # controle: sem lease perdida o resultado chega ao Mongo
+    doc, _ = _run_step_com_lease(tmp_path / "ctl", pipeline, set())
+    assert doc["status"] == mongo_final

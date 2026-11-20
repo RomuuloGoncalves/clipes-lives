@@ -1138,6 +1138,26 @@
         return livre + fmtNum(cap.ram_limite_gb, " GB") + " limite";
       }
 
+      function temSeloDiverge(cap) {
+        return cap.recursos_divergentes === true;
+      }
+
+      function capacidadeInfo(jobsCap, ocupados) {
+        ocupados = ocupados || {};
+        if (!jobsCap || jobsCap.lives_sustentaveis === null || jobsCap.lives_sustentaveis === undefined) {
+          return { texto: "medindo", alerta: false };
+        }
+        var sustentaveis = Math.floor(Number(jobsCap.lives_sustentaveis));
+        var livesAtivas = (Number(ocupados.twitch) || 0) + (Number(ocupados.kick) || 0) + (Number(ocupados.youtube) || 0);
+        var medioS = jobsCap.job_medio_s === null || jobsCap.job_medio_s === undefined
+          ? "-" : String(Math.round(Number(jobsCap.job_medio_s)));
+        return {
+          texto: livesAtivas + "/" + fmtNum(sustentaveis) + " lives · "
+            + fmtNum(jobsCap.efetivos) + " jobs · " + medioS + " s",
+          alerta: livesAtivas > sustentaveis
+        };
+      }
+
       function fmtGpu(gpu) {
         if (!gpu) return "-";
         if (typeof gpu === "string") return gpu;
@@ -1375,7 +1395,7 @@
 
           tr.appendChild(tdLabel("CPU", "mono", fmtCpu(cap)));
           var tdRam = tdLabel("RAM", "mono", fmtRam(cap));
-          if (cap.recursos_divergentes === true) {
+          if (temSeloDiverge(cap)) {
             var seloDiverge = el("span", "selo-diverge", "diverge");
             seloDiverge.title = "pedido do painel diferente do limite do contêiner";
             tdRam.appendChild(seloDiverge);
@@ -1429,21 +1449,11 @@
           }, 0);
           tr.appendChild(tdLabel("Fila", "mono", w.fila ? String(tamFila) : "-"));
 
-          var jobsCap = w.jobs || null;
-          var tdCap = tdLabel("Capacidade", "mono td-full");
-          if (!jobsCap || jobsCap.lives_sustentaveis === null || jobsCap.lives_sustentaveis === undefined) {
-            tdCap.textContent = "medindo";
-          } else {
-            var sustentaveis = Math.floor(Number(jobsCap.lives_sustentaveis));
-            var livesAtivas = (Number(ocupados.twitch) || 0) + (Number(ocupados.kick) || 0) + (Number(ocupados.youtube) || 0);
-            var medioS = jobsCap.job_medio_s === null || jobsCap.job_medio_s === undefined
-              ? "-" : String(Math.round(Number(jobsCap.job_medio_s)));
-            tdCap.textContent = livesAtivas + "/" + fmtNum(sustentaveis) + " lives · "
-              + fmtNum(jobsCap.efetivos) + " jobs · " + medioS + " s";
-            if (livesAtivas > sustentaveis) {
-              tdCap.className = "mono td-full cap-alerta";
-              tdCap.title = "fila vai crescer: aumente CLIPES_JOBS ou reduza CLIPES_SLOTS";
-            }
+          var infoCap = capacidadeInfo(w.jobs, ocupados);
+          var tdCap = tdLabel("Capacidade", "mono td-full", infoCap.texto);
+          if (infoCap.alerta) {
+            tdCap.className = "mono td-full cap-alerta";
+            tdCap.title = "fila vai crescer: aumente CLIPES_JOBS ou reduza CLIPES_SLOTS";
           }
           tr.appendChild(tdCap);
 

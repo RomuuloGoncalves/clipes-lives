@@ -879,3 +879,63 @@ def test_index_html_ram_livre_limite_e_selo_diverge():
     assert "livre / " in raw and '" limite"' in raw
     assert "selo-diverge" in raw and ".selo-diverge {" in raw
     assert "pedido do painel diferente do limite do contêiner" in raw
+
+
+# ---- CAPA-04/05: comportamento do JS (funcoes puras extraidas do index.html) ----------------------
+# Com `node` executa as funcoes de verdade. Sem node (o contêiner nao tem) o teste estatico abaixo
+# so confere as expressoes de decisao: limitacao documentada, nao roda o JS.
+
+_JS_FUNCS = ("fmtNum", "fmtRam", "temSeloDiverge", "capacidadeInfo")
+
+
+def _js_funcoes() -> str:
+    from pathlib import Path
+
+    raw = (Path(__file__).resolve().parents[1] / "painel" / "index.html").read_text(encoding="utf-8")
+    out = []
+    for nome in _JS_FUNCS:
+        m = re.search(rf"^      function {nome}\(.*?^      }}\n", raw, re.S | re.M)
+        assert m, nome
+        out.append(m.group(0))
+    return "\n".join(out)
+
+
+def _node(expr: str):
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node ausente (so o teste estatico roda)")
+    r = subprocess.run([node, "-e", _js_funcoes() + f"\nconsole.log(JSON.stringify({expr}));"],
+                       capture_output=True, text=True, check=True)
+    return json.loads(r.stdout)
+
+
+def test_js_capacidade_info_texto_e_alerta():
+    f = "capacidadeInfo"
+    assert _node(f"{f}(null, {{}})") == {"texto": "medindo", "alerta": False}
+    assert _node(f"{f}({{lives_sustentaveis: null}}, {{}})") == {"texto": "medindo", "alerta": False}
+    j = "{lives_sustentaveis: 5.7, efetivos: 3, job_medio_s: 180.4}"
+    # 2 ativas de 5 sustentaveis (floor de 5.7)
+    assert _node(f"{f}({j}, {{twitch: 1, kick: 1}})") == {"texto": "2/5 lives · 3 jobs · 180 s", "alerta": False}
+    assert _node(f"{f}({j}, {{twitch: 3, kick: 1, youtube: 1}})")["alerta"] is False  # igual: nao alerta (M31)
+    assert _node(f"{f}({j}, {{twitch: 3, kick: 2, youtube: 1}})")["alerta"] is True
+    assert _node(f"{f}({{lives_sustentaveis: 2, efetivos: 1, job_medio_s: null}}, {{}})")["texto"] == "0/2 lives · 1 jobs · - s"
+
+
+def test_js_fmt_ram_por_estado_e_selo_diverge():
+    assert _node("fmtRam({ram_gb: 8})") == "8 GB"  # worker antigo, sem ram_livre_gb
+    assert _node("fmtRam({ram_gb: 8, ram_livre_gb: 3, ram_limite_estado: null})") == "8 GB"
+    assert _node("fmtRam({ram_livre_gb: 3, ram_limite_estado: 'limite', ram_limite_gb: 6})") == "3 GB livre / 6 GB limite"
+    assert _node("fmtRam({ram_livre_gb: 3, ram_limite_estado: 'sem_limite'})") == "3 GB livre / sem limite"
+    assert _node("fmtRam({ram_livre_gb: 3, ram_limite_estado: 'ilegivel'})") == "3 GB livre / ?"
+    assert _node("[true, false, null, 'true', 1, undefined].map(function (v) { return temSeloDiverge({recursos_divergentes: v}); })") \
+        == [True, False, False, False, False, False]  # so `true` (M32)
+
+
+def test_js_painel_expressoes_de_decisao_estaticas():
+    # fallback sem node: M31 (`>=`) e M32 (selo sempre) mudam estas expressoes
+    js = _js_funcoes()
+    assert "alerta: livesAtivas > sustentaveis" in js
+    assert "return cap.recursos_divergentes === true;" in js
