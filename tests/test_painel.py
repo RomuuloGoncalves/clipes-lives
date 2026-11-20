@@ -583,3 +583,16 @@ def test_dev_server_roteia_api_config(db, env):
         assert resp.status == 200
         assert json.loads(resp.read()) == {"ok": True, "pc_alias": "PC-1", "config": {"CLIPES_PORTAO": "on"}}
     srv.server_close()
+
+
+def test_salvar_config_global(db):
+    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_LAYOUT": "inexistente"}}, NOW)[0] == 400
+    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_BAR_H": "400"}}, NOW)[0] == 400
+    assert _nucleo.salvar_config_global(db, {"config": {"PAINEL_SENHA": "x"}}, NOW)[0] == 400
+    code, body = _nucleo.salvar_config_global(db, {"config": {"CLIPES_LAYOUT": "split-cheio"}}, NOW)
+    assert code == 200 and body["config"] == {"CLIPES_LAYOUT": "split-cheio"}
+    assert db.config_global.find_one({"_id": "global"})["config"] == {"CLIPES_LAYOUT": "split-cheio"}
+    assert _nucleo.status(db, NOW)["config_global"] == {"CLIPES_LAYOUT": "split-cheio"}
+    # vazio = remove o global (volta ao .env/padrao)
+    assert _nucleo.salvar_config_global(db, {"config": {"CLIPES_LAYOUT": ""}}, NOW)[1]["config"] == {}
+    assert _nucleo.status(db, NOW)["config_global"] == {}

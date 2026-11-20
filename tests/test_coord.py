@@ -723,7 +723,7 @@ def test_reconcile_alias_migra_config_e_remove_duplicata(env):
     })
 
     cfg = a.reconcile_alias("PC-1")
-    assert cfg == {"CLIPES_LAYOUT": "split-barra", "CLIPES_WHISPER_MODEL": "large-v3-turbo"}
+    assert cfg == {"CLIPES_WHISPER_MODEL": "large-v3-turbo"}  # CLIPES_LAYOUT por PC e ignorado (global)
     # Documentos antigos/duplicados removidos; apenas w-a permanece
     docs = list(db.workers.find({"alias": "PC-1"}))
     assert len(docs) == 1
@@ -873,3 +873,16 @@ def test_promover_para_vod_in_place_e_duplicado(env):
     assert res3 == "ignorado"
     doc3 = db.alvos.find_one({"_id": "yt_Outro999"})
     assert doc3["tipo"] == "live"  # nao alterado
+
+
+def test_layout_global_vence_config_por_pc(env, capsys):
+    _, db, a, _ = env
+    db.workers.update_one({"_id": "w-a"}, {"$set": {"config": {"CLIPES_LAYOUT": "full", "CLIPES_BAR_H": "400"}}}, upsert=True)
+    beat = lambda: a.beat("PC-1", {}, None, 1, 1.0)
+    # sem global: chave por PC ignorada (env/padrao valem), aviso unico
+    assert beat() == {"CLIPES_BAR_H": "400"}
+    beat()
+    assert capsys.readouterr().out.count("CLIPES_LAYOUT por PC ignorado") == 1
+    db.config_global.insert_one({"_id": "global", "config": {"CLIPES_LAYOUT": "split-cheio"}})
+    assert beat() == {"CLIPES_BAR_H": "400", "CLIPES_LAYOUT": "split-cheio"}
+    assert a.reconcile_alias("PC-1")["CLIPES_LAYOUT"] == "split-cheio"

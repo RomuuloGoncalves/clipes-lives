@@ -324,7 +324,22 @@ class Coord:
 
     # ---- heartbeat e config por alias ----
 
+    def _com_global(self, cfg: dict) -> dict:
+        """Config global (`config_global/_id=global`) sempre vence a por-PC nas chaves globais."""
+        cfg = dict(cfg)
+        if "CLIPES_LAYOUT" in cfg and not getattr(self, "_avisou_layout_pc", False):
+            self._avisou_layout_pc = True
+            print("[config] CLIPES_LAYOUT por PC ignorado: use o layout global do painel", flush=True)
+        cfg.pop("CLIPES_LAYOUT", None)
+        glob = (self.db.config_global.find_one({"_id": "global"}) or {}).get("config")
+        if isinstance(glob, dict) and glob.get("CLIPES_LAYOUT"):
+            cfg["CLIPES_LAYOUT"] = glob["CLIPES_LAYOUT"]
+        return cfg
+
     def reconcile_alias(self, alias: str) -> dict:
+        return self._com_global(self._reconcile_alias(alias))
+
+    def _reconcile_alias(self, alias: str) -> dict:
         """Unifica documentos antigos/pre-criados com o mesmo `alias` em `self.worker_id` e retorna o `config`."""
         alias_clean = (alias or "").strip()
         if not alias_clean:
@@ -388,7 +403,7 @@ class Coord:
             upsert=True,
             return_document=ReturnDocument.AFTER,
         )
-        return dict((doc or {}).get("config") or {})
+        return self._com_global(dict((doc or {}).get("config") or {}))
 
     # ---- comandos do painel ----
 

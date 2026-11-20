@@ -110,7 +110,7 @@ class PainelDevHandler(BaseHTTPRequestHandler):
             self._servir_index()
         elif path == "/api/status":
             _nucleo.tratar(self, "status")
-        elif path in ("/api/alvos", "/api/comando", "/api/config"):
+        elif path in ("/api/alvos", "/api/comando", "/api/config", "/api/config_global"):
             _nucleo._enviar(self, 405, {"erro": "metodo nao permitido"}, {"Allow": "POST"})
         else:
             _nucleo._enviar(self, 404, {"erro": "nao encontrado"})
@@ -123,6 +123,8 @@ class PainelDevHandler(BaseHTTPRequestHandler):
             _nucleo.tratar(self, "comando")
         elif path == "/api/config":
             _nucleo.tratar(self, "config")
+        elif path == "/api/config_global":
+            _nucleo.tratar(self, "config_global")
         elif path == "/api/status":
             _nucleo._enviar(self, 405, {"erro": "metodo nao permitido"}, {"Allow": "GET"})
         else:

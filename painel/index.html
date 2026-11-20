@@ -882,6 +882,20 @@
       </div>
     </section>
 
+    <section class="kpis" aria-label="Layout global dos clipes" style="align-items:center;gap:10px">
+      <label for="layout-global-sel"><strong>Layout dos clipes (global)</strong></label>
+      <select id="layout-global-sel">
+        <option value="">Padrao do sistema (split-starcuts)</option>
+        <option value="split-starcuts">split-starcuts: barra + webcam + jogo, estilo StarCuts (padrao)</option>
+        <option value="split-barra">split-barra: barra de marca fixa, webcam e jogo</option>
+        <option value="split-cheio">split-cheio: webcam e jogo ocupam a tela toda, sem barra</option>
+        <option value="split-fina">split-fina: barra fina, mais area para a webcam e o jogo</option>
+        <option value="full">full: recorte unico tradicional, sem webcam</option>
+      </select>
+      <button id="layout-global-btn" class="btn-primary" type="button">Salvar</button>
+      <span class="sec-sub">Vale para todos os PCs, so para clipes novos. Sobrepoe o .env e o modal por PC.</span>
+    </section>
+
     <div class="sec-head">
       <h2>PCs e workers</h2>
       <div class="sec-head-actions">
@@ -1560,6 +1574,23 @@
           });
       });
 
+      document.getElementById("layout-global-btn").addEventListener("click", function () {
+        var v = document.getElementById("layout-global-sel").value;
+        fetch("/api/config_global", {
+          method: "POST",
+          credentials: "same-origin",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ config: { CLIPES_LAYOUT: v } })
+        })
+          .then(function (r) {
+            return r.json().catch(function () { return {}; }).then(function (b) {
+              if (r.ok) mostrarMsg("Layout global salvo (vale para clipes novos).", "ok");
+              else mostrarMsg("Falha ao salvar layout: " + ((b && b.erro) || ("HTTP " + r.status)), "erro");
+            });
+          })
+          .catch(function () { mostrarMsg("Erro de rede ao salvar layout.", "erro"); });
+      });
+
       function atualizar() {
         if (carregando) return;
         carregando = true;
@@ -1576,7 +1607,14 @@
             return r.json();
           })
           .then(function (dados) {
-            if (dados.config_schema) ultimoSchema = dados.config_schema;
+            if (dados.config_schema) {
+              ultimoSchema = Object.assign({}, dados.config_schema);
+              delete ultimoSchema.CLIPES_LAYOUT; // global: fora do modal por PC
+            }
+            var selLg = document.getElementById("layout-global-sel");
+            if (dados.config_global && document.activeElement !== selLg) {
+              selLg.value = dados.config_global.CLIPES_LAYOUT || "";
+            }
             renderWorkers(dados.workers || []);
             renderLives(dados.lives || [], dados.workers || []);
             renderAlvos(dados.alvos || [], dados.workers || []);

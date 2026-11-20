@@ -18,7 +18,7 @@ from typing import Any, Literal, Protocol, TypedDict
 from urllib.parse import parse_qs, urlparse, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-MetodoPainel = Literal["status", "comando", "alvos", "config"]
+MetodoPainel = Literal["status", "comando", "alvos", "config", "config_global"]
 
 
 class WorkerStatus(TypedDict):
@@ -74,6 +74,7 @@ class StatusPayload(TypedDict):
     vods_recentes: list[VodRecenteStatus]
     jobs_24h: dict[str, int]
     config_schema: dict[str, dict[str, Any]]
+    config_global: dict[str, str]
 
 
 class _Headers(Protocol):
@@ -214,6 +215,7 @@ def status(db: Any, now: datetime, beat_s: float = BEAT_S) -> StatusPayload:
         "vods_recentes": vods_recentes,
         "jobs_24h": jobs,
         "config_schema": CONFIG_SCHEMA,
+        "config_global": _config_str_dict((db.config_global.find_one({"_id": "global"}) or {}).get("config")),
     }
 
 
@@ -1061,6 +1063,18 @@ def salvar_config(db: Any, corpo: Mapping[str, Any], now: datetime) -> tuple[int
     return 200, {"ok": True, "pc_alias": pc_alias, "config": clean_cfg}
 
 
+def salvar_config_global(db: Any, corpo: Mapping[str, Any], now: datetime) -> tuple[int, dict[str, Any]]:
+    """Persiste a config global (hoje so CLIPES_LAYOUT) em `config_global/_id=global`; vazio = remove."""
+    raw_cfg = corpo.get("config")
+    if not isinstance(raw_cfg, Mapping) or set(raw_cfg) - {"CLIPES_LAYOUT"}:
+        return 400, {"erro": "config global aceita apenas CLIPES_LAYOUT"}
+    clean_cfg, err = validate_config_payload(raw_cfg)
+    if err is not None:
+        return 400, {"erro": err}
+    db.config_global.update_one({"_id": "global"}, {"$set": {"config": clean_cfg, "updated_at": now}}, upsert=True)
+    return 200, {"ok": True, "config": clean_cfg}
+
+
 def _origem_valida(h: _HttpHandler) -> bool:
     origin = (h.headers.get("Origin") or "").strip()
     alvo = origin or (h.headers.get("Referer") or "").strip()
@@ -1091,7 +1105,7 @@ def tratar(h: _HttpHandler, metodo: MetodoPainel, now: datetime | None = None) -
     uri = os.environ.get("PAINEL_MONGO_URI")
     if not uri:
         return _enviar(h, *SEM_CONFIG)
-    if metodo in ("comando", "alvos", "config"):
+    if metodo in ("comando", "alvos", "config", "config_global"):
         if not _origem_valida(h):
             return _enviar(h, 403, {"erro": "origem nao permitida"})
         ctype = (h.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
@@ -1113,6 +1127,8 @@ def tratar(h: _HttpHandler, metodo: MetodoPainel, now: datetime | None = None) -
             return _enviar(h, *gerir_alvo(db, corpo, now))
         if metodo == "config":
             return _enviar(h, *salvar_config(db, corpo, now))
+        if metodo == "config_global":
+            return _enviar(h, *salvar_config_global(db, corpo, now))
         return _enviar(h, *criar_comando(db, corpo.get("worker_id"), corpo.get("confirmar"), now))
     except Exception:  # nunca vazar detalhe (URI/host) na resposta
         return _enviar(h, 500, {"erro": "erro interno"})

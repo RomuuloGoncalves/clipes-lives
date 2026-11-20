@@ -96,7 +96,8 @@ Variáveis de ambiente de renderização:
   - `CLIPES_BAR_STYLE`: `claro` (padrão; fundo branco, texto preto, handle cinza) ou `escuro` (fundo preto, texto branco, handle cinza-claro).
   - `CLIPES_BAR_H`: altura da barra em pixels (padrão `420`, aceito de `300` a `600`).
 - Layout dividido (`CLIPES_LAYOUT`): empilha barra opcional, recorte da webcam e recorte do jogo em `1080x1920`, com a legenda falada centralizada na emenda (`barra + cam`) e crédito no rodapé (`y=1860`). Quando nenhuma webcam de overlay é detectada (ou a fonte já é vertical), o render cai para o layout `full` sem erro.
-  - `CLIPES_LAYOUT`: `split-barra` (padrão quando vazio), `split-cheio`, `split-fina` ou `full` (mantém o layout tradicional sem detecção de webcam).
+  - `CLIPES_LAYOUT`: `split-starcuts` (padrão quando vazio), `split-barra`, `split-cheio`, `split-fina` ou `full` (mantém o layout tradicional sem detecção de webcam).
+  - **Layout global (painel):** o seletor "Layout dos clipes (global)" grava `config_global/_id=global` no Mongo e vale para todos os PCs via heartbeat, só para clipes novos. Precedência: **global do painel > `CLIPES_LAYOUT` do `.env` > padrão `split-starcuts`**. `CLIPES_LAYOUT` salvo por PC (`workers.config`) é ignorado, com aviso único no log; a chave não aparece mais no modal por PC.
   - Variantes e orçamento de altura (`barra + webcam + jogo = 1920`):
     - `split-barra` (padrão): `340 + 520 + 1060` px. Barra branca com logo, nome, handle e título fixo; sem gancho sobre a webcam.
     - `split-cheio`: `0 + 768 + 1152` px. Sem barra; logo e nome com contorno sobre a webcam, e gancho de `0` a `5,4 s` sobre a webcam escurecida.
