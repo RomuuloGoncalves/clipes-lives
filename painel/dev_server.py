@@ -135,19 +135,21 @@ class PainelDevHandler(BaseHTTPRequestHandler):
 def criar_servidor(
     port: int = DEFAULT_PORT,
     handler_cls: type[PainelDevHandler] = PainelDevHandler,
+    host: str = "127.0.0.1",
 ) -> ThreadingHTTPServer:
-    """Instancia o `ThreadingHTTPServer` em `127.0.0.1` na porta informada."""
-    return ThreadingHTTPServer(("127.0.0.1", port), handler_cls)
+    """Instancia o `ThreadingHTTPServer` no host e porta informados."""
+    return ThreadingHTTPServer((host, port), handler_cls)
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Servidor local de desenvolvimento do painel.")
     parser.add_argument("--port", type=int, default=None, help="Porta HTTP local (padrao: PAINEL_PORT ou 8787).")
+    parser.add_argument("--host", default="127.0.0.1", help="Endereco de bind HTTP (padrao: 127.0.0.1).")
     args = parser.parse_args(argv)
 
     configurar_ambiente()
     port = resolver_porta(args.port)
-    servidor = criar_servidor(port)
+    servidor = criar_servidor(port, host=args.host)
     porta_real = servidor.server_address[1]
     print(f"Painel local disponivel em http://127.0.0.1:{porta_real}", flush=True)
     try:

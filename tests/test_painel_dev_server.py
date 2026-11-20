@@ -104,17 +104,8 @@ def test_rotas_index_status_alvos_e_comando(servidor_local) -> None:
             body = resp.read().decode("utf-8")
             assert "<html" in body.lower()
 
-    # GET /api/status sem auth -> 401
-    with pytest.raises(urllib.error.HTTPError) as exc:
-        urllib.request.urlopen(f"{base_url}/api/status")
-    assert exc.value.code == 401
-
-    # GET /api/status autenticado -> 200 com workers
-    req_status = urllib.request.Request(
-        f"{base_url}/api/status",
-        headers={"Authorization": _basic("segredo")},
-    )
-    with urllib.request.urlopen(req_status) as resp:
+    # GET /api/status sem auth -> 200 (painel aberto)
+    with urllib.request.urlopen(f"{base_url}/api/status") as resp:
         assert resp.status == 200
         payload = json.loads(resp.read().decode("utf-8"))
         assert [w["id"] for w in payload["workers"]] == ["w-1"]

@@ -84,6 +84,8 @@ services:
       CLIPES_PUB_MAX_POR_CICLO: ${CLIPES_PUB_MAX_POR_CICLO:-}
       CLIPES_AGENDA_HORARIOS: ${CLIPES_AGENDA_HORARIOS-11:30,19:00}
       CLIPES_TZ: ${CLIPES_TZ:-America/Sao_Paulo}
+      PAINEL_MONGO_URI: ${PAINEL_MONGO_URI:-}
+      PAINEL_PORT: ${PAINEL_PORT:-8787}
     volumes:
       - clipes_models:/cache
       - ${OUT_DIR:-./out}:/out
@@ -133,6 +135,8 @@ services:
       CLIPES_PUB_MAX_POR_CICLO: ${CLIPES_PUB_MAX_POR_CICLO:-}
       CLIPES_AGENDA_HORARIOS: ${CLIPES_AGENDA_HORARIOS-11:30,19:00}
       CLIPES_TZ: ${CLIPES_TZ:-America/Sao_Paulo}
+      PAINEL_MONGO_URI: ${PAINEL_MONGO_URI:-}
+      PAINEL_PORT: ${PAINEL_PORT:-8787}
     volumes:
       - clipes_models:/cache
       - ${OUT_DIR:-./out}:/out

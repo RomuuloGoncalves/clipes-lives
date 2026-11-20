@@ -70,11 +70,36 @@ def _bench_live(argv: list[str]) -> int:
     return 0
 
 
+def _start_dashboard_thread():
+    import threading
+    from painel import dev_server
+
+    dev_server.configurar_ambiente()
+    port = dev_server.resolver_porta()
+    srv = dev_server.criar_servidor(port, host="0.0.0.0")
+    print(f"[dashboard] disponivel em http://127.0.0.1:{srv.server_address[1]}", flush=True)
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    return srv
+
+
 def main(argv: list[str]) -> int:
+    has_dashboard = "--dashboard" in argv
+    if argv == ["--dashboard"]:
+        from painel import dev_server
+
+        return dev_server.main(["--host", "0.0.0.0"])
     if argv[:1] == ["servico"]:
         from .acompanhar import main as acompanhar_main
 
-        return acompanhar_main(argv[1:])
+        rest = [a for a in argv[1:] if a != "--dashboard"]
+        srv = _start_dashboard_thread() if has_dashboard else None
+        try:
+            return acompanhar_main(rest)
+        finally:
+            if srv is not None:
+                srv.shutdown()
+                srv.server_close()
     if argv[:1] and argv[0] in _REMOVED_CMDS:
         print(REMOVED_CMD_MSG, file=sys.stderr, flush=True)
         return 2

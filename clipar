@@ -71,8 +71,18 @@ fi
 fim() { kill $V 2>/dev/null; docker unpause $(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes) >/dev/null 2>&1; }
 trap fim EXIT INT TERM
 
+DASH_PORT_FLAG=""
+for arg in "$@"; do
+  if [ "$arg" = "--dashboard" ]; then
+    p="${PAINEL_PORT:-8787}"
+    DASH_PORT_FLAG="-p 127.0.0.1:${p}:${p}"
+    break
+  fi
+done
+
 while :; do
-  nice -n 19 docker compose run --rm clipes "$@"
+  # shellcheck disable=SC2086
+  nice -n 19 docker compose run --rm $DASH_PORT_FLAG clipes "$@"
   rc=$?
   if [ "$rc" -ne 75 ]; then
     exit "$rc"

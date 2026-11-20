@@ -76,6 +76,7 @@ RUN chmod +x /usr/local/bin/entrypoint.sh
 
 COPY pyproject.toml /app/pyproject.toml
 COPY clipes /app/clipes
+COPY painel /app/painel
 COPY tests /app/tests
 COPY assets /app/assets
 
