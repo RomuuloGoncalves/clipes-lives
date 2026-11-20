@@ -1260,6 +1260,7 @@ def render_clip(
         accept_bytes: int | None = None
         if mode == "livre":
             clip.cabe_discord = False
+            rate_kbps = 6000  # DSC-05: teto só de bitrate; sem accept_bytes, não há retry nem downscale
         else:
             from .previa import _resolve_limit_mb, bitrate_alvo
 

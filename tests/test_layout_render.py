@@ -879,3 +879,41 @@ def test_render_clip_real_ffmpeg_split_starcuts_and_antiflop(tmp_path: Path, mon
     # Green gameplay below y=770 (y=820, x=540)
     game_px = frame[820, 540]
     assert game_px[1] > 100 and game_px[1] > game_px[0] + 40 and game_px[1] > game_px[2] + 40
+
+
+def test_t9_master_livre_teto_6000k_sem_retry_nem_downscale(tmp_path: Path, monkeypatch):
+    """DSC-05: master livre passa teto 6000k ao ffmpeg, sem retry e sem scale=720, cabe_discord=False."""
+    _clear_layout_and_bar_env(monkeypatch)
+    monkeypatch.setenv("CLIPES_MASTER_MODE", "livre")
+    monkeypatch.setattr(reframe_mod, "_probe_video_size", lambda p: (1920, 1080))
+    _install_fake_layout_and_facecam(
+        monkeypatch,
+        SimpleNamespace(tipo="nenhuma", rect=None, metodo="yunet"),
+    )
+    src = tmp_path / "src.mkv"
+    src.write_bytes(b"src")
+    out_dir = tmp_path / "out" / "vod1"
+    cache_dir = tmp_path / "cache"
+    out_dir.mkdir(parents=True)
+    cache_dir.mkdir()
+
+    cmds: list[list[str]] = []
+
+    def fake_run(cmd, **kw):
+        cmds.append(cmd)
+        # Saída bem acima de 10 MB: se houvesse retry por limite Discord, ele aconteceria aqui
+        with open(cmd[-1], "wb") as fh:
+            fh.truncate(50 * 1024 * 1024)
+        return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+    monkeypatch.setattr(render_mod.subprocess, "run", fake_run)
+    clip = SnappedClip(peak=5.0, start=0.0, end=10.0, score=0.9, title="Livre teto")
+    render_mod.render_clip(clip, 1, [], "", out_dir, cache_dir, live_video_path=src)
+
+    assert len(cmds) == 1
+    cmd = cmds[0]
+    joined = " ".join(cmd)
+    assert "-crf 21 -maxrate 6000k -bufsize 12000k" in joined
+    assert "scale=720" not in cmd[cmd.index("-filter_complex") + 1]
+    assert "scale=720" not in joined
+    assert clip.cabe_discord is False
