@@ -257,3 +257,46 @@ def test_worker_with_llm_title_skips_cli_heuristic_fallback(local_job_queue, tmp
     monitor.run_worker_step(local_job_queue, tmp_path / "out", monitor.ChannelPolicy(delay_h={"gaules": 24}))
 
     assert calls == ["candidates", "asr", "snap", "llm", "render"]
+
+
+@pytest.mark.parametrize("last", [False, True])
+def test_run_local_pipeline_passa_own_range_da_regiao_dona(tmp_path, monkeypatch, last):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from clipes.janelas import owns
+
+    seen = []
+
+    def fake_run_pipeline(args):
+        seen.append(args)
+        ing = cli.ingest(args.url, Path(args.out_dir), args.live_minutes, args.chat)
+        (ing.out_dir / "clips.json").write_text(json.dumps({"clips": []}), encoding="utf-8")
+        return 0
+
+    monkeypatch.setattr(cli, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(
+        "clipes.ingest.ingest_local",
+        lambda jd, root, chat: SimpleNamespace(video_id=jd.name, out_dir=(root / jd.name).resolve()),
+    )
+    (tmp_path / "out" / "j").mkdir(parents=True)
+    job = tmp_path / "j"
+    job.mkdir()
+    (job / "job.json").write_text(json.dumps(
+        {"window_start": 700.0, "window_end": 1000.0, "video_start": 400.0, "max_dur": 60.0, "last": last}))
+    monitor.run_local_pipeline(job, tmp_path / "out")
+    lo, hi = seen[-1].own_range
+    step, pad, vs = monitor.LIVE_STEP_S, 30.0, 400.0
+    eps = 1e-6
+    # centros logo dentro/fora da regiao batem com janelas.owns (tempo absoluto = vs + relativo)
+    for rel in (lo - eps, lo + eps, hi - eps, hi + eps):
+        in_range = lo <= rel <= hi if last else lo <= rel < hi
+        assert in_range == owns(vs + rel, 700.0, 1000.0, step, pad, last), rel
+
+    # job sem os campos (VOD/antigo): sem flag
+    old = tmp_path / "old"
+    old.mkdir()
+    (old / "job.json").write_text(json.dumps({"job_id": "old", "max_dur": 60.0}))
+    (tmp_path / "out" / "old").mkdir()
+    monitor.run_local_pipeline(old, tmp_path / "out")
+    assert seen[-1].own_range is None

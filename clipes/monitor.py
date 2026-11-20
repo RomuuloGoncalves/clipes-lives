@@ -905,6 +905,14 @@ def run_local_pipeline(job_dir: Path, out_root: Path) -> dict[str, Any]:
                     continue
                 if math.isfinite(dur_val) and dur_val > 0:
                     cli_args.extend([flag, str(dur_val)])
+            # FIL-01: regiao dona da janela (tempo relativo ao source) para o cli filtrar antes da ASR 2
+            try:
+                we, vs, md = (float(job_meta[k]) for k in ("window_end", "video_start", "max_dur"))
+                pad = md / 2
+                hi = (we if job_meta["last"] else we - pad) - vs
+                cli_args.extend(["--own-range", f"{we - LIVE_STEP_S - pad - vs},{hi}"])
+            except (KeyError, TypeError, ValueError):
+                pass  # job VOD/antigo: sem filtro
 
     args = cli.build_parser().parse_args(cli_args)
     original_ingest = cli.ingest
