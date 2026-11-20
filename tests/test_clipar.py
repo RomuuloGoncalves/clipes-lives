@@ -178,6 +178,100 @@ def test_clipar_sem_sensor_warns_without_changing_limits(tmp_path):
     assert "CPUS=8|MEM=7372m|THREADS=8" in docker_log.read_text(encoding="utf-8").strip()
 
 
+# ---- VIG-06 / WIN-02 / VIG-09 (ajustes-nov20 T15) ---------------------------------------------
+
+
+def _vigia_que_registra_inicio(clipar_bin: Path, start_log: Path) -> None:
+    # Vigia falso: anota o proprio PID em start_log e roda ate receber TERM/INT.
+    _write_exec(
+        clipar_bin.parent / "vigia-temp",
+        f"""#!/bin/sh
+if [ "${{1:-}}" = "--check" ]; then
+  printf '%s\\n' "72"
+  exit 0
+fi
+echo $$ >> "{start_log}"
+trap 'exit 0' INT TERM
+while :; do
+  /bin/sleep 0.05
+done
+""",
+    )
+
+
+def _esperar_morrer(pid: int, timeout: float = 3.0) -> bool:
+    import time
+
+    fim = time.monotonic() + timeout
+    while time.monotonic() < fim:
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_clipar_nao_inicia_nem_mata_vigia_ja_vivo(tmp_path):
+    import subprocess as sp
+
+    clipar_bin, env, _, _ = _prepare_clipar_env(tmp_path)
+    start_log = tmp_path / "vigia_starts.log"
+    _vigia_que_registra_inicio(clipar_bin, start_log)
+    out_dir = Path(env["OUT_DIR"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    vivo = sp.Popen(["/bin/sleep", "30"])
+    try:
+        (out_dir / ".vigia.pid").write_text(f"{vivo.pid}\n", encoding="utf-8")
+        res = subprocess.run([str(clipar_bin), "https://twitch.tv/teste"], env=env, capture_output=True, text=True)
+        assert res.returncode == 0
+        assert not start_log.exists(), "clipar nao deveria iniciar outro vigia"
+        assert vivo.poll() is None, "clipar nao deveria matar o vigia que ja estava vivo"
+    finally:
+        vivo.kill()
+        vivo.wait()
+
+
+def test_clipar_mata_so_o_vigia_que_iniciou(tmp_path):
+    clipar_bin, env, _, _ = _prepare_clipar_env(tmp_path)
+    start_log = tmp_path / "vigia_starts.log"
+    _vigia_que_registra_inicio(clipar_bin, start_log)
+    # pidfile apontando para processo morto: clipar deve iniciar o seu
+    Path(env["OUT_DIR"]).mkdir(parents=True, exist_ok=True)
+    (Path(env["OUT_DIR"]) / ".vigia.pid").write_text("999999\n", encoding="utf-8")
+
+    res = subprocess.run([str(clipar_bin), "https://twitch.tv/teste"], env=env, capture_output=True, text=True)
+    assert res.returncode == 0
+    pids = [int(x) for x in start_log.read_text(encoding="utf-8").split()]
+    assert len(pids) == 1
+    assert _esperar_morrer(pids[0]), "o vigia iniciado pelo clipar deve morrer ao sair"
+
+
+def test_clipar_aviso_sem_sensor_cita_lhm_so_no_wsl(tmp_path):
+    clipar_bin, env, _, _ = _prepare_clipar_env(tmp_path / "wsl", vigia_check_output="sem-sensor")
+    proc = tmp_path / "wsl" / "proc"
+    (proc / "version").write_text("Linux version 5.15.0-microsoft-standard-WSL2 (gcc)\n", encoding="utf-8")
+    res = subprocess.run([str(clipar_bin), "https://twitch.tv/teste"], env=env, capture_output=True, text=True)
+    assert "LibreHardwareMonitor" in res.stderr
+
+    clipar_nat, env_nat, _, _ = _prepare_clipar_env(tmp_path / "nativo", vigia_check_output="sem-sensor")
+    (tmp_path / "nativo" / "proc" / "version").write_text("Linux version 6.8.0-generic (gcc)\n", encoding="utf-8")
+    res_nat = subprocess.run([str(clipar_nat), "https://twitch.tv/teste"], env=env_nat, capture_output=True, text=True)
+    assert "LibreHardwareMonitor" not in res_nat.stderr
+
+
+def test_compose_clipes_repassa_variaveis_do_vigia_e_log_fora_da_raiz():
+    root = Path(__file__).resolve().parent.parent
+    compose = (root / "docker-compose.yml").read_text(encoding="utf-8")
+    bloco_clipes = compose.split("\n  clipes:\n", 1)[1].split("\n  bot:\n", 1)[0]
+    for var in ("CLIPES_VIGIA", "CLIPES_TEMP_MAX", "CLIPES_TEMP_MIN"):
+        assert f"      {var}: " in bloco_clipes
+    gitignore = (root / ".gitignore").read_text(encoding="utf-8").splitlines()
+    assert "vigia-temp.log" in gitignore
+    assert not (root / "vigia-temp.log").exists()
+
+
 def test_clipar_restarts_on_exit_75_and_stops_on_other_exit_code(tmp_path):
     # Exit 75 then 0 -> 2 runs with same arguments after sleeping CLIPES_RESTART_S (default 60)
     clipar_75, env_75, log_75, sleep_log = _prepare_clipar_env(

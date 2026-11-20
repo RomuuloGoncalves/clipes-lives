@@ -64,11 +64,29 @@ CLIPES_CPU_THREADS="${CLIPES_CPU_THREADS:-$CLIPES_CPUS}"
 export CLIPES_CPU_THREADS
 
 D="$(dirname "$0")"
+# Vigia ja vivo para este OUT_DIR (outro ./clipar ou servico): nao inicia outro e nao o mata.
+vivo=0
+if [ -r "$OUT_DIR/.vigia.pid" ]; then
+  old=$(cat "$OUT_DIR/.vigia.pid" 2>/dev/null)
+  case "$old" in ''|*[!0-9]*) ;; *) kill -0 "$old" 2>/dev/null && vivo=1 ;; esac
+fi
 if [ "$("$D/vigia-temp" --check 2>/dev/null)" = "sem-sensor" ]; then
   echo "aviso: sem sensor de temperatura; vigia termico desligado" >&2
+  case "$(cat "$PROC_ROOT/version" 2>/dev/null)" in
+    *[Mm]icrosoft*) echo "aviso: no WSL, abra o LibreHardwareMonitor no Windows (como administrador) com o servidor WMI ligado" >&2 ;;
+  esac
 fi
-"$D/vigia-temp" & V=$!
-fim() { kill $V 2>/dev/null; docker unpause $(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes) >/dev/null 2>&1; }
+V=""
+if [ "$vivo" = 0 ]; then
+  "$D/vigia-temp" & V=$!
+fi
+# So mata (e despausa) o vigia que este ./clipar iniciou.
+fim() {
+  if [ -n "$V" ]; then
+    kill $V 2>/dev/null
+    docker unpause $(docker ps -q --filter label=com.docker.compose.project=clipes-lives --filter label=com.docker.compose.service=clipes) >/dev/null 2>&1
+  fi
+}
 trap fim EXIT INT TERM
 
 DASH_PORT_FLAG=""
