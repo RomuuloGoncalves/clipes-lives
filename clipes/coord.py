@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 
+from .config import chaves_globais, config_global
+
 ACOES = {"liberar"}  # lista branca de comandos do painel
 _SECRET_ENV_HINTS = ("SECRET", "TOKEN", "KEY", "PASS", "URI")
 _URI_CREDS_RE = re.compile(r"(https?://)([^/\s@:]+:[^/\s@]+@)")
@@ -38,6 +40,7 @@ def _sanitize_erro(erro: str | None) -> str | None:
 class Coord:
     def __init__(self, db, worker_id: str, *, now=time.time, lease_s: float = 90):
         self.db, self.worker_id, self._now, self.lease_s = db, worker_id, now, lease_s
+        self._avisou_global_pc: set[str] = set()
 
     def _dt(self, offset: float = 0.0) -> datetime:
         """Instante atual (relógio injetável) como datetime UTC ingênuo, o que o Mongo guarda."""
@@ -325,15 +328,15 @@ class Coord:
     # ---- heartbeat e config por alias ----
 
     def _com_global(self, cfg: dict) -> dict:
-        """Config global (`config_global/_id=global`) sempre vence a por-PC nas chaves globais."""
+        """Config global (`config_global/_id=global`) sempre vence a por-PC nas chaves globais do schema."""
         cfg = dict(cfg)
-        if "CLIPES_LAYOUT" in cfg and not getattr(self, "_avisou_layout_pc", False):
-            self._avisou_layout_pc = True
-            print("[config] CLIPES_LAYOUT por PC ignorado: use o layout global do painel", flush=True)
-        cfg.pop("CLIPES_LAYOUT", None)
-        glob = (self.db.config_global.find_one({"_id": "global"}) or {}).get("config")
-        if isinstance(glob, dict) and glob.get("CLIPES_LAYOUT"):
-            cfg["CLIPES_LAYOUT"] = glob["CLIPES_LAYOUT"]
+        globais = chaves_globais()
+        for key in [k for k in cfg if k in globais]:
+            cfg.pop(key)
+            if key not in self._avisou_global_pc:
+                self._avisou_global_pc.add(key)
+                print(f"[config] {key} por PC ignorado: use a config global do painel", flush=True)
+        cfg.update(config_global(self.db))
         return cfg
 
     def reconcile_alias(self, alias: str) -> dict:

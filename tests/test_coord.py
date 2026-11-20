@@ -886,3 +886,31 @@ def test_layout_global_vence_config_por_pc(env, capsys):
     db.config_global.insert_one({"_id": "global", "config": {"CLIPES_LAYOUT": "split-cheio"}})
     assert beat() == {"CLIPES_BAR_H": "400", "CLIPES_LAYOUT": "split-cheio"}
     assert a.reconcile_alias("PC-1")["CLIPES_LAYOUT"] == "split-cheio"
+
+
+def test_global_vence_pc_em_chave_do_schema(env):
+    _, db, a, _ = env
+    db.workers.update_one({"_id": "w-a"}, {"$set": {"config": {"CLIPES_DUR_MAX": "90"}}}, upsert=True)
+    db.config_global.insert_one({"_id": "global", "config": {"CLIPES_DUR_MAX": "30"}})
+    assert a.reconcile_alias("PC-1") == {"CLIPES_DUR_MAX": "30"}
+
+
+def test_chave_global_por_pc_e_ignorada_com_um_aviso_por_chave(env, capsys):
+    _, db, a, _ = env
+    db.workers.update_one(
+        {"_id": "w-a"}, {"$set": {"config": {"CLIPES_DUR_MAX": "90", "CLIPES_DUR_MIN": "20"}}}, upsert=True
+    )
+    assert a.reconcile_alias("PC-1") == {}
+    a.reconcile_alias("PC-1")
+    saida = capsys.readouterr().out
+    assert saida.count("CLIPES_DUR_MAX por PC ignorado") == 1
+    assert saida.count("CLIPES_DUR_MIN por PC ignorado") == 1
+
+
+def test_chave_nao_global_por_pc_continua_valendo(env):
+    _, db, a, _ = env
+    db.workers.update_one(
+        {"_id": "w-a"}, {"$set": {"config": {"CLIPES_DUR_MAX": "90", "CLIPES_BAR_H": "400"}}}, upsert=True
+    )
+    db.config_global.insert_one({"_id": "global", "config": {"CLIPES_DUR_MAX": "30"}})
+    assert a.reconcile_alias("PC-1") == {"CLIPES_DUR_MAX": "30", "CLIPES_BAR_H": "400"}
