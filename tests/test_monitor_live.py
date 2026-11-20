@@ -84,6 +84,7 @@ def test_disco_abaixo_do_piso_pula_a_janela(tmp_path, monkeypatch, capsys):
 
 
 def test_backlog_maior_que_2_descarta_a_mais_antiga_como_lost(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLIPES_MAX_BACKLOG", "2")  # T20: padrao agora 6
     def slow(clock):
         calls = []
 

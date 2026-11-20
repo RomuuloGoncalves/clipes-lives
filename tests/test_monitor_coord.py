@@ -931,6 +931,7 @@ def test_follow_live_renova_lease_cria_jobs_e_para_ao_perder_lease(tmp_path, mon
 def test_follow_live_backlog_marca_lost_no_mongo(tmp_path, monkeypatch):
     """Achado 1: backlog > LIVE_MAX_BACKLOG marks oldest window as `lost` in Mongo as well as DiskQueue."""
     B = 1_700_000_100
+    monkeypatch.setenv("CLIPES_MAX_BACKLOG", "2")  # T20: padrao agora 6
     monkeypatch.setattr(monitor, "probe_duration", lambda p: 600.0)
     clock = Clock(B + 10)
     db = mongomock.MongoClient().db
