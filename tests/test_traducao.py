@@ -307,3 +307,55 @@ def test_enrich_clips_with_llm_accepts_pt_terms_from_translated_text(tmp_path, m
     assert clip_fb.title_source == "heuristic_fallback"
     assert "Tóquio" in clip_fb.title
     assert "Tóquio" in clip_fb.description_long
+
+
+def test_providers_used_preserved_across_traduzir_clipes_and_enrich_clips(tmp_path, monkeypatch):
+    from clipes.models import IngestResult
+
+    monkeypatch.setenv("GEMINI_API_KEYS", "AIzaFAKE-KEY")
+    monkeypatch.setenv("CLIPES_GEMINI_MODELS", "gemini-2.5-flash")
+    monkeypatch.setenv("CLIPES_GEMINI_MIN_INTERVAL_S", "0")
+    monkeypatch.setenv("CLIPES_GEMINI_COTA_FILE", str(tmp_path / "cota.json"))
+    monkeypatch.delenv("CLIPES_LLM_BACKEND", raising=False)
+    monkeypatch.delenv("CLIPES_LEGENDA_IDIOMA", raising=False)
+    cloud_llm.reset_round()
+
+    ing = IngestResult(
+        video_id="vid2",
+        title="English Live",
+        url="https://twitch.tv/streamer",
+        extractor="twitch",
+        is_live=True,
+        duration=60.0,
+        audio_path=tmp_path / "audio.wav",
+        video_path=None,
+        heatmap=None,
+        chat_messages=None,
+        out_dir=tmp_path,
+        cache_dir=tmp_path,
+        channel="streamer",
+    )
+    words = [_w(1.0, 1.5, "What"), _w(1.6, 2.2, "happened?")]
+    clip = SnappedClip(peak=1.5, start=0.0, end=5.0, score=0.95, text="What happened?")
+
+    # 1) Translation succeeds via cloud_llm, metadata enrichment fails cloud & local -> "gemini" must remain
+    calls = {"n": 0}
+
+    def fake_call(model, key, prompt, schema, system_prompt, urlopen):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"blocos": [{"id": 0, "pt": "O que aconteceu?"}]}
+        raise RuntimeError("cloud quota exhausted on metadata step")
+
+    monkeypatch.setattr(cloud_llm, "_call", fake_call)
+    monkeypatch.setattr(llm, "llama_server_session", lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError("no bin")))
+
+    traduzir_clipes([clip], words, "en", enabled=True)
+    assert clip.legenda_traduzida is True
+    assert clip.translated_text == "O que aconteceu?"
+    assert cloud_llm.providers_used() == ["gemini"]
+
+    llm.enrich_clips_with_llm([clip], words, ing, enabled=True)
+    assert cloud_llm.providers_used() == ["gemini"]
+    assert clip.title_source == "heuristic_fallback"
+    assert "aconteceu" in clip.title.lower()
