@@ -520,3 +520,24 @@ def test_compose_valido():
 
 def test_clipar_exporta_vigia_host():
     assert "CLIPES_VIGIA_HOST=1" in (ROOT / "clipar").read_text(encoding="utf-8")
+
+
+def test_temperatura_igual_ao_max_pausa(ambiente):
+    # M34: o limite exato ja pausa (>=), nao so acima
+    d, out, novo = ambiente
+    f = novo()
+    _vigia(d, out, 85).ciclo()  # padrao 1 85 75
+    assert len(f.posts("/pause")) == 1
+
+
+def test_recursos_asterisco_com_conteiner_ja_sem_limite_nao_chama_update(ambiente, monkeypatch):
+    # M44: Memory=0/NanoCpus=0 ja e "sem limite"; "*" nao gera update espurio
+    d, out, novo = ambiente
+    monkeypatch.setattr(vigia, "_mem_host", lambda: 8 * 1024**3)
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    f = novo(mem=0, nano=0)
+    (out / ".recursos").write_text("* *\n")
+    v = _vigia(d, out, 50)
+    v.ciclo()
+    v.ciclo()
+    assert not f.posts("/update")

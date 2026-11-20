@@ -168,3 +168,12 @@ def test_asymmetric_window_on_top_candidates_and_symmetric_reserves():
     for c in cands[3:]:
         assert c.start_win == round(max(0.0, c.peak - 45.0), 2)
         assert c.end_win == round(min(duration, c.peak + 45.0), 2)
+
+
+def test_pre_score_pico_isolado_abaixo_de_5pct_e_ignorado_pelo_p95(tmp_path: Path):
+    # M28: p95 descarta o pico (1 s em 40 s = 2,5% dos frames); `max` daria ~> 20
+    sr = 16000
+    t = np.arange(40 * sr) / sr
+    sig = 0.05 * np.sin(2 * np.pi * 440.0 * t)
+    sig[20 * sr:21 * sr] = 0.8 * np.sin(2 * np.pi * 440.0 * t[:sr])
+    assert abs(pre_score(_write_wav(tmp_path / "pico_isolado.wav", sig, sr))) <= 0.5

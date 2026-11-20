@@ -280,3 +280,33 @@ def test_duas_threads_mesma_chave_respeitam_intervalo(monkeypatch, cota):
     [t.start() for t in ts]
     [t.join() for t in ts]
     assert len(stamps) == 2 and abs(stamps[1] - stamps[0]) >= 0.19
+
+
+def test_lock_forca_entrelacamento_e_serializa_o_intervalo(monkeypatch, cota):
+    # M30: `now` lento faz as 2 threads lerem `_last_call` juntas; so o lock impede os 2 de passar sem espera
+    import threading
+    import time
+
+    monkeypatch.setenv("GEMINI_API_KEYS", "AIzaKEY-A")
+    monkeypatch.setenv("CLIPES_GEMINI_MIN_INTERVAL_S", "10")
+    cloud_llm._last_call.clear()
+    clock = [1000.0]
+    sleeps = []
+
+    def now():
+        t = clock[0]
+        time.sleep(0.05)  # abre a janela de corrida entre ler e gravar
+        return t
+
+    def sleep(s):
+        sleeps.append(s)
+        clock[0] += s
+
+    def fake(req, timeout=None):
+        return _Resp(json.dumps({"candidates": [{"content": {"parts": [{"text": '{"titulo":"x"}'}]}}]}).encode())
+
+    ts = [threading.Thread(target=lambda: cloud_llm.complete_cloud("p", SCHEMA, "s", urlopen=fake, now=now, sleep=sleep))
+          for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(sleeps) == 1 and sleeps[0] >= 9.9

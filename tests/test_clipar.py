@@ -383,3 +383,16 @@ def test_clipar_recursos_mem_valor_continua_igual(tmp_path):
 def test_clipar_sintaxe_sh_valida():
     res = subprocess.run(["sh", "-n", str(CLIPAR_SRC)], capture_output=True, text=True)
     assert res.returncode == 0, res.stderr
+
+
+def test_clipar_env_cpus_asterisco_sem_recursos_vira_zero_e_threads_com_nproc(tmp_path):
+    # M12: CLIPES_CPUS=* no .env, sem .recursos
+    clipar_bin, env, docker_log, _ = _prepare_clipar_env(tmp_path / "env_cpus", nproc_val=5)
+    secrets = tmp_path / "env_cpus" / "segredos.env"
+    secrets.write_text("CLIPES_CPUS=*\n", encoding="utf-8")
+    secrets.chmod(0o600)
+    env["CLIPES_SECRETS"] = str(secrets)
+    res = subprocess.run([str(clipar_bin), "https://twitch.tv/teste"], env=env, capture_output=True, text=True)
+    assert res.returncode == 0
+    line = docker_log.read_text(encoding="utf-8").strip().splitlines()[0]
+    assert "CPUS=0|" in line and "THREADS=5" in line
