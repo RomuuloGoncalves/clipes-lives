@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import random
 import re
 import time
@@ -24,6 +25,7 @@ MAX_RESUMES = 5  # 1 tentativa inicial + 5 retentativas = 6 tentativas (faixa 5.
 BACKOFF_BASE_S = 1.0
 BACKOFF_MAX_S = 60.0
 PRIVACY_STATUS = "private"
+_VALID_PRIVACY = frozenset({"private", "unlisted", "public"})
 CATEGORY_ID = "20"
 
 _RANGE_RE = re.compile(r"bytes=0-(\d+)")
@@ -36,11 +38,14 @@ def _resolve_token(token: str | Callable[[], str]) -> str:
     return str(token() if callable(token) else token)
 
 
+def _resolve_privacy() -> str:
+    raw = os.environ.get("CLIPES_YT_PRIVACY", "").strip().lower()
+    return raw if raw in _VALID_PRIVACY else PRIVACY_STATUS
+
+
 def _sanitize_title(title: str) -> str:
     clean = " ".join(title.replace("<", "").replace(">", "").split()) or "Clipe"
-    if "#shorts" in clean.lower():
-        return clean[:100]
-    return f"{clean[:90].rstrip()} #Shorts"
+    return clean[:100].rstrip()
 
 
 def _format_description(description: str) -> str:
@@ -108,14 +113,14 @@ def _send(req: urllib.request.Request, urlopen: Callable[..., Any], timeout: flo
         raise
 
 
-def _ok_result(raw: bytes) -> dict[str, Any]:
+def _ok_result(raw: bytes, privacy_status: str = PRIVACY_STATUS) -> dict[str, Any]:
     data = json.loads(raw.decode("utf-8")) if raw else {}
     video_id = str(data.get("id") or "")
     return {
         "status": "ok",
         "video_id": video_id,
         "url": f"https://youtu.be/{video_id}" if video_id else "",
-        "privacidade": PRIVACY_STATUS,
+        "privacidade": privacy_status,
     }
 
 
@@ -165,6 +170,7 @@ def publish(
     total_size = len(mp4_bytes)
     access_token = _resolve_token(token)
     refreshed = False
+    privacy_status = _resolve_privacy()
 
     metadata = {
         "snippet": {
@@ -173,7 +179,7 @@ def publish(
             "categoryId": CATEGORY_ID,
         },
         "status": {
-            "privacyStatus": PRIVACY_STATUS,
+            "privacyStatus": privacy_status,
             "selfDeclaredMadeForKids": False,
         },
     }
@@ -245,7 +251,7 @@ def publish(
         try:
             status, headers, body = _send(put_req, urlopen, timeout=120)
             if status in (200, 201):
-                return _ok_result(body)
+                return _ok_result(body, privacy_status)
             if status == 308:
                 if resumes_used >= MAX_RESUMES:
                     return {"status": "erro", "erro": f"youtube upload incompleto apos {MAX_RESUMES} retomadas"}
@@ -287,7 +293,7 @@ def publish(
             try:
                 st_code, st_headers, st_body = _send(status_req, urlopen, timeout=30)
                 if st_code in (200, 201):
-                    return _ok_result(st_body)
+                    return _ok_result(st_body, privacy_status)
                 if st_code == 308:
                     offset = _parse_range_offset(st_headers)
                     break

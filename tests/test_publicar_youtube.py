@@ -80,7 +80,7 @@ def test_publish_youtube_happy_path_captures_private_json_and_title(tmp_path: Pa
     assert sent_json["status"]["privacyStatus"] == "private"
     assert sent_json["status"]["selfDeclaredMadeForKids"] is False
     assert sent_json["snippet"]["categoryId"] == "20"
-    assert sent_json["snippet"]["title"] == "Jogada absurda na live #Shorts"
+    assert sent_json["snippet"]["title"] == "Jogada absurda na live"
     assert "#Shorts" in sent_json["snippet"]["description"]
 
     _, _, _, put_data = calls[1]
@@ -111,8 +111,8 @@ def test_publish_youtube_sanitizes_angle_brackets_and_truncates_title(tmp_path: 
     assert res["status"] == "ok"
     sent_title = captured_json[0]["snippet"]["title"]
     assert "<" not in sent_title and ">" not in sent_title
-    assert sent_title == ("a" * 90) + " #Shorts"
-    assert len(sent_title) <= 100
+    assert sent_title == ("a" * 95) + " test"
+    assert len(sent_title) == 100
 
 
 def test_publish_youtube_rejects_clip_over_180_seconds_without_http_call(tmp_path: Path):
@@ -290,3 +290,31 @@ def test_publish_youtube_strips_angle_brackets_from_description(tmp_path: Path):
     sent_desc = captured_json[0]["snippet"]["description"]
     assert "<" not in sent_desc and ">" not in sent_desc
     assert sent_desc == "Linha um\n\nLinha dois\n\n#Shorts"
+
+
+def test_publish_youtube_privacy_env_and_invalid_fallback(tmp_path: Path, monkeypatch):
+    mp4 = tmp_path / "clip.mp4"
+    mp4.write_bytes(b"MP4DATA")
+    captured_json: list[dict[str, Any]] = []
+
+    def fake_urlopen(req: urllib.request.Request, timeout: float = 30) -> FakeResponse:
+        if req.get_method() == "POST":
+            captured_json.append(json.loads(req.data.decode("utf-8")))
+            return FakeResponse(200, headers={"Location": "https://upload.example/u-priv"})
+        return FakeResponse(200, body={"id": "yt_priv"})
+
+    monkeypatch.setenv("CLIPES_YT_PRIVACY", "public")
+    res_pub = publish(mp4, "Gancho forte", "Desc", "tok", fake_urlopen, probe_duration_fn=lambda _: 25.0)
+    assert res_pub["privacidade"] == "public"
+    assert captured_json[0]["status"]["privacyStatus"] == "public"
+    assert captured_json[0]["snippet"]["title"] == "Gancho forte"
+
+    monkeypatch.setenv("CLIPES_YT_PRIVACY", "unlisted")
+    res_unl = publish(mp4, "Gancho forte", "Desc", "tok", fake_urlopen, probe_duration_fn=lambda _: 25.0)
+    assert res_unl["privacidade"] == "unlisted"
+    assert captured_json[1]["status"]["privacyStatus"] == "unlisted"
+
+    monkeypatch.setenv("CLIPES_YT_PRIVACY", "invalid_value")
+    res_inv = publish(mp4, "Gancho forte", "Desc", "tok", fake_urlopen, probe_duration_fn=lambda _: 25.0)
+    assert res_inv["privacidade"] == "private"
+    assert captured_json[2]["status"]["privacyStatus"] == "private"
